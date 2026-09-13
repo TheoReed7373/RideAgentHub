@@ -2,21 +2,32 @@
 
 <div align="center">
 
-**一个面向网约车场景的多 Agent Spring Boot 项目**
+**网约车场景的 Spring Boot 全栈实战：Redis 高并发 + 多 Agent + RAG**
 
-前置分类路由、领域 Agent 执行、工具调用循环、订单确认断点、多层记忆与多存储协同，全部落在真实代码里。
+一套代码、两条学习主线：抢单预检、GEO 附近订单、延迟队列与缓存一致性对应实际业务场景；同一套业务之上，再叠一层多 Agent 编排与混合检索 RAG。
 
 ![Java](https://img.shields.io/badge/Java-21-ff6b35)
 ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5.9-6db33f)
 ![Spring AI](https://img.shields.io/badge/Spring%20AI-1.1.0-1677ff)
+![Redis](https://img.shields.io/badge/Redis-GEO%20%2B%20Lua-dc382d)
 ![MyBatis-Plus](https://img.shields.io/badge/MyBatis--Plus-3.5.9-0052cc)
 ![Multi-Agent](https://img.shields.io/badge/Agents-4-orange)
+![RAG](https://img.shields.io/badge/RAG-Hybrid%20Retrieval-9b59b6)
 
 </div>
 
 ## 项目简介
 
-`RideAgentHub` 不是“一个大 Prompt + 一个大模型”式的 Demo，而是把网约车场景拆成了清晰的执行链路：
+`RideAgentHub` 将网约车业务系统与多 Agent 应用结合，同一套代码提供**两条可以分别学习的主线**：
+
+| 主线 | 能学到什么 | 入口 |
+| --- | --- | --- |
+| **Redis 高并发** | 抢单 Lua 原子预检、GEO 附近订单、成员级 TTL 心跳、ZSet 延迟队列、缓存穿透 / 击穿 / 雪崩、分布式锁、缓存一致性三解法（延迟双删 / 墓碑 / Lease 令牌） | 下方 [Redis 高并发实战](#redis-高并发实战)；专题学习笔记在 [`docs/learn/redis/`](docs/learn/redis/README.md)（25 篇，一个考点一篇） |
+| **多 Agent + RAG** | 分类路由、工具调用循环、订单确认断点（HITL）、多层记忆、混合检索 RAG | 下方 [Agent 与 RAG 链路](#agent-与-rag-链路) |
+
+Redis 既承担 Agent 的**对话状态存储**（订单槽位、确认断点、分类结果），也提供业务侧的**并发协调与查询加速**（抢单预检、附近订单、超时兜底）。两条学习主线因此共享同一组业务场景。
+
+Agent 这条线将网约车场景拆成了清晰的执行链路：
 
 - 入口层先做意图分类，决定应该交给哪个领域 Agent
 - 领域 Agent 再进入工具循环，逐步补齐信息、调用业务能力、生成回复
@@ -30,6 +41,16 @@
 - 怎样把“模型生成”约束进 **可确认、可恢复、可追踪** 的业务流程
 
 ## 亮点
+
+**Redis 高并发**
+
+- **抢单用 Lua 做原子预检**：「判断可抢」与「占住司机」在同一次执行内完成
+- **GEO 查询附近订单**：在线司机可查看三公里内按距离排序的候选订单，索引不可用时降级为数据库时间排序
+- **ZSet 延迟队列**：Lua 原子读取并移除到期任务，避免多实例重复领取及误删已改期任务；失败重试与数据库扫描补偿遗漏
+- **缓存一致性三解法对照**：延迟双删 / 墓碑 / Lease 令牌，各自解决什么、边界在哪
+- **手写锁与 Redisson 并存**：统计缓存与索引重建使用令牌锁，订单状态流转使用 Redisson 看门狗续期并持锁到事务结束
+
+**Agent 与 RAG**
 
 - **多 Agent 分工明确**：`OrderAgent`、`DailyAgent`、`SupportAgent`、`FallbackAgent`
 - **前置分类路由**：基于用户对话的连续性进行分类，再分发到领域 Agent
@@ -93,7 +114,37 @@ flowchart LR
     TR --> MYSQL
 ```
 
-## Agent 链路
+## Redis 高并发实战
+
+这里不是“把 Redis 命令挨个试一遍”，而是**每个考点都由一个真实的业务需求逼出来** —— 没有订单超时兜底的需求，就不会有延迟队列。
+
+| 业务需求 | Redis 考点 | 用到的能力 | 代码落点 |
+| --- | --- | --- | --- |
+| 司机抢单（订单唯一 + 一人一单） | **秒杀模型** | 司机账号行锁串行校验 + Lua 原子判断与占位；数据库按订单状态和司机为空做条件更新 | [`OrderGrabService`](src/main/java/com/fancy/rideagenthub/service/base/OrderGrabService.java)、[`RideOrderServiceImpl`](src/main/java/com/fancy/rideagenthub/service/impl/RideOrderServiceImpl.java) |
+| 司机端“附近订单”排序 | **GEO** | `GEORADIUS` 查询三公里内最近的至多 200 个候选；提交后失效、版本校验重建，回表发现候选或版本不一致时整页降级为数据库查询 | [`OrderGeoPool`](src/main/java/com/fancy/rideagenthub/service/base/OrderGeoPool.java) |
+| 司机在线状态 | **成员级 TTL** | 共享 GEO key + 心跳 Hash，以 Redis 时间判定 60 秒有效期；Lua 原子更新、检查与清理成员 | [`DriverGeoIndex`](src/main/java/com/fancy/rideagenthub/service/base/DriverGeoIndex.java) |
+| 订单超时兜底（无人接单 / 未到达 / 未支付） | **ZSet 延迟队列** | 提交后 `ZADD` 排期；Lua 原子执行 `ZRANGEBYSCORE` + `ZREM` 领取任务；失败重新入队并由数据库补偿扫描兜底 | [`OrderDelayQueue`](src/main/java/com/fancy/rideagenthub/service/base/OrderDelayQueue.java)、[`OrderTimeoutJob`](src/main/java/com/fancy/rideagenthub/service/base/OrderTimeoutJob.java) |
+| 用户名占用查询 | **缓存穿透** | Redisson 布隆过滤器 | [`UserUsernameBloomFilterService`](src/main/java/com/fancy/rideagenthub/service/base/UserUsernameBloomFilterService.java) |
+| 工单统计热点 key | **缓存击穿** | 互斥锁 + 双检；未拿到锁时有限重试读缓存，仍未命中则直查 DB | [`TicketServiceImpl`](src/main/java/com/fancy/rideagenthub/service/impl/TicketServiceImpl.java) |
+| 缓存批量过期 | **缓存雪崩** | TTL 随机抖动 | 同上 |
+| 工单写操作后的脏缓存 | **延迟双删** | 事务提交后立即删除，再延迟删除；降低旧快照回填风险，仍受延迟窗口与进程存活限制 | [`DelayedCacheEvictor`](src/main/java/com/fancy/rideagenthub/service/base/DelayedCacheEvictor.java) |
+| 城市编码（TTL 7 天） | **墓碑机制** | 5 秒墓碑阻止直接回填，失效时递增版本；Lua 拒绝墓碑过期后的旧快照 | [`CityCodeUtil`](src/main/java/com/fancy/rideagenthub/agentbase/amap/util/citycode/CityCodeUtil.java) |
+| 聊天历史回填丢消息 | **Lease 令牌** | 版本号 + Lua 原子校验，租约失效则拒绝回填；版本号独立于历史数据保留 | [`RedisMemory`](src/main/java/com/fancy/rideagenthub/agentbase/memory/RedisMemory.java) |
+| 订单状态机并发流转 | **分布式锁** | Redisson `RLock` 看门狗续期，事务结束后解锁；统计与索引重建采用固定 TTL 的手写令牌锁 | [`RideOrderServiceImpl`](src/main/java/com/fancy/rideagenthub/service/impl/RideOrderServiceImpl.java)、[`RedisLock`](src/main/java/com/fancy/rideagenthub/service/base/RedisLock.java) |
+| LLM 调用配额 | **滑动窗口限流** | ZSet + Lua，避开固定窗口边界的双倍放行；Redis 异常时放行 | [`ChatRateLimiter`](src/main/java/com/fancy/rideagenthub/service/base/ChatRateLimiter.java) |
+| 工单池分页排序 | **ZSet 复合排序** | 优先级与更新时间组成 score；提交后失效、完整重建，Lua 校验版本和成员数后读取总数与当前页 | [`TicketPoolIndex`](src/main/java/com/fancy/rideagenthub/service/base/TicketPoolIndex.java) |
+| 对话记忆 | **多级缓存** | Heap → Redis → MySQL 分层读取，以版本租约保护逐级回填 | [`MessageMemory`](src/main/java/com/fancy/rideagenthub/agentbase/memory/MessageMemory.java) |
+
+### 代码组织上的几个约定
+
+- **Lua 脚本集中维护**于 [`RedisScripts`](src/main/java/com/fancy/rideagenthub/util/RedisScripts.java)，覆盖位置心跳、索引发布与读取、延迟任务领取、锁释放、版本校验和抢单预检。
+- **主要 key 由** [`RedisKeyConstants`](src/main/java/com/fancy/rideagenthub/constant/RedisKeyConstants.java) **统一生成**；工单编号仍在 `TicketServiceImpl` 内使用局部前缀 `ticket:no:`。
+- **抢单正确性由数据库约束兜底**：司机账号行锁保障跨订单的一人一单，订单条件更新裁决是否接单成功；Redis Lua 承担原子预检与占位。
+- **故障策略按组件区分**：附近订单与工单池索引不可用时回退数据库查询，对话限流异常时放行；抢单路径仍依赖 Redisson 锁与 Redis 预检，不能承诺 Redis 故障时继续接单。延迟队列的任务丢失由数据库扫描补偿，实际状态流转仍会获取订单锁。
+
+> [`docs/02-cache-consistency-race.md`](docs/02-cache-consistency-race.md) 与 [`docs/learn/redis/`](docs/learn/redis/README.md) 可作学习索引，但部分项目名、行号与实现描述仍沿用旧版本，具体行为以当前源码为准。目前，会话锁的 `HSET` + `EXPIRE` 已原子化，令牌锁释放会校验持有者；工具确认标记的检查与业务执行仍分离，布隆过滤器仍原地删除后重建，存在重建期假阴性风险。
+
+## Agent 与 RAG 链路
 
 ### 1. 总路由链路
 
@@ -265,11 +316,21 @@ src/main/java/com/fancy/rideagenthub
 ├─ agentbase/rag/          # 知识库检索与 ES/RRF 融合
 ├─ agentbase/amap/         # 地图与路线能力
 ├─ agentbase/qweather/     # 天气能力
+├─ service/base/           # Redis 组件：抢单预检、GEO 池、延迟队列、分布式锁、限流…
+├─ util/                   # RedisScripts 等通用工具
+├─ constant/               # RedisKeyConstants 等常量与 key 生成方法
 ├─ controller/             # HTTP 入口
 ├─ service/                # 业务服务层
 ├─ mapper/                 # MyBatis-Plus Mapper
 ├─ domain/                 # DTO / VO / Entity / Enum
 └─ config/                 # 配置与系统 Prompt
+
+docs/
+├─ 01-redis-application-points.md   # Redis 应用点盘点（改造前的规划稿）
+├─ 02-cache-consistency-race.md     # 缓存一致性竞态盘点（同上）
+└─ learn/
+   ├─ redis/                        # 25 篇考点文档，部分说明与行号待随代码同步
+   └─ agent/                        # Agent 层笔记（整理中）
 ```
 
 ## 快速启动
@@ -362,7 +423,16 @@ curl -X POST http://localhost:8080/order/chat/demo-order-001 \
 
 ## 这个项目适合谁看
 
-如果你关心下面这些问题，这个仓库会比普通聊天 Demo 更有参考价值：
+**想补 Redis 高并发实战的**（如果你觉得“缓存 + 分布式锁”的练习项目不够用）：
+
+- 抢单怎么用 Lua 把「判断」和「占位」做成一步，以及司机行锁与订单条件更新怎样兜底
+- GEO 怎么查询附近订单；共享的司机 GEO key 为什么采用成员级心跳，订单池又如何用固定 TTL 与版本校验重建
+- ZSet 延迟队列怎么用 Lua 原子领取到期任务，为什么领取无需额外锁，而业务处理仍需要订单锁与补偿机制
+- 缓存穿透 / 击穿 / 雪崩各自对应哪种解法，以及**它们各自解决不了什么**
+- 延迟双删、墓碑、Lease 令牌三种一致性方案的适用边界，以及长耗时回填、墓碑到期与旧租约带来的竞态
+- 手写锁和 Redisson 的差距，具体体现在哪几行代码上
+
+**想做 Agent 工程化的**：
 
 - 如何把 Agent 接进真实业务系统，而不是只停留在 prompt playground
 - 如何设计一个“先分类、再执行”的多 Agent 架构
@@ -381,3 +451,7 @@ curl -X POST http://localhost:8080/order/chat/demo-order-001 \
 
 如果你正在做一个垂直业务 Agent，这个项目的重点不是“模型多强”，而是：  
 **怎样把模型放进一条能落地、能确认、能恢复、能追踪的业务链路里。**
+
+如果你正在补 Redis 高并发的实战经验，这个项目的重点也不是“用了多少条命令”，而是：
+
+**怎样让每个考点都由一个真实需求逼出来 —— 而不是为了用 Redis 而用 Redis。**
