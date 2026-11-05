@@ -1,0 +1,38 @@
+{
+  "settings": {
+    "analysis": {
+      "analyzer": {
+        "my_ngram_analyzer": {
+          "tokenizer": "my_ngram_tokenizer"
+        }
+      },
+      "tokenizer": {
+        "my_ngram_tokenizer": {
+          "type": "ngram",
+          "min_gram": 1,
+          "max_gram": 2,
+          "token_chars": [
+            "letter",
+            "digit",
+            "punctuation",
+            "symbol"
+          ]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "properties": {
+      "chat_id": { "type": "keyword" },
+      "user_id": { "type": "keyword" },
+      "created_at": { "type": "date" },
+      "full_text_content": {
+        "type": "text",
+        "analyzer": "my_ngram_analyzer",
+        "search_analyzer": "my_ngram_analyzer",
+        "term_vector": "with_positions_offsets",
+        "doc_values": false
+      }
+    }
+  }
+}

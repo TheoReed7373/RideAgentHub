@@ -1,0 +1,88 @@
+spring:
+  application:
+    name: RideAgentHub
+  ai:
+    dashscope:
+      api-key: your-dashscope-api-key
+      embedding:
+        options:
+          model: text-embedding-v4
+          dimensions: 1024
+    openai:
+      api-key: your-deepseek-api-key/openai-competitor-api-key
+      base-url: https://api.deepseek.com
+  # 数据源配置
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: your-database-url
+    username: your-database-username
+    password: your-database-password
+  # Elasticsearch配置
+  elasticsearch:
+    uris: your-elasticsearch-url
+    username: your-elasticsearch-username
+    password: your-elasticsearch-password
+  # Redis配置
+  data:
+    redis:
+      host: your-redis-host
+      port: 6379
+      password: your-redis-password
+      database: 0
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 12
+          max-wait: 3000ms
+          max-idle: 12
+          min-idle: 0
+    mongodb:
+      uri: your-mongodb-uri
+  # 邮件配置（QQ邮箱SMTP）
+  mail:
+    host: your-mail-host
+    port: 465
+    username: your-mail-username
+    password: your-mail-password
+    properties:
+      mail:
+        smtp:
+          from: ${spring.mail.username}
+          auth: true
+          starttls:
+            enable: true
+          ssl:
+            enable: true
+
+# MyBatis-Plus配置
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+  mapper-locations: classpath*:/mapper/**/*.xml
+
+# 服务器配置
+server:
+  port: 8080
+
+# 认证配置
+auth:
+  token-ttl-seconds: 604800          # Token 有效期: 7 天
+  email-code-ttl-seconds: 300        # 验证码有效期: 5 分钟
+  email-code-cooldown-seconds: 60    # 验证码发送冷却: 60 秒
+
+amap:
+  url: https://restapi.amap.com/v3
+  key: your-amap-api-key
+  timeout: 5000
+
+qweather:
+  url: https://mt2pg7fdtc.re.qweatherapi.com
+  key: your-qweather-api-key
+  token: your-qweather-api-token
+  timeout: 5000
