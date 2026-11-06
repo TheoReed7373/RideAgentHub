@@ -2,7 +2,18 @@ package com.fancy.rideagenthub.util;
 
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 
+import java.util.List;
+
 public final class RedisScripts {
+
+    /** 在同一次 Redis 操作中领取并移除到期任务，保护同时发生的改期。 */
+    public static final DefaultRedisScript<List> CLAIM_DUE_ORDERS = new DefaultRedisScript<>("""
+            local orders = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, ARGV[2])
+            for _, orderId in ipairs(orders) do
+                redis.call('ZREM', KEYS[1], orderId)
+            end
+            return orders
+            """, List.class);
 
     /** 原子设置 Hash 字段并刷新整个 key 的过期时间，TTL 单位为秒。 */
     public static final DefaultRedisScript<Long> HASH_SET_WITH_EXPIRE = new DefaultRedisScript<>("""

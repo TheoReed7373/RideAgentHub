@@ -3,12 +3,14 @@ package com.fancy.rideagenthub;
 import com.fancy.rideagenthub.agentbase.amap.service.AmapGeoRegeoService;
 import com.fancy.rideagenthub.agentbase.amap.service.AmapRouteService;
 import com.fancy.rideagenthub.constant.RedisKeyConstants;
+import com.fancy.rideagenthub.config.RideOrderTimeoutProperties;
 import com.fancy.rideagenthub.domain.entity.RideOrder;
 import com.fancy.rideagenthub.domain.entity.UserAuth;
 import com.fancy.rideagenthub.exception.BusinessException;
 import com.fancy.rideagenthub.mapper.RideOrderMapper;
 import com.fancy.rideagenthub.mapper.UserAuthMapper;
 import com.fancy.rideagenthub.service.base.OrderGrabService;
+import com.fancy.rideagenthub.service.base.OrderDelayQueue;
 import com.fancy.rideagenthub.service.base.OrderRouteService;
 import com.fancy.rideagenthub.service.impl.RideOrderServiceImpl;
 import com.fancy.rideagenthub.util.RedisScripts;
@@ -179,6 +181,7 @@ class OrderGrabRegressionTest {
 
     private RideOrderServiceImpl service(RideOrderMapper orders, OrderGrabService grabs) {
         return new RideOrderServiceImpl(orders, mock(AmapRouteService.class), mock(OrderRouteService.class),
-                mock(AmapGeoRegeoService.class), grabs);
+                mock(AmapGeoRegeoService.class), grabs,
+                mock(OrderDelayQueue.class), new RideOrderTimeoutProperties());
     }
 }
