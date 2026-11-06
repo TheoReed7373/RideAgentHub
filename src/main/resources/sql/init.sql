@@ -155,14 +155,14 @@ CREATE TABLE `sys_ticket_chat` (
 CREATE TABLE `sys_qa_info`
 (
     `id` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY ,
-    `group_id` BIGINT NOT NULL ,--雪花id
+    `group_id` BIGINT NOT NULL , -- 雪花id
     `answer` TEXT NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='rag问答对信息表';
 
 CREATE TABLE `sys_qa_es`
 (
     `id` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY ,
-    `elastic_id` BIGINT NOT NULL , --雪花id
-    `group_id` BIGINT NOT NULL , --雪花id
+    `elastic_id` BIGINT NOT NULL , -- 雪花id
+    `group_id` BIGINT NOT NULL , -- 雪花id
     `question` VARCHAR(255) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='rag问答对ES映射表';
