@@ -5,11 +5,13 @@ import com.baomidou.mybatisplus.extension.spring.MybatisSqlSessionFactoryBean;
 import com.fancy.rideagenthub.agentbase.amap.service.AmapGeoRegeoService;
 import com.fancy.rideagenthub.agentbase.amap.service.AmapRouteService;
 import com.fancy.rideagenthub.constant.RedisKeyConstants;
+import com.fancy.rideagenthub.config.RideOrderTimeoutProperties;
 import com.fancy.rideagenthub.exception.BusinessException;
 import com.fancy.rideagenthub.mapper.RideOrderMapper;
 import com.fancy.rideagenthub.mapper.UserAuthMapper;
 import com.fancy.rideagenthub.service.RideOrderService;
 import com.fancy.rideagenthub.service.base.OrderGrabService;
+import com.fancy.rideagenthub.service.base.OrderDelayQueue;
 import com.fancy.rideagenthub.service.base.OrderRouteService;
 import com.fancy.rideagenthub.service.impl.RideOrderServiceImpl;
 import org.junit.jupiter.api.AfterAll;
@@ -234,7 +236,8 @@ class OrderGrabIntegrationTest {
 
     private static RideOrderService rideService(RideOrderMapper mapper) {
         return transactional(new RideOrderServiceImpl(mapper, mock(AmapRouteService.class),
-                mock(OrderRouteService.class), mock(AmapGeoRegeoService.class), grabs));
+                mock(OrderRouteService.class), mock(AmapGeoRegeoService.class), grabs,
+                mock(OrderDelayQueue.class), new RideOrderTimeoutProperties()));
     }
 
     @SuppressWarnings("unchecked")
