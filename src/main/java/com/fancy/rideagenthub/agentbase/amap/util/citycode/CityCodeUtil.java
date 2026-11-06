@@ -4,12 +4,14 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fancy.rideagenthub.constant.RedisKeyConstants;
 import com.fancy.rideagenthub.domain.entity.CityCode;
 import com.fancy.rideagenthub.mapper.CityCodeMapper;
+import com.fancy.rideagenthub.util.RedisScripts;
 import jakarta.annotation.Nullable;
-import jakarta.annotation.Resource;
 import org.springframework.stereotype.Component;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.time.Duration;
+import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 @Component
@@ -59,9 +61,11 @@ public class CityCodeUtil {
         // 此前 key 做了 trim 而 DB 查询用原始入参，两者不一致：
         // 在 MySQL 8.0 默认的 NO PAD 排序规则（utf8mb4_0900_ai_ci）下，
         // "北京 " 与 "北京" 的 DB 结果不同却共用同一个 key，会造成缓存污染。
-        String normalized = cityName.trim();
+        String normalized = cityName.trim().toLowerCase(Locale.ROOT);
 
         String key = RedisKeyConstants.amapCityCodeKey(normalized);
+        String versionKey = RedisKeyConstants.amapCityCodeVersionKey(normalized);
+        String version = redisTemplate.opsForValue().get(versionKey);
         String cached = redisTemplate.opsForValue().get(key);
 
         // 命中墓碑：当前有写入正在进行，本 key 不可信
@@ -77,17 +81,18 @@ public class CityCodeUtil {
         }
 
         String code = queryCityCode(normalized);
-        redisTemplate.opsForValue().set(
-                key,
+        redisTemplate.execute(
+                RedisScripts.CACHE_CITY_CODE_IF_VERSION_MATCH,
+                List.of(key, versionKey),
+                version == null ? "0" : version,
                 code == null ? NULL_SENTINEL : code,
-                CACHE_TTL_DAYS,
-                TimeUnit.DAYS
+                String.valueOf(TimeUnit.DAYS.toSeconds(CACHE_TTL_DAYS))
         );
         return code;
     }
 
     /**
-     * 城市编码发生变更时调用，使缓存失效（墓碑机制）
+     * 城市编码变更的事务提交后调用，使缓存失效（墓碑机制）
      * <p>
      * 不直接 {@code DEL}：删掉之后，一个手持旧快照的并发读线程会立刻把旧值回填，
      * 而回填的 TTL 是 {@link #CACHE_TTL_DAYS} 天 —— 脏数据将存活整整 7 天。
@@ -103,7 +108,9 @@ public class CityCodeUtil {
             return;
         }
         String key = RedisKeyConstants.amapCityCodeKey(cityName.trim());
-        redisTemplate.opsForValue().set(key, TOMBSTONE, TOMBSTONE_TTL);
+        redisTemplate.execute(RedisScripts.INVALIDATE_CITY_CODE,
+                List.of(key, RedisKeyConstants.amapCityCodeVersionKey(cityName)),
+                TOMBSTONE, String.valueOf(TOMBSTONE_TTL.toSeconds()));
     }
 
     @Nullable

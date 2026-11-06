@@ -5,6 +5,7 @@ import com.fancy.rideagenthub.domain.entity.ChatMessage;
 import com.fancy.rideagenthub.mapper.ChatMessageMapper;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -73,6 +74,7 @@ public class MysqlMemory {
         return result;
     }
 
+    @Transactional
     public void append(String chatId, List<Message> messages) {
         if (chatId == null || messages == null || messages.isEmpty()) {
             return;

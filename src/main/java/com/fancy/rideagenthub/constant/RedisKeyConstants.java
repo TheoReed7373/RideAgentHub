@@ -2,6 +2,7 @@ package com.fancy.rideagenthub.constant;
 
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 
 /**
  * Redis Key 常量定义
@@ -140,7 +141,11 @@ public final class RedisKeyConstants {
         if (cityName == null) {
             return AMAP_CITY_CODE_PREFIX;
         }
-        return AMAP_CITY_CODE_PREFIX + cityName.trim().toLowerCase();
+        return AMAP_CITY_CODE_PREFIX + cityName.trim().toLowerCase(Locale.ROOT);
+    }
+
+    public static String amapCityCodeVersionKey(String cityName) {
+        return "amap:city_code:version:" + cityName.trim().toLowerCase(Locale.ROOT);
     }
 
     /**

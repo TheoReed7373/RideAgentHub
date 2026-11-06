@@ -1,10 +1,12 @@
 package com.fancy.rideagenthub.agentbase.memory;
 
 import com.fancy.rideagenthub.constant.RedisKeyConstants;
-import com.fancy.taxiagent.util.RedisScripts;
+import com.fancy.rideagenthub.util.RedisScripts;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.messages.Message;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.RedisOperations;
+import org.springframework.data.redis.core.SessionCallback;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
@@ -15,7 +17,7 @@ import java.util.UUID;
 /**
  * L2 Redis 聊天历史缓存
  * <p>
- * 除常规读写外，还维护一个与数据同生命周期的版本号，用于 Lease 令牌机制：
+ * 除常规读写外，还保留单调递增的版本号，用于 Lease 令牌机制：
  * 回填缓存必须持有效租约（版本号未变），否则拒绝，
  * 避免基于旧 MySQL 快照的回填把并发追加的新消息整段抹掉。
  *
@@ -32,6 +34,7 @@ public class RedisMemory {
      * 若进程在写入暂存后崩溃，靠此 TTL 自清理，避免残留。
      */
     private static final Duration STAGING_TTL = Duration.ofMinutes(1);
+    private static final Duration HISTORY_TTL = Duration.ofHours(24);
 
     private final StringRedisTemplate redisTemplate;
     private final MessageParser messageParser;
@@ -45,15 +48,8 @@ public class RedisMemory {
         if (chatId == null || lastN <= 0) {
             return List.of();
         }
-        String key = RedisKeyConstants.chatHistoryKey(chatId);
-        Long sizeObj = redisTemplate.opsForList().size(key);
-        long size = sizeObj == null ? 0 : sizeObj;
-        if (size <= 0) {
-            return List.of();
-        }
-        long start = Math.max(0, size - (long) lastN);
-        long end = size - 1;
-        return deserialize(redisTemplate.opsForList().range(key, start, end));
+        return deserialize(redisTemplate.opsForList().range(
+                RedisKeyConstants.chatHistoryKey(chatId), -(long) lastN, -1));
     }
 
     public List<Message> getAll(String chatId) {
@@ -72,16 +68,12 @@ public class RedisMemory {
         if (chatId == null) {
             return 0L;
         }
-        String value = redisTemplate.opsForValue().get(RedisKeyConstants.chatHistoryVersionKey(chatId));
-        if (value == null || value.isBlank()) {
-            return 0L;
+        Long version = redisTemplate.execute(RedisScripts.CURRENT_HISTORY_VERSION,
+                List.of(RedisKeyConstants.chatHistoryVersionKey(chatId), RedisKeyConstants.chatHistoryKey(chatId)));
+        if (version == null) {
+            throw new IllegalStateException("无法读取聊天历史版本号");
         }
-        try {
-            return Long.parseLong(value.trim());
-        } catch (NumberFormatException e) {
-            log.warn("聊天历史版本号非法，按 0 处理: chatId={}, value={}", chatId, value);
-            return 0L;
-        }
+        return version;
     }
 
     /**
@@ -90,7 +82,7 @@ public class RedisMemory {
      * 版本递增与数据追加在同一次原子操作内完成，避免"数据已追加、
      * 版本尚未递增"的窗口被手持旧租约的读线程利用。
      *
-     * @param versionTtl 版本 key 的过期时间，需与数据 key 保持一致
+     * @param versionTtl 数据 key 的过期时间，版本号独立保留
      */
     public void append(String chatId, List<Message> messages, Duration versionTtl) {
         if (chatId == null || messages == null || messages.isEmpty()) {
@@ -101,9 +93,9 @@ public class RedisMemory {
             return;
         }
 
-        long ttlSeconds = versionTtl == null ? -1L : versionTtl.toSeconds();
+        long ttlMillis = versionTtl == null ? -1L : versionTtl.toMillis();
         List<String> args = new ArrayList<>(jsonList.size() + 1);
-        args.add(String.valueOf(ttlSeconds));
+        args.add(String.valueOf(ttlMillis));
         args.addAll(jsonList);
 
         redisTemplate.execute(
@@ -111,6 +103,24 @@ public class RedisMemory {
                 List.of(RedisKeyConstants.chatHistoryVersionKey(chatId),
                         RedisKeyConstants.chatHistoryKey(chatId)),
                 args.toArray());
+    }
+
+    /** 只向仍持有写库前版本的完整缓存追加，否则失效并由后续读请求重建。 */
+    public void appendIfVersionMatch(String chatId, List<Message> messages, Duration ttl, long expectedVersion) {
+        if (chatId == null || messages == null || messages.isEmpty()) {
+            return;
+        }
+        List<String> jsonList = serialize(messages);
+        if (jsonList.isEmpty()) {
+            return;
+        }
+        List<String> args = new ArrayList<>(jsonList.size() + 2);
+        args.add(String.valueOf(expectedVersion));
+        args.add(String.valueOf(ttl.toMillis()));
+        args.addAll(jsonList);
+        redisTemplate.execute(RedisScripts.APPEND_HISTORY_IF_VERSION_MATCH,
+                List.of(RedisKeyConstants.chatHistoryVersionKey(chatId),
+                        RedisKeyConstants.chatHistoryKey(chatId)), args.toArray());
     }
 
     /**
@@ -137,8 +147,17 @@ public class RedisMemory {
         String stagingKey = RedisKeyConstants.chatHistoryStagingKey(chatId, UUID.randomUUID().toString());
         try {
             // 1. 待回填数据写入暂存 key。此步失败只影响本次回填，不触碰线上数据。
-            redisTemplate.opsForList().rightPushAll(stagingKey, jsonList);
-            redisTemplate.expire(stagingKey, STAGING_TTL);
+            redisTemplate.execute(new SessionCallback<List<Object>>() {
+                @Override
+                public <K, V> List<Object> execute(RedisOperations<K, V> operations) {
+                    @SuppressWarnings("unchecked")
+                    RedisOperations<String, String> strings = (RedisOperations<String, String>) operations;
+                    strings.multi();
+                    strings.opsForList().rightPushAll(stagingKey, jsonList);
+                    strings.expire(stagingKey, STAGING_TTL);
+                    return strings.exec();
+                }
+            });
 
             // 2. 版本校验 + 原子替换。租约失效时由脚本丢弃暂存数据。
             Long result = redisTemplate.execute(
@@ -146,7 +165,7 @@ public class RedisMemory {
                     List.of(stagingKey,
                             RedisKeyConstants.chatHistoryKey(chatId),
                             RedisKeyConstants.chatHistoryVersionKey(chatId)),
-                    String.valueOf(leaseVersion));
+                    String.valueOf(leaseVersion), String.valueOf(HISTORY_TTL.toMillis()));
 
             if (result != null && result == 1L) {
                 return true;
@@ -171,17 +190,15 @@ public class RedisMemory {
             return;
         }
         redisTemplate.expire(RedisKeyConstants.chatHistoryKey(chatId), duration);
-        // 版本号与数据保持同一生命周期：版本 key 若先过期会归零，
-        // 使在途租约被误判为有效
-        redisTemplate.expire(RedisKeyConstants.chatHistoryVersionKey(chatId), duration);
     }
 
     public void clear(String chatId) {
         if (chatId == null) {
             return;
         }
-        redisTemplate.delete(RedisKeyConstants.chatHistoryKey(chatId));
-        redisTemplate.delete(RedisKeyConstants.chatHistoryVersionKey(chatId));
+        redisTemplate.execute(RedisScripts.CLEAR_HISTORY_WITH_VERSION_BUMP,
+                List.of(RedisKeyConstants.chatHistoryKey(chatId),
+                        RedisKeyConstants.chatHistoryVersionKey(chatId)));
     }
 
     private List<String> serialize(List<Message> messages) {
