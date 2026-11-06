@@ -106,6 +106,28 @@ public final class RedisScripts {
             return version
             """, Long.class);
 
+    /** 检查订单状态与司机占位，并原子占用司机。 */
+    public static final DefaultRedisScript<Long> GRAB_ORDER_ATOMIC = new DefaultRedisScript<>("""
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] then
+                return -1
+            end
+            if redis.call('GET', KEYS[2]) ~= ARGV[2] then
+                return -2
+            end
+            redis.call('SET', KEYS[2], ARGV[3], 'EX', ARGV[4])
+            return 1
+            """, Long.class);
+
+    /** 订单状态单调推进，防止先前操作的延迟同步覆盖后续状态。 */
+    public static final DefaultRedisScript<Long> SYNC_ORDER_STATUS = new DefaultRedisScript<>("""
+            local current = redis.call('GET', KEYS[1])
+            if current == false or tonumber(current) == nil or tonumber(current) <= tonumber(ARGV[1]) then
+                redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+                return 1
+            end
+            return 0
+            """, Long.class);
+
     private RedisScripts() {
     }
 }
