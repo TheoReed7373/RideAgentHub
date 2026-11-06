@@ -28,7 +28,7 @@ import com.fancy.rideagenthub.mapper.TicketMapper;
 import com.fancy.rideagenthub.mapper.UserAuthMapper;
 import com.fancy.rideagenthub.security.UserTokenContext;
 import com.fancy.rideagenthub.service.TicketService;
-import com.fancy.taxiagent.service.base.DelayedCacheEvictor;
+import com.fancy.rideagenthub.service.base.DelayedCacheEvictor;
 import com.fancy.rideagenthub.util.RedisScripts;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -1094,7 +1094,12 @@ public class TicketServiceImpl implements TicketService {
         afterCommit(() -> {
             String cacheKey = RedisKeyConstants.ticketStatisticsKey(LocalDate.now());
             // 第一次删除：立即失效
-            stringRedisTemplate.delete(cacheKey);
+            try {
+                stringRedisTemplate.delete(cacheKey);
+            } catch (RuntimeException e) {
+                // 数据库已经提交，缓存故障通过延迟删除重试。
+                log.warn("工单统计缓存失效失败: key={}", cacheKey, e);
+            }
             // 第二次删除：延迟执行，兜住"并发读基于旧快照回填"的窗口。
             // 注意此处是在提交后调度，因此延迟窗口从"DB 已可见"开始计，语义正确。
             delayedCacheEvictor.evictAfter(cacheKey, TICKET_STATS_DELAYED_EVICT);

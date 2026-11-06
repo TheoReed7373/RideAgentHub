@@ -49,6 +49,7 @@ public class MessageMemory {
 
         switchFocusChatIfNeeded(userId, chatId);
 
+        long heapLease = heapMemory.currentVersion(chatId);
         List<Message> heapAll = heapMemory.getAll(chatId);
         if (!heapAll.isEmpty()) {
             return tail(heapAll, lastN);
@@ -56,21 +57,21 @@ public class MessageMemory {
 
         // 取租约：必须在任何"耗时读取"之前捕获版本号。
         // 若读 L2/MySQL 期间有 save 落库，版本号会变化，本次回填随即被拒绝。
-        long heapLease = heapMemory.currentVersion(chatId);
         long redisLease = redisMemory.currentVersion(chatId);
 
-        List<Message> redisLastN = redisMemory.getLastN(chatId, lastN);
-        if (!redisLastN.isEmpty()) {
-            fillHeapWithLease(chatId, redisLastN, heapLease);
-            return redisLastN;
+        List<Message> redisAll = redisMemory.getAll(chatId);
+        if (!redisAll.isEmpty()) {
+            fillHeapWithLease(chatId, redisAll, heapLease);
+            return tail(redisAll, lastN);
         }
 
-        List<Message> mysqlLastN = mysqlMemory.getLastN(chatId, lastN);
-        if (!mysqlLastN.isEmpty()) {
+        List<Message> mysqlAll = mysqlMemory.getAll(chatId);
+        if (!mysqlAll.isEmpty()) {
             // 持租约回填：宁可放弃回填（下次再查一次 DB），也不覆盖掉并发写入的新消息
-            fillRedisWithLease(chatId, mysqlLastN, redisLease);
-            fillHeapWithLease(chatId, mysqlLastN, heapLease);
-            return mysqlLastN;
+            if (fillRedisWithLease(chatId, mysqlAll, redisLease)) {
+                fillHeapWithLease(chatId, mysqlAll, heapLease);
+            }
+            return tail(mysqlAll, lastN);
         }
 
         return List.of();
@@ -92,11 +93,17 @@ public class MessageMemory {
 
         switchFocusChatIfNeeded(userId, chatId);
 
-        heapMemory.append(chatId, newMessages);
-        // 追加与版本递增在同一脚本内原子完成，使所有在途租约立即失效
-        redisMemory.append(chatId, newMessages, FOCUS_CHAT_TTL);
-        redisMemory.expire(chatId, FOCUS_CHAT_TTL);
+        long heapVersion = heapMemory.currentVersion(chatId);
+        long redisVersion = redisMemory.currentVersion(chatId);
+        // 先完成持久化，避免数据库写入失败后缓存仍返回未保存的消息。
         mysqlMemory.append(chatId, newMessages);
+        try {
+            redisMemory.appendIfVersionMatch(chatId, newMessages, FOCUS_CHAT_TTL, redisVersion);
+            heapMemory.appendIfVersionMatch(chatId, newMessages, heapVersion);
+        } catch (RuntimeException e) {
+            heapMemory.clear(chatId);
+            throw e;
+        }
         chatManager.updateChatTime(chatId);
     }
 
@@ -113,10 +120,10 @@ public class MessageMemory {
 
         switchFocusChatIfNeeded(userId, chatId);
 
+        long heapLease = heapMemory.currentVersion(chatId);
         List<Message> allMessages = heapMemory.getAll(chatId);
         if (allMessages.isEmpty()) {
             // 取租约：必须在任何"耗时读取"之前捕获版本号
-            long heapLease = heapMemory.currentVersion(chatId);
             long redisLease = redisMemory.currentVersion(chatId);
 
             List<Message> redisAll = redisMemory.getAll(chatId);
@@ -126,8 +133,9 @@ public class MessageMemory {
             } else {
                 List<Message> mysqlAll = mysqlMemory.getAll(chatId);
                 if (!mysqlAll.isEmpty()) {
-                    fillRedisWithLease(chatId, mysqlAll, redisLease);
-                    fillHeapWithLease(chatId, mysqlAll, heapLease);
+                    if (fillRedisWithLease(chatId, mysqlAll, redisLease)) {
+                        fillHeapWithLease(chatId, mysqlAll, heapLease);
+                    }
                     allMessages = mysqlAll;
                 } else {
                     return List.of();
@@ -148,9 +156,12 @@ public class MessageMemory {
         if (chatId == null || chatId.isBlank()) {
             return;
         }
-        heapMemory.clear(chatId);
-        redisMemory.clear(chatId);
         mysqlMemory.clear(chatId);
+        try {
+            redisMemory.clear(chatId);
+        } finally {
+            heapMemory.clear(chatId);
+        }
     }
 
     /**
@@ -158,10 +169,8 @@ public class MessageMemory {
      *
      * @param leaseVersion 读 MySQL 快照之前捕获的版本号
      */
-    private void fillRedisWithLease(String chatId, List<Message> messages, long leaseVersion) {
-        if (redisMemory.overwriteIfLeaseValid(chatId, messages, leaseVersion)) {
-            redisMemory.expire(chatId, FOCUS_CHAT_TTL);
-        }
+    private boolean fillRedisWithLease(String chatId, List<Message> messages, long leaseVersion) {
+        return redisMemory.overwriteIfLeaseValid(chatId, messages, leaseVersion);
     }
 
     /**
@@ -170,16 +179,12 @@ public class MessageMemory {
      * L1 是优先读取的层，若在此处覆盖掉并发 save 刚追加的消息，
      * 后续读取会被脏 L1 短路，L2 修得再好也救不回来 —— 故 L1 同样必须校验租约。
      * <p>
-     * 租约失效时清空 L1：此刻 L1 的内容不完整（可能只含并发追加的那几条），
-     * 保留它反而会让后续读取拿到残缺上下文；清空后下次读取会从 L2 重新加载，
-     * 而 L2 是权威的。
+     * 租约失效时保留并发写入的内容，避免旧读请求清掉新数据。
      *
      * @param leaseVersion 任何耗时读取之前捕获的 L1 版本号
      */
     private void fillHeapWithLease(String chatId, List<Message> messages, long leaseVersion) {
-        if (!heapMemory.overwriteIfVersionMatch(chatId, messages, leaseVersion)) {
-            heapMemory.clear(chatId);
-        }
+        heapMemory.overwriteIfVersionMatch(chatId, messages, leaseVersion);
     }
 
     private void switchFocusChatIfNeeded(String userId, String newChatId) {

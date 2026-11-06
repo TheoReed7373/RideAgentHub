@@ -99,10 +99,28 @@ public class HeapMemory {
         return written[0];
     }
 
+    /** 写库期间版本发生变化时失效缓存，避免重复追加已被读请求回填的新消息。 */
+    public void appendIfVersionMatch(String chatId, List<Message> messages, long expectedVersion) {
+        if (chatId == null || messages == null || messages.isEmpty()) {
+            return;
+        }
+        heapCache.compute(chatId, (key, existing) -> {
+            long current = existing == null ? 0L : existing.version();
+            List<Message> merged = new ArrayList<>();
+            if (current == expectedVersion && existing != null && !existing.messages().isEmpty()) {
+                merged.addAll(existing.messages());
+                merged.addAll(messages);
+            }
+            return new Entry(merged, current + 1);
+        });
+    }
+
     public void clear(String chatId) {
         if (chatId == null) {
             return;
         }
-        heapCache.remove(chatId);
+        // 保留递增后的版本，防止清空之前持有的租约因版本归零重新生效。
+        heapCache.compute(chatId, (key, existing) ->
+                new Entry(List.of(), existing == null ? 1L : existing.version() + 1));
     }
 }
