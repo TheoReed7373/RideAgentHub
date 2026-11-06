@@ -1,4 +1,6 @@
 spring:
+  config:
+    import: optional:file:./.env.properties
   application:
     name: RideAgentHub
   ai:
@@ -14,9 +16,9 @@ spring:
   # 数据源配置
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: your-database-url
-    username: your-database-username
-    password: your-database-password
+    url: ${MYSQL_URL:jdbc:mysql://127.0.0.1:3306/taxi_agent?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false}
+    username: ${MYSQL_USERNAME}
+    password: ${MYSQL_PASSWORD}
   # Elasticsearch配置
   elasticsearch:
     uris: your-elasticsearch-url
