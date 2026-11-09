@@ -10,6 +10,7 @@ import com.fancy.rideagenthub.agentbase.chatinfo.ChatManager;
 import com.fancy.rideagenthub.constant.RedisKeyConstants;
 import com.fancy.rideagenthub.domain.entity.CityCode;
 import com.fancy.rideagenthub.mapper.CityCodeMapper;
+import com.fancy.rideagenthub.service.base.RedisLock;
 import com.fancy.rideagenthub.util.RedisScripts;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -254,6 +255,30 @@ class RedisCacheRegressionTest {
         assertEquals("new-owner", redis.opsForValue().get(lock));
         assertEquals(1L, redis.execute(RedisScripts.RELEASE_LOCK_IF_MATCH, List.of(lock), "new-owner"));
         assertFalse(redis.hasKey(lock));
+    }
+
+    @Test
+    void redisLockHelperRejectsContentionAndProtectsNewOwnerAfterExpiry() throws Exception {
+        String key = "helper-lock-" + chatId;
+        keys.add(key);
+        var locks = new RedisLock(redis);
+        String oldToken = locks.tryLock(key, Duration.ofSeconds(30));
+        assertNotNull(oldToken);
+        assertTrue(redis.getExpire(key) > 0);
+        assertNull(locks.tryLock(key, Duration.ofSeconds(30)));
+        // 缩短有效期，验证真实过期后旧令牌不会删除新持有者。
+        redis.expire(key, Duration.ofMillis(20));
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+        while (Boolean.TRUE.equals(redis.hasKey(key)) && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        String newToken = locks.tryLock(key, Duration.ofSeconds(30));
+        assertNotNull(newToken);
+        assertNotEquals(oldToken, newToken);
+        locks.unlock(key, oldToken);
+        assertEquals(newToken, redis.opsForValue().get(key));
+        locks.unlock(key, newToken);
+        assertFalse(redis.hasKey(key));
     }
 
     private static List<Message> messages(String... texts) {

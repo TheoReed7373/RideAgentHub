@@ -22,6 +22,9 @@ import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.mybatis.spring.SqlSessionTemplate;
+import org.redisson.Redisson;
+import org.redisson.api.RedissonClient;
+import org.redisson.config.Config;
 import org.springframework.aop.framework.ProxyFactory;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
@@ -41,6 +44,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -53,6 +57,7 @@ class OrderGrabIntegrationTest {
 
     private static LettuceConnectionFactory redisFactory;
     private static StringRedisTemplate redis;
+    private static RedissonClient redisson;
     private static JdbcTemplate admin;
     private static JdbcTemplate database;
     private static String schema;
@@ -93,12 +98,18 @@ class OrderGrabIntegrationTest {
         redisFactory.afterPropertiesSet();
         redisFactory.start();
         redis = new StringRedisTemplate(redisFactory);
+        Config redisConfig = new Config().setLockWatchdogTimeout(1500L);
+        redisConfig.useSingleServer().setAddress("redis://127.0.0.1:" + System.getProperty("test.redis.port"));
+        redisson = Redisson.create(redisConfig);
         grabs = transactional(new OrderGrabService(redis, orders, session.getMapper(UserAuthMapper.class)));
         rides = rideService(orders);
     }
 
     @AfterAll
     static void shutdown() {
+        if (redisson != null) {
+            redisson.shutdown();
+        }
         if (redisFactory != null) {
             redisFactory.destroy();
         }
@@ -158,10 +169,12 @@ class OrderGrabIntegrationTest {
         transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
         transaction.execute(status -> {
             assertTrue(rides.driverAcceptOrder("100", "1", null, null));
+            assertTrue(redisson.getLock(RedisKeyConstants.orderLockKey("100")).isHeldByCurrentThread());
             status.setRollbackOnly();
             return null;
         });
         assertEquals(0, activeCount());
+        assertFalse(redisson.getLock(RedisKeyConstants.orderLockKey("100")).isLocked());
         assertNull(redis.opsForValue().get(RedisKeyConstants.driverActiveKey("1")));
         assertEquals("10", redis.opsForValue().get(RedisKeyConstants.orderStatusKey("100")));
         assertTrue(rides.driverAcceptOrder("100", "1", null, null));
@@ -207,6 +220,58 @@ class OrderGrabIntegrationTest {
         assertEquals("90", redis.opsForValue().get(RedisKeyConstants.orderStatusKey("100")));
     }
 
+    @Test
+    void acceptedOrderLockCoversOuterTransactionAndReleasesAfterCommit() {
+        var transaction = new TransactionTemplate(transactionManager);
+        transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        transaction.execute(status -> {
+            assertTrue(rides.driverAcceptOrder("0100", "01", null, null));
+            assertTrue(redisson.getLock(RedisKeyConstants.orderLockKey("100")).isHeldByCurrentThread());
+            return null;
+        });
+        assertFalse(redisson.getLock(RedisKeyConstants.orderLockKey("100")).isLocked());
+        assertEquals("20", redis.opsForValue().get(RedisKeyConstants.orderStatusKey("100")));
+    }
+
+    @Test
+    void concurrentArrivalWaitsForAcceptanceTransactionCommit() throws Exception {
+        var executor = Executors.newSingleThreadExecutor();
+        try {
+            var transaction = new TransactionTemplate(transactionManager);
+            transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+            var arrival = transaction.execute(status -> {
+                assertTrue(rides.driverAcceptOrder("0100", "01", null, null));
+                var started = new CountDownLatch(1);
+                var pending = executor.submit(() -> {
+                    started.countDown();
+                    return rides.driverArriveStart("100", "1");
+                });
+                assertTrue(assertDoesNotThrow(() -> started.await(1, TimeUnit.SECONDS)));
+                assertThrows(TimeoutException.class, () -> pending.get(200, TimeUnit.MILLISECONDS));
+                return pending;
+            });
+            assertNotNull(arrival);
+            assertTrue(arrival.get(5, TimeUnit.SECONDS));
+            assertEquals(30, database.queryForObject("SELECT order_status FROM sys_ride_order WHERE order_id=100", Integer.class));
+        } finally {
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void slowTransactionRenewsOrderLockBeyondWatchdogTimeout() {
+        var transaction = new TransactionTemplate(transactionManager);
+        transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        transaction.execute(status -> {
+            assertTrue(rides.driverAcceptOrder("100", "1", null, null));
+            assertDoesNotThrow(() -> Thread.sleep(2200));
+            assertTrue(redisson.getLock(RedisKeyConstants.orderLockKey("100")).isHeldByCurrentThread());
+            return null;
+        });
+        assertFalse(redisson.getLock(RedisKeyConstants.orderLockKey("100")).isLocked());
+    }
+
     private static int activeCount() {
         return database.queryForObject("SELECT COUNT(*) FROM sys_ride_order WHERE driver_id IS NOT NULL AND order_status NOT IN (50,60,90)", Integer.class);
     }
@@ -237,7 +302,7 @@ class OrderGrabIntegrationTest {
     private static RideOrderService rideService(RideOrderMapper mapper) {
         return transactional(new RideOrderServiceImpl(mapper, mock(AmapRouteService.class),
                 mock(OrderRouteService.class), mock(AmapGeoRegeoService.class), grabs,
-                mock(OrderDelayQueue.class), new RideOrderTimeoutProperties()));
+                mock(OrderDelayQueue.class), new RideOrderTimeoutProperties(), redisson));
     }
 
     @SuppressWarnings("unchecked")

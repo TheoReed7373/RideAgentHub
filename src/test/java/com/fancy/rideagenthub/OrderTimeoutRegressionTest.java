@@ -182,6 +182,7 @@ class OrderTimeoutRegressionTest {
 
     private RideOrderServiceImpl service(RideOrderMapper orders, OrderGrabService grabs, OrderDelayQueue queue) {
         return new RideOrderServiceImpl(orders, mock(AmapRouteService.class), mock(OrderRouteService.class),
-                mock(AmapGeoRegeoService.class), grabs, queue, new RideOrderTimeoutProperties());
+                mock(AmapGeoRegeoService.class), grabs, queue, new RideOrderTimeoutProperties(),
+                OrderLockTestSupport.availableClient());
     }
 }

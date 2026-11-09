@@ -11,6 +11,7 @@ import com.fancy.rideagenthub.mapper.TicketChatMapper;
 import com.fancy.rideagenthub.mapper.TicketMapper;
 import com.fancy.rideagenthub.mapper.UserAuthMapper;
 import com.fancy.rideagenthub.service.base.DelayedCacheEvictor;
+import com.fancy.rideagenthub.service.base.RedisLock;
 import com.fancy.rideagenthub.service.impl.TicketServiceImpl;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
@@ -156,7 +157,8 @@ class CacheConsistencyRegressionTest {
         when(values.increment(anyString())).thenReturn(1L);
         DelayedCacheEvictor delayed = mock(DelayedCacheEvictor.class);
         TicketServiceImpl service = new TicketServiceImpl(mock(TicketMapper.class), mock(TicketChatMapper.class),
-                mock(UserAuthMapper.class), redis, new ObjectMapper(), delayed);
+                mock(UserAuthMapper.class), redis, new ObjectMapper(), delayed,
+                new RedisLock(redis));
         TransactionSynchronizationManager.initSynchronization();
         service.submitTicket(TicketCreateReqDTO.builder().userId("1").ticketType(1)
                 .title("test").content("test").build());
@@ -178,7 +180,8 @@ class CacheConsistencyRegressionTest {
         when(values.increment(anyString())).thenReturn(1L);
         DelayedCacheEvictor delayed = mock(DelayedCacheEvictor.class);
         TicketServiceImpl service = new TicketServiceImpl(mock(TicketMapper.class), mock(TicketChatMapper.class),
-                mock(UserAuthMapper.class), redis, new ObjectMapper(), delayed);
+                mock(UserAuthMapper.class), redis, new ObjectMapper(), delayed,
+                new RedisLock(redis));
         TransactionSynchronizationManager.initSynchronization();
         service.submitTicket(TicketCreateReqDTO.builder().userId("1").ticketType(1)
                 .title("test").content("test").build());
