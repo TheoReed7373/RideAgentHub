@@ -12,6 +12,8 @@ import com.fancy.rideagenthub.mapper.UserAuthMapper;
 import com.fancy.rideagenthub.service.RideOrderService;
 import com.fancy.rideagenthub.service.base.OrderGrabService;
 import com.fancy.rideagenthub.service.base.OrderDelayQueue;
+import com.fancy.rideagenthub.service.base.OrderGeoPool;
+import com.fancy.rideagenthub.service.base.DriverGeoIndex;
 import com.fancy.rideagenthub.service.base.OrderRouteService;
 import com.fancy.rideagenthub.service.impl.RideOrderServiceImpl;
 import org.junit.jupiter.api.AfterAll;
@@ -302,7 +304,7 @@ class OrderGrabIntegrationTest {
     private static RideOrderService rideService(RideOrderMapper mapper) {
         return transactional(new RideOrderServiceImpl(mapper, mock(AmapRouteService.class),
                 mock(OrderRouteService.class), mock(AmapGeoRegeoService.class), grabs,
-                mock(OrderDelayQueue.class), new RideOrderTimeoutProperties(), redisson));
+                mock(OrderDelayQueue.class), mock(OrderGeoPool.class), mock(DriverGeoIndex.class), new RideOrderTimeoutProperties(), redisson));
     }
 
     @SuppressWarnings("unchecked")

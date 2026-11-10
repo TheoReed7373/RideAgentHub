@@ -9,7 +9,9 @@ import com.fancy.rideagenthub.constant.RedisKeyConstants;
 import com.fancy.rideagenthub.domain.dto.CreateOrderDTO;
 import com.fancy.rideagenthub.domain.entity.OrderRoute;
 import com.fancy.rideagenthub.security.UserTokenContext;
+import com.fancy.rideagenthub.service.base.DriverGeoIndex;
 import com.fancy.rideagenthub.service.base.OrderDelayQueue;
+import com.fancy.rideagenthub.service.base.OrderGeoPool;
 import com.fancy.rideagenthub.service.base.OrderGrabService;
 import com.fancy.rideagenthub.service.base.OrderRouteService;
 import com.fancy.rideagenthub.domain.dto.Point;
@@ -40,8 +42,12 @@ import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -58,6 +64,8 @@ public class RideOrderServiceImpl implements RideOrderService {
     private final AmapGeoRegeoService amapGeoRegeoService;
     private final OrderGrabService orderGrabService;
     private final OrderDelayQueue orderDelayQueue;
+    private final OrderGeoPool orderGeoPool;
+    private final DriverGeoIndex driverGeoIndex;
     private final RideOrderTimeoutProperties timeoutProperties;
     private final RedissonClient redissonClient;
     private final SnowflakeIdWorker snowflakeIdWorker = new SnowflakeIdWorker(1, 1);
@@ -294,6 +302,8 @@ public class RideOrderServiceImpl implements RideOrderService {
         orderGrabService.syncOrderStatus(createdOrderId, RideOrderStatus.CREATED.getCode());
         // 登记无人接单兜底：到点仍停留在"待接单"就自动取消
         orderDelayQueue.schedule(createdOrderId, Duration.ofMinutes(timeoutProperties.getAcceptTimeoutMinutes()));
+        // 新订单落库后失效完整 GEO 池，下次按数据库起点坐标重建。
+        orderGeoPool.add(createdOrderId, order.getStartLng(), order.getStartLat());
         return createdOrderId;
     }
 
@@ -340,6 +350,13 @@ public class RideOrderServiceImpl implements RideOrderService {
             }
 
             orderGrabService.syncOrderStatus(orderId, RideOrderStatus.DRIVER_ACCEPTED.getCode());
+            // 订单离开待接单，提交后失效附近订单索引
+            orderGeoPool.remove(orderId);
+            // 顺手用请求里一直闲置的 currentLat/currentLng 刷新司机位置。
+            // 用 refreshIfExist 而非 goOnline：未上线的司机不该因为接了单就凭空出现在在线池里
+            if (currentLng != null && currentLat != null) {
+                driverGeoIndex.refreshIfExist(driverId, currentLng, currentLat);
+            }
             // 覆盖掉"无人接单"的待办，改为盯"司机是否按时到达"
             orderDelayQueue.schedule(orderId, Duration.ofMinutes(timeoutProperties.getArriveTimeoutMinutes()));
             return true;
@@ -731,6 +748,8 @@ public class RideOrderServiceImpl implements RideOrderService {
 
         if (updated > 0) {
             orderGrabService.syncOrderStatus(orderId, RideOrderStatus.CANCELLED.getCode());
+            // 已作废的订单不该再出现在司机的"附近订单"里
+            orderGeoPool.remove(orderId);
             // 订单作废即释放司机，否则该司机将一直被这单锁在"忙"状态
             if (order.getDriverId() != null) {
                 orderGrabService.releaseDriver(order.getDriverId().toString(), orderId);
@@ -751,7 +770,7 @@ public class RideOrderServiceImpl implements RideOrderService {
      * 记下的意图。这样处理滞后、重复触发、以及任务入队后订单又被推进等情况
      * 都会自然退化为"什么都不做"，无需额外去重。
      *
-     * @param orderId 订单ID
+     * @param rawOrderId 原始订单ID
      */
     @Override
     @Transactional(isolation = Isolation.READ_COMMITTED)
@@ -864,6 +883,8 @@ public class RideOrderServiceImpl implements RideOrderService {
         orderGrabService.releaseDriver(order.getDriverId().toString(), orderIdStr);
         // 状态缓存按数值单调推进，回池需要失效后重新读取数据库。
         orderGrabService.refreshOrderStatus(orderIdStr);
+        // 订单退回待接单，提交后失效附近订单索引。
+        orderGeoPool.add(orderIdStr, order.getStartLng(), order.getStartLat());
         orderDelayQueue.schedule(orderIdStr, Duration.ofMinutes(timeoutProperties.getAcceptTimeoutMinutes()));
         // TODO 实际部署时应通过推送通道告知司机与乘客；当前项目订单侧尚无通知设施，先落日志
         log.info("司机超时未到达，订单已退回车池: orderId={}, driverId={}", orderIdStr, order.getDriverId());
@@ -921,6 +942,8 @@ public class RideOrderServiceImpl implements RideOrderService {
 
         orderGrabService.syncOrderStatus(orderId, RideOrderStatus.CANCELLED.getCode());
         orderDelayQueue.cancel(orderId);
+        // 系统取消（无人接单超时 / 超时未支付）同样要让订单离开附近订单池
+        orderGeoPool.remove(orderId);
         if (order.getDriverId() != null) {
             orderGrabService.releaseDriver(order.getDriverId().toString(), orderId);
         }
@@ -1110,22 +1133,126 @@ public class RideOrderServiceImpl implements RideOrderService {
         return rideOrderMapper.selectList(qw).stream().map(this::toVO).toList();
     }
 
+    /**
+     * 司机端"附近订单"查询
+     * <p>
+     * 原实现是纯 DB 的时间排序，司机看到的是"最新发布的订单"；对出租车业务来说
+     * 真正需要的是"离我最近的订单"。这里改成以司机在线位置为圆心做 GEO 附近查询，
+     * 距离由近到远，搜索半径三公里、最多返回最近 200 个候选。
+     * <p>
+     * <b>三分支</b>：
+     * <ol>
+     *   <li>司机未上线 —— 没有圆心，返回空池，由前端引导"先上线"；</li>
+     *   <li>Redis 不可用 / 地理池尚未建立 —— 退回按时间排序的 DB 查询。
+     *       缓存是加速结构，绝不能因为它不可用就让司机看不到任何订单；</li>
+     *   <li>正常 —— 走地理池，按距离排序。</li>
+     * </ol>
+     *
+     * @param driverId 当前登录司机（由 controller 从登录态取出，不信任请求体）
+     * @param page     页码，从 1 开始
+     * @param size     页大小
+     */
     @Override
-    public PageResult<RideOrderVO> getDriverOrderPool(Integer page, Integer size) {
+    public PageResult<RideOrderVO> getDriverOrderPool(String driverId, Integer page, Integer size) {
         int p = page == null ? 1 : page;
         int s = size == null ? 10 : size;
         if (p <= 0 || s <= 0) {
             throw new IllegalArgumentException("page/size必须为正数");
         }
-        int offset = (p - 1) * s;
+        if (driverId == null || driverId.isBlank()) {
+            throw new IllegalArgumentException("driverId不能为空");
+        }
 
+        DriverGeoIndex.Location location = driverGeoIndex.location(driverId);
+        if (location.status() == DriverGeoIndex.OnlineStatus.OFFLINE) {
+            return emptyPool(p, s);
+        }
+        if (location.status() != DriverGeoIndex.OnlineStatus.ONLINE || location.point() == null) {
+            return legacyTimeSortedPool(p, s);
+        }
+        Optional<OrderGeoPool.GeoSlice> candidates = orderGeoPool
+                .search(location.point().getLng(), location.point().getLat());
+        if (candidates.isEmpty()) {
+            return legacyTimeSortedPool(p, s);
+        }
+
+        return buildDistanceSortedPool(candidates.get(), p, s);
+    }
+
+    /**
+     * 由地理池的候选集装配分页结果
+     * <p>
+     * 池里的候选必须<b>回表校验</b>：订单被接单/取消到摘除之间存在时间差，
+     * 池里可能残留已经失效的订单。发现失效候选时整页降级，避免分页缺项。
+     * <p>
+     * 由于分页发生在过滤之后，这里一次性取回候选再在内存中切片 —— 候选量由
+     * 地理池的扫描上限约束，不存在无界内存问题。
+     */
+    private PageResult<RideOrderVO> buildDistanceSortedPool(OrderGeoPool.GeoSlice slice, int p, int s) {
+        List<OrderGeoPool.GeoOrder> candidates = slice.orders();
+        if (candidates.isEmpty()) {
+            return orderGeoPool.isCurrent(slice) ? emptyPool(p, s) : legacyTimeSortedPool(p, s);
+        }
+
+        List<Long> orderIds = new ArrayList<>(candidates.size());
+        Map<Long, Double> distanceById = new HashMap<>(candidates.size());
+        for (OrderGeoPool.GeoOrder candidate : candidates) {
+            orderIds.add(candidate.orderId());
+            distanceById.put(candidate.orderId(), candidate.distanceKm());
+        }
+
+        List<RideOrder> alive = rideOrderMapper.selectList(new LambdaQueryWrapper<RideOrder>()
+                .eq(RideOrder::getIsDeleted, 0)
+                .eq(RideOrder::getOrderStatus, RideOrderStatus.CREATED.getCode())
+                .in(RideOrder::getOrderId, orderIds));
+
+        Map<Long, RideOrder> orderById = new HashMap<>(alive.size());
+        for (RideOrder order : alive) {
+            orderById.put(order.getOrderId(), order);
+        }
+
+        if (orderById.size() != orderIds.size() || !orderGeoPool.isCurrent(slice)) {
+            // 候选失效或回表期间有订单变更时整页降级，避免残页和错误总数。
+            return legacyTimeSortedPool(p, s);
+        }
+
+        // in() 查询不保证返回顺序，必须按地理池给出的距离序重排
+        List<RideOrderVO> ordered = new ArrayList<>(alive.size());
+        for (Long orderId : orderIds) {
+            RideOrder order = orderById.get(orderId);
+            if (order == null) {
+                continue;
+            }
+            RideOrderVO vo = toVO(order);
+            vo.setDistanceKm(BigDecimal.valueOf(distanceById.get(orderId))
+                    .setScale(2, RoundingMode.HALF_UP));
+            ordered.add(vo);
+        }
+
+        int from = (int) Math.min((long) (p - 1) * s, ordered.size());
+        int to = (int) Math.min((long) from + s, ordered.size());
+        return PageResult.<RideOrderVO>builder()
+                .page(p)
+                .size(s)
+                .total((long) ordered.size())
+                .records(new ArrayList<>(ordered.subList(from, to)))
+                .build();
+    }
+
+    /**
+     * 降级路径：按创建时间倒序直查 DB
+     * <p>
+     * 这是地理池上线前的原逻辑，保留为 Redis 不可用时的兜底。
+     */
+    private PageResult<RideOrderVO> legacyTimeSortedPool(int p, int s) {
+        long offset = (long) (p - 1) * s;
         LambdaQueryWrapper<RideOrder> baseQw = new LambdaQueryWrapper<RideOrder>()
                 .eq(RideOrder::getIsDeleted, 0)
                 .eq(RideOrder::getOrderStatus, RideOrderStatus.CREATED.getCode());
 
         Long total = rideOrderMapper.selectCount(baseQw);
         List<RideOrder> list = rideOrderMapper.selectList(baseQw
-                .orderByDesc(RideOrder::getCreateTime)
+                .orderByDesc(RideOrder::getCreateTime, RideOrder::getOrderId)
                 .last("limit " + offset + "," + s));
 
         List<RideOrderVO> records = list.stream().map(this::toVO).toList();
@@ -1134,6 +1261,18 @@ public class RideOrderServiceImpl implements RideOrderService {
                 .size(s)
                 .total(total == null ? 0L : total)
                 .records(records)
+                .build();
+    }
+
+    /**
+     * 空池（司机未上线 / 附近确实没有订单）
+     */
+    private PageResult<RideOrderVO> emptyPool(int p, int s) {
+        return PageResult.<RideOrderVO>builder()
+                .page(p)
+                .size(s)
+                .total(0L)
+                .records(List.of())
                 .build();
     }
 
