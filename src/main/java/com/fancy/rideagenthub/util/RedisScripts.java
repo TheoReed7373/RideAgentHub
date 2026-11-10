@@ -6,6 +6,84 @@ import java.util.List;
 
 public final class RedisScripts {
 
+    /** 原子更新位置与心跳；接单刷新模式只更新尚未过期的在线司机。时间以 Redis 为准。 */
+    public static final DefaultRedisScript<Long> UPDATE_DRIVER_LOCATION = new DefaultRedisScript<>("""
+            local time = redis.call('TIME')
+            local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+            if ARGV[5] == 'refresh' then
+                local beat = tonumber(redis.call('HGET', KEYS[1], ARGV[1]))
+                if not beat or now < beat or now - beat >= tonumber(ARGV[4])
+                        or not redis.call('ZSCORE', KEYS[2], ARGV[1]) then
+                    redis.call('HDEL', KEYS[1], ARGV[1])
+                    redis.call('ZREM', KEYS[2], ARGV[1])
+                    return 0
+                end
+            end
+            redis.call('GEOADD', KEYS[2], ARGV[2], ARGV[3], ARGV[1])
+            redis.call('HSET', KEYS[1], ARGV[1], string.format('%.0f', now))
+            return 1
+            """, Long.class);
+
+    public static final DefaultRedisScript<Long> REMOVE_DRIVER_LOCATION = new DefaultRedisScript<>("""
+            redis.call('HDEL', KEYS[1], ARGV[1])
+            redis.call('ZREM', KEYS[2], ARGV[1])
+            return 1
+            """, Long.class);
+
+    /** 原子检查心跳并返回同一时刻的位置；过期或坐标缺失时同时清理两个成员。 */
+    public static final DefaultRedisScript<List> READ_DRIVER_LOCATION = new DefaultRedisScript<>("""
+            local time = redis.call('TIME')
+            local now = tonumber(time[1]) * 1000 + math.floor(tonumber(time[2]) / 1000)
+            local beat = tonumber(redis.call('HGET', KEYS[1], ARGV[1]))
+            local positions = redis.call('GEOPOS', KEYS[2], ARGV[1])
+            if beat and now >= beat and now - beat < tonumber(ARGV[2]) and positions[1] then
+                return positions[1]
+            end
+            redis.call('HDEL', KEYS[1], ARGV[1])
+            redis.call('ZREM', KEYS[2], ARGV[1])
+            return {}
+            """, List.class);
+
+    /** 订单提交后失效整池；版本令牌阻止并发重建发布旧数据库快照。 */
+    public static final DefaultRedisScript<Long> INVALIDATE_ORDER_GEO_POOL = new DefaultRedisScript<>("""
+            redis.call('SET', KEYS[1], ARGV[1])
+            redis.call('DEL', KEYS[2], KEYS[3])
+            return 1
+            """, Long.class);
+
+    /** 版本与锁仍有效时发布完整 GEO 池，数据和标记固定到期，不因单笔订单续期。 */
+    public static final DefaultRedisScript<Long> PUBLISH_ORDER_GEO_POOL = new DefaultRedisScript<>("""
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] or redis.call('GET', KEYS[2]) ~= ARGV[2] then
+                return 0
+            end
+            redis.call('DEL', KEYS[3], KEYS[4])
+            for i = 4, #ARGV, 3 do
+                redis.call('GEOADD', KEYS[4], ARGV[i], ARGV[i + 1], ARGV[i + 2])
+            end
+            local count = redis.call('ZCARD', KEYS[4])
+            redis.call('PEXPIRE', KEYS[4], ARGV[3])
+            redis.call('SET', KEYS[3], ARGV[1] .. ':' .. count, 'PX', ARGV[3])
+            return 1
+            """, Long.class);
+
+    /** 就绪标记、池成员数和附近搜索原子读取；GEORADIUS 兼容本地 Redis 5。 */
+    public static final DefaultRedisScript<List> SEARCH_ORDER_GEO_POOL = new DefaultRedisScript<>("""
+            local version = redis.call('GET', KEYS[1])
+            local ready = redis.call('GET', KEYS[2])
+            local count = redis.call('ZCARD', KEYS[3])
+            if not version or ready ~= version .. ':' .. count then
+                return {}
+            end
+            local orders = redis.call('GEORADIUS', KEYS[3], ARGV[1], ARGV[2],
+                ARGV[3], 'km', 'ASC', 'COUNT', ARGV[4], 'WITHDIST')
+            local result = {version}
+            for _, order in ipairs(orders) do
+                table.insert(result, order[1])
+                table.insert(result, order[2])
+            end
+            return result
+            """, List.class);
+
     /** 同时更换版本并移除旧状态池，阻止并发重建发布旧快照。 */
     public static final DefaultRedisScript<Long> INVALIDATE_TICKET_POOLS = new DefaultRedisScript<>("""
             redis.call('SET', KEYS[1], ARGV[1])

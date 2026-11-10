@@ -10,6 +10,8 @@ import com.fancy.rideagenthub.domain.entity.RideOrder;
 import com.fancy.rideagenthub.exception.BusinessException;
 import com.fancy.rideagenthub.mapper.RideOrderMapper;
 import com.fancy.rideagenthub.service.base.OrderDelayQueue;
+import com.fancy.rideagenthub.service.base.OrderGeoPool;
+import com.fancy.rideagenthub.service.base.DriverGeoIndex;
 import com.fancy.rideagenthub.service.base.OrderGrabService;
 import com.fancy.rideagenthub.service.base.OrderRouteService;
 import com.fancy.rideagenthub.service.impl.RideOrderServiceImpl;
@@ -40,7 +42,7 @@ class OrderLockRegressionTest {
     private final RedissonClient client = OrderLockTestSupport.availableClient();
     private final RLock lock = client.getLock(RedisKeyConstants.orderLockKey("100"));
     private final RideOrderServiceImpl service = new RideOrderServiceImpl(orders, mock(AmapRouteService.class),
-            routes, mock(AmapGeoRegeoService.class), grabs, queue, new RideOrderTimeoutProperties(), client);
+            routes, mock(AmapGeoRegeoService.class), grabs, queue, mock(OrderGeoPool.class), mock(DriverGeoIndex.class), new RideOrderTimeoutProperties(), client);
 
     @BeforeAll
     static void initializeMapperMetadata() {

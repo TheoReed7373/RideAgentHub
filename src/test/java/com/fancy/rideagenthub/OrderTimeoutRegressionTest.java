@@ -10,6 +10,8 @@ import com.fancy.rideagenthub.domain.entity.RideOrder;
 import com.fancy.rideagenthub.mapper.RideOrderMapper;
 import com.fancy.rideagenthub.service.RideOrderService;
 import com.fancy.rideagenthub.service.base.OrderDelayQueue;
+import com.fancy.rideagenthub.service.base.OrderGeoPool;
+import com.fancy.rideagenthub.service.base.DriverGeoIndex;
 import com.fancy.rideagenthub.service.base.OrderGrabService;
 import com.fancy.rideagenthub.service.base.OrderRouteService;
 import com.fancy.rideagenthub.service.base.OrderTimeoutJob;
@@ -182,7 +184,7 @@ class OrderTimeoutRegressionTest {
 
     private RideOrderServiceImpl service(RideOrderMapper orders, OrderGrabService grabs, OrderDelayQueue queue) {
         return new RideOrderServiceImpl(orders, mock(AmapRouteService.class), mock(OrderRouteService.class),
-                mock(AmapGeoRegeoService.class), grabs, queue, new RideOrderTimeoutProperties(),
+                mock(AmapGeoRegeoService.class), grabs, queue, mock(OrderGeoPool.class), mock(DriverGeoIndex.class), new RideOrderTimeoutProperties(),
                 OrderLockTestSupport.availableClient());
     }
 }

@@ -11,6 +11,8 @@ import com.fancy.rideagenthub.mapper.RideOrderMapper;
 import com.fancy.rideagenthub.mapper.UserAuthMapper;
 import com.fancy.rideagenthub.service.base.OrderGrabService;
 import com.fancy.rideagenthub.service.base.OrderDelayQueue;
+import com.fancy.rideagenthub.service.base.OrderGeoPool;
+import com.fancy.rideagenthub.service.base.DriverGeoIndex;
 import com.fancy.rideagenthub.service.base.OrderRouteService;
 import com.fancy.rideagenthub.service.impl.RideOrderServiceImpl;
 import com.fancy.rideagenthub.util.RedisScripts;
@@ -182,6 +184,6 @@ class OrderGrabRegressionTest {
     private RideOrderServiceImpl service(RideOrderMapper orders, OrderGrabService grabs) {
         return new RideOrderServiceImpl(orders, mock(AmapRouteService.class), mock(OrderRouteService.class),
                 mock(AmapGeoRegeoService.class), grabs,
-                mock(OrderDelayQueue.class), new RideOrderTimeoutProperties(), OrderLockTestSupport.availableClient());
+                mock(OrderDelayQueue.class), mock(OrderGeoPool.class), mock(DriverGeoIndex.class), new RideOrderTimeoutProperties(), OrderLockTestSupport.availableClient());
     }
 }
