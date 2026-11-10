@@ -38,7 +38,7 @@
 
 `RideOrderServiceImpl.driverAcceptOrder:271-304` 完全依赖 DB 乐观锁：
 
-```java
+```text
 // 280-289 行：每个司机抢单都要 selectCount 一次"我有没有未结束订单"
 Long activeCount = rideOrderMapper.selectCount(new LambdaQueryWrapper<RideOrder>()
         .eq(RideOrder::getDriverId, driverIdLong)
@@ -94,7 +94,7 @@ KEYS[2] = driver:active:{driverId}    -- 司机当前进行中订单
 
 `RideOrderServiceImpl:763-778` 的工单池查询是纯 DB 时间排序：
 
-```java
+```text
 LambdaQueryWrapper<RideOrder> baseQw = new LambdaQueryWrapper<RideOrder>()
         .eq(RideOrder::getIsDeleted, 0)
         .eq(RideOrder::getOrderStatus, RideOrderStatus.CREATED.getCode());
@@ -109,7 +109,7 @@ List<RideOrder> list = rideOrderMapper.selectList(baseQw
 
 **建议改造**
 
-```java
+```text
 // 下单成功时（RideOrderServiceImpl.createOrder 末尾）
 // GEOADD order:geo:pool {startLng} {startLat} {orderId}
 
@@ -134,7 +134,7 @@ List<RideOrder> list = rideOrderMapper.selectList(baseQw
 
 **建议改造**
 
-```java
+```text
 // 下单时写入延迟队列
 // ZADD delay:order:timeout score={deadline时间戳} member={orderId}
 
@@ -160,7 +160,7 @@ List<RideOrder> list = rideOrderMapper.selectList(baseQw
 
 `ChatServiceImpl.chat:76-96` —— **每轮对话都要调用两次 LLM**：
 
-```java
+```text
 // 76-85 行：对话为空，调分类器
 classification = chatClient.prompt()
         .system(CLASSIFIER_SYS_PROMPT)
@@ -200,7 +200,7 @@ classification = chatClient.prompt()
 
 项目**已引入 Redisson**（`UserUsernameBloomFilterService` 在用 `RBloomFilter`），可直接使用 `RLock`：
 
-```java
+```text
 RLock lock = redissonClient.getLock("order:lock:" + orderId);
 lock.lock();
 try {
@@ -251,13 +251,13 @@ try {
 ## 三、现存缺陷（改造时顺带修）
 
 1. **`ToolResponseMemory.save:35` 用了 `set` 而非 `setIfAbsent`**
-   ```java
+   ```text
    redisTemplate.opsForValue().set(key, response, DEFAULT_TOOL_CACHE_TTL);
    ```
    重复的 tool call 会覆盖已有结果。若要讲幂等，这是现成的反例。
 
 2. **`UserUsernameBloomFilterService.rebuild:41-59` 重建期存在穿透**
-   ```java
+   ```text
    bloomFilter.delete();                    // 先删
    bloomFilter.tryInit(...);
    for (String username : normalized) {     // 再逐条加
