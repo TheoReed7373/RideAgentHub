@@ -217,26 +217,20 @@ try {
 
 ### P1-3：工单池用 ZSet 排序
 
-**现状**
+**已实现**
 
-`TicketServiceImpl.getAdminTicketPage:302-303`：
+`TicketPoolIndex` 按状态维护 `ticket:pool:{statusCode}`，仅按状态筛选的管理端工单池查询走索引。
+带关键词、工单类型、处理人、发起人类型或未指定状态时，整体使用数据库查询。
 
-```java
-queryWrapper.orderByDesc(Ticket::getPriority)
-        .orderByDesc(Ticket::getUpdatedAt);
-```
-
-每次分页查询都要对全表排序。
-
-**建议改造**
-
-```java
-// 工单创建/状态变更时
-// ZADD ticket:pool:{statusCode} score={priority * 1e12 + 时间戳} member={ticketId}
-// 查询直接 ZREVRANGE ticket:pool:{statusCode} {offset} {offset+size}
-```
-
-对应黑马点评的点赞排行榜。注意 score 的构造要保证"优先级优先、同级按时间"，用位权拼接。
+- 分值为 `priority * 1e13 + updatedAt` 的 UTC 毫秒值；主键补零为 19 位作为成员。
+  倒序读取对应数据库的 `priority DESC, updated_at DESC, id DESC`，相同时间下分页顺序稳定。
+- 工单写入提交后统一失效统计缓存和全部状态池，并更新随机版本令牌；回滚不触发。
+  写入较少时，按需完整重建比逐条增量同步更容易保证集合完整，代价是变更后的首次读取需全量加载对应状态。
+- Lua 在版本和重建锁令牌均匹配时原子替换完整索引，旧快照和已过期锁持有者不能发布结果。
+- 数据和就绪标记固定保存 2 小时，不因写入续期。就绪标记包含版本和成员数，可区分空池与数据丢失。
+- Lua 原子读取总数和当前页，回表后再校验状态及版本。缺行、状态漂移或版本变化时整页退回数据库。
+- 数据库回退显式查询总数并使用 `LIMIT` 分页，不依赖分页拦截器；偏移使用 `long`，防止整数溢出。
+  活跃事务中的查询也使用数据库，防止将事务快照或未提交数据发布到公共缓存。
 
 ---
 

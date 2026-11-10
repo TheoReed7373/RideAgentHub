@@ -12,6 +12,7 @@ import com.fancy.rideagenthub.mapper.TicketMapper;
 import com.fancy.rideagenthub.mapper.UserAuthMapper;
 import com.fancy.rideagenthub.service.base.DelayedCacheEvictor;
 import com.fancy.rideagenthub.service.base.RedisLock;
+import com.fancy.rideagenthub.service.base.TicketPoolIndex;
 import com.fancy.rideagenthub.service.impl.TicketServiceImpl;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.AfterEach;
@@ -156,19 +157,22 @@ class CacheConsistencyRegressionTest {
         when(redis.opsForValue()).thenReturn(values);
         when(values.increment(anyString())).thenReturn(1L);
         DelayedCacheEvictor delayed = mock(DelayedCacheEvictor.class);
+        TicketPoolIndex pool = mock(TicketPoolIndex.class);
         TicketServiceImpl service = new TicketServiceImpl(mock(TicketMapper.class), mock(TicketChatMapper.class),
                 mock(UserAuthMapper.class), redis, new ObjectMapper(), delayed,
-                new RedisLock(redis));
+                new RedisLock(redis), pool);
         TransactionSynchronizationManager.initSynchronization();
         service.submitTicket(TicketCreateReqDTO.builder().userId("1").ticketType(1)
                 .title("test").content("test").build());
         String key = RedisKeyConstants.ticketStatisticsKey(LocalDate.now());
         verify(redis, never()).delete(key);
         verifyNoInteractions(delayed);
+        verifyNoInteractions(pool);
         when(redis.delete(key)).thenThrow(new IllegalStateException("Redis failure"));
         var callbacks = TransactionSynchronizationManager.getSynchronizations();
-        assertEquals(1, callbacks.size());
-        assertDoesNotThrow(callbacks.getFirst()::afterCommit);
+        assertEquals(2, callbacks.size());
+        callbacks.forEach(callback -> assertDoesNotThrow(callback::afterCommit));
+        verify(pool).syncByTicketId(anyString());
         verify(delayed).evictAfter(key, Duration.ofMillis(500));
     }
 
@@ -179,9 +183,10 @@ class CacheConsistencyRegressionTest {
         when(redis.opsForValue()).thenReturn(values);
         when(values.increment(anyString())).thenReturn(1L);
         DelayedCacheEvictor delayed = mock(DelayedCacheEvictor.class);
+        TicketPoolIndex pool = mock(TicketPoolIndex.class);
         TicketServiceImpl service = new TicketServiceImpl(mock(TicketMapper.class), mock(TicketChatMapper.class),
                 mock(UserAuthMapper.class), redis, new ObjectMapper(), delayed,
-                new RedisLock(redis));
+                new RedisLock(redis), pool);
         TransactionSynchronizationManager.initSynchronization();
         service.submitTicket(TicketCreateReqDTO.builder().userId("1").ticketType(1)
                 .title("test").content("test").build());
@@ -190,6 +195,7 @@ class CacheConsistencyRegressionTest {
         }
         verify(redis, never()).delete(anyString());
         verifyNoInteractions(delayed);
+        verifyNoInteractions(pool);
     }
 
     @Test

@@ -6,6 +6,45 @@ import java.util.List;
 
 public final class RedisScripts {
 
+    /** 同时更换版本并移除旧状态池，阻止并发重建发布旧快照。 */
+    public static final DefaultRedisScript<Long> INVALIDATE_TICKET_POOLS = new DefaultRedisScript<>("""
+            redis.call('SET', KEYS[1], ARGV[1])
+            for i = 2, #KEYS do
+                redis.call('DEL', KEYS[i])
+            end
+            return 1
+            """, Long.class);
+
+    /** 确认版本与重建锁仍有效，再原子替换完整索引及其就绪标记。 */
+    public static final DefaultRedisScript<Long> PUBLISH_TICKET_POOL = new DefaultRedisScript<>("""
+            if redis.call('GET', KEYS[1]) ~= ARGV[1] or redis.call('GET', KEYS[2]) ~= ARGV[2] then
+                return 0
+            end
+            redis.call('DEL', KEYS[3], KEYS[4])
+            for i = 4, #ARGV, 2 do
+                redis.call('ZADD', KEYS[4], ARGV[i], ARGV[i + 1])
+            end
+            local count = redis.call('ZCARD', KEYS[4])
+            redis.call('SET', KEYS[3], ARGV[1] .. ':' .. count, 'PX', ARGV[3])
+            redis.call('PEXPIRE', KEYS[4], ARGV[3])
+            return 1
+            """, Long.class);
+
+    /** 原子校验版本、成员数量并读取总数和当前页；索引缺失不能伪装成空池。 */
+    public static final DefaultRedisScript<List> READ_TICKET_POOL = new DefaultRedisScript<>("""
+            local version = redis.call('GET', KEYS[1])
+            local count = redis.call('ZCARD', KEYS[3])
+            if not version or redis.call('GET', KEYS[2]) ~= version .. ':' .. count then
+                return {}
+            end
+            local result = {version, tostring(count)}
+            local members = redis.call('ZREVRANGE', KEYS[3], ARGV[1], ARGV[2])
+            for _, member in ipairs(members) do
+                result[#result + 1] = member
+            end
+            return result
+            """, List.class);
+
     /** 在同一次 Redis 操作中领取并移除到期任务，保护同时发生的改期。 */
     public static final DefaultRedisScript<List> CLAIM_DUE_ORDERS = new DefaultRedisScript<>("""
             local orders = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, ARGV[2])
