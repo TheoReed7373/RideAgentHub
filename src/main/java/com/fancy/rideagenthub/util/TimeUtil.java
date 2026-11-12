@@ -43,8 +43,11 @@ public class TimeUtil {
         }
         // 核心技法：把空格替换成 'T'，瞬间符合 ISO 标准
         // 如果原本就是 'T'，这行代码不会有副作用
-        String isoTimeStr = timeStr.replace(" ", "T");
-
-        return LocalDateTime.parse(isoTimeStr);
+        String isoTimeStr = timeStr.trim().replace(' ', 'T');
+        try {
+            return LocalDateTime.parse(isoTimeStr);
+        } catch (java.time.format.DateTimeParseException e) {
+            return null;
+        }
     }
 }

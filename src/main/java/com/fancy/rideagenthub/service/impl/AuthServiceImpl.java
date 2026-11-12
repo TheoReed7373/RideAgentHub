@@ -50,7 +50,8 @@ public class AuthServiceImpl implements AuthService {
     private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
 
     // Snowflake ID generator (workerId=0, datacenterId=0)
-    private final SnowflakeIdWorker snowflakeIdWorker = new SnowflakeIdWorker(0, 0);
+    @jakarta.annotation.Resource
+    private SnowflakeIdWorker snowflakeIdWorker;
 
     @Override
     public void sendEmailCode(SendEmailCodeRequestDTO request) {
@@ -74,16 +75,15 @@ public class AuthServiceImpl implements AuthService {
     @Override
     @Transactional
     public Long registerByEmailCode(RegisterRequestDTO request) {
+        if (request == null) throw new BusinessException(400, "请求不能为空");
         validateEmail(request.getEmail());
+        if (request.getPassword() == null || request.getPassword().isBlank()) throw new BusinessException(400, "密码不能为空");
+        if (request.getUsername() != null && !isUsernameAvailable(request.getUsername())) throw new BusinessException(409, "用户名已存在");
+        if (userAuthService.existsByEmailAndRole(request.getEmail(), UserRole.USER.name())) throw new BusinessException(409, "该邮箱已注册");
 
         // 校验验证码
         if (!emailCodeService.verifyAndConsume(request.getEmail(), EmailScene.REGISTER, request.getCode())) {
             throw new BusinessException(400, "验证码无效或已过期");
-        }
-
-        // 检查邮箱是否已注册（USER 角色）
-        if (userAuthService.existsByEmailAndRole(request.getEmail(), UserRole.USER.name())) {
-            throw new BusinessException(409, "该邮箱已注册");
         }
 
         // 生成 userId
@@ -109,6 +109,7 @@ public class AuthServiceImpl implements AuthService {
 
     @Override
     public LoginResultVO loginByPassword(PasswordLoginRequestDTO request) {
+        if (request == null || request.getPassword() == null || request.getPassword().isBlank()) throw new BusinessException(400, "登录参数不完整");
         // 解析登录标识
         LoginPrincipal principal = parseLoginPrincipal(request.getLogin());
 
@@ -118,16 +119,20 @@ public class AuthServiceImpl implements AuthService {
             throw new UnauthorizedException("用户名或密码错误");
         }
 
+        long version = tokenService.currentVersion(userAuth.getUserId());
+        userAuth = findUserByPrincipal(principal);
+        if (userAuth == null) throw new UnauthorizedException("账号状态已变化");
         // 验证密码
         if (!passwordEncoder.matches(request.getPassword(), userAuth.getPassword())) {
             throw new UnauthorizedException("用户名或密码错误");
         }
 
-        return issueLoginResultVO(userAuth);
+        return issueLoginResultVO(userAuth, version);
     }
 
     @Override
     public LoginResultVO loginByEmailCode(EmailCodeLoginRequestDTO request) {
+        if (request == null) throw new BusinessException(400, "请求不能为空");
         validateEmail(request.getEmail());
 
         // 校验验证码
@@ -141,7 +146,7 @@ public class AuthServiceImpl implements AuthService {
             throw new UnauthorizedException("账号不存在");
         }
 
-        return issueLoginResultVO(userAuth);
+        return issueLoginResultVO(userAuth, tokenService.currentVersion(userAuth.getUserId()));
     }
 
     @Override
@@ -258,10 +263,6 @@ public class AuthServiceImpl implements AuthService {
             throw new BusinessException(400, "用户名不能包含@符号");
         }
 
-        if (!usernameBloomFilterService.mightContain(username)) {
-            return true;
-        }
-
         UserAuth existing = userAuthService.findByUsernameAndRole(username, UserRole.USER.name());
         return existing == null;
     }
@@ -269,7 +270,7 @@ public class AuthServiceImpl implements AuthService {
     /**
      * 签发 Token
      */
-    private LoginResultVO issueLoginResultVO(UserAuth userAuth) {
+    private LoginResultVO issueLoginResultVO(UserAuth userAuth, long version) {
         String token = tokenService.generateToken();
         long now = System.currentTimeMillis();
         long expiresAt = now + authProperties.getTokenTtlSeconds() * 1000;
@@ -282,6 +283,8 @@ public class AuthServiceImpl implements AuthService {
                 .role(userAuth.getRole())
                 .token(token)
                 .issuedAtEpochMs(now)
+                .sessionVersion(version)
+                .credentialStamp(com.fancy.rideagenthub.security.CredentialStamp.of(userAuth.getPassword()))
                 .expiresAtEpochMs(expiresAt)
                 .build();
 

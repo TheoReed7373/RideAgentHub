@@ -37,12 +37,12 @@ public class AuthTokenInterceptor implements HandlerInterceptor {
                     UserTokenContext.set(userToken);
                     log.debug("Token validated: userId={}", userToken.getUserId());
                 } else {
-                    log.debug("Token expired: {}", token);
+                    log.debug("Token expired");
                     // 可选：删除过期 token
                     tokenService.deleteToken(token);
                 }
             } else {
-                log.debug("Token not found in Redis: {}", token);
+                log.debug("Token not found in Redis");
             }
         }
 

@@ -1,60 +1,39 @@
 package com.fancy.rideagenthub.exception;
 
 import com.fancy.rideagenthub.domain.response.Result;
-
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.web.bind.annotation.ExceptionHandler;
-import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
-/**
- * 全局异常处理器
- */
 @Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler {
-
-    /**
-     * 处理未授权异常
-     */
     @ExceptionHandler(UnauthorizedException.class)
-    public Result handleUnauthorized(UnauthorizedException e) {
-        log.warn("Unauthorized: {}", e.getMessage());
-        return Result.fail(401, e.getMessage());
-    }
-
-    /**
-     * 处理禁止访问异常
-     */
+    public ResponseEntity<Result> handleUnauthorized(UnauthorizedException e) { return response(401, e.getMessage()); }
     @ExceptionHandler(ForbiddenException.class)
-    public Result handleForbidden(ForbiddenException e) {
-        log.warn("Forbidden: {}", e.getMessage());
-        return Result.fail(403, e.getMessage());
-    }
-
-    /**
-     * 处理业务异常
-     */
+    public ResponseEntity<Result> handleForbidden(ForbiddenException e) { return response(403, e.getMessage()); }
     @ExceptionHandler(BusinessException.class)
-    public Result handleBusiness(BusinessException e) {
-        log.warn("Business exception: code={}, message={}", e.getCode(), e.getMessage());
-        return Result.fail(e.getCode(), e.getMessage());
-    }
-
-    /**
-     * 处理参数非法异常
-     */
+    public ResponseEntity<Result> handleBusiness(BusinessException e) { return response(e.getCode(), e.getMessage()); }
     @ExceptionHandler(IllegalArgumentException.class)
-    public Result handleIllegalArgument(IllegalArgumentException e) {
-        log.warn("Illegal argument: {}", e.getMessage());
-        return Result.fail(400, e.getMessage());
+    public ResponseEntity<Result> handleIllegalArgument(IllegalArgumentException e) { return response(400, e.getMessage()); }
+    @ExceptionHandler({HttpMessageNotReadableException.class, MethodArgumentNotValidException.class,
+            MissingServletRequestParameterException.class, MethodArgumentTypeMismatchException.class})
+    public ResponseEntity<Result> handleInvalidRequest(Exception e) { return response(400, "请求参数格式不正确"); }
+    @ExceptionHandler(org.springframework.dao.DuplicateKeyException.class)
+    public ResponseEntity<Result> handleDuplicate(org.springframework.dao.DuplicateKeyException e) {
+        return response(409, "记录已存在或请求已被处理");
     }
-
-    /**
-     * 处理其他未知异常
-     */
     @ExceptionHandler(Exception.class)
-    public Result handleException(Exception e) {
+    public ResponseEntity<Result> handleException(Exception e) {
         log.error("Unexpected error", e);
-        return Result.fail(500, "服务器内部错误");
+        return response(500, "服务器内部错误");
+    }
+    private ResponseEntity<Result> response(int code, String message) {
+        int status = code >= 400 && code <= 599 ? code : 400;
+        return ResponseEntity.status(status).body(Result.fail(code, message));
     }
 }

@@ -41,7 +41,7 @@ public class PermissionAspect {
         String[] requiredRoles = annotation.value();
         if (requiredRoles.length > 0) {
             String currentRole = userToken.getRole();
-            boolean hasPermission = Arrays.stream(requiredRoles)
+            boolean hasPermission = currentRole != null && Arrays.stream(requiredRoles)
                     .map(String::toUpperCase)
                     .anyMatch(role -> role.equals(currentRole.toUpperCase()));
 

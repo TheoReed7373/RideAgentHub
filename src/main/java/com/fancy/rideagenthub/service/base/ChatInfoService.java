@@ -20,14 +20,48 @@ public class ChatInfoService {
     private final ChatMapper chatMapper;
     private final StringRedisTemplate stringRedisTemplate;
 
+    public void assertOwned(String userId, String chatId, boolean allowNew) {
+        findOwned(userId, chatId, allowNew);
+    }
+
+    public boolean isNewOwnedChat(String userId, String chatId) { return findOwned(userId, chatId, true) == null; }
+
+    private Chat findOwned(String userId, String chatId, boolean allowNew) {
+        if (userId == null || chatId == null || chatId.isBlank()) {
+            throw new com.fancy.rideagenthub.exception.ForbiddenException("无效的会话身份");
+        }
+        Chat chat = chatMapper.selectOne(new LambdaQueryWrapper<Chat>().eq(Chat::getChatId, chatId));
+        if (chat == null) {
+            if (allowNew) return null;
+            throw new com.fancy.rideagenthub.exception.BusinessException(404, "会话不存在");
+        }
+        if (!java.util.Objects.equals(String.valueOf(chat.getUserId()), userId)) {
+            throw new com.fancy.rideagenthub.exception.ForbiddenException("无权操作该会话");
+        }
+        if (Boolean.TRUE.equals(chat.getHistoryDeleted())) {
+            throw new com.fancy.rideagenthub.exception.BusinessException(410, "会话已清空，请新建对话");
+        }
+        return chat;
+    }
+
+    public void retireHistory(String chatId) {
+        chatMapper.update(null, new LambdaUpdateWrapper<Chat>().eq(Chat::getChatId, chatId)
+                .set(Chat::getHistoryDeleted, true).set(Chat::getLocked, true));
+    }
+
     public Integer insertChat(String userId, String chatId, String title){
+        assertOwned(userId, chatId, true);
+        if (chatMapper.selectCount(new LambdaQueryWrapper<Chat>().eq(Chat::getChatId, chatId)) > 0) return 0;
+        String normalizedTitle = title == null || title.isBlank() ? "新对话" : title;
+        normalizedTitle = normalizedTitle.substring(0, normalizedTitle.offsetByCodePoints(0,
+                Math.min(255, normalizedTitle.codePointCount(0, normalizedTitle.length()))));
         Chat newChat = Chat.builder()
                 .chatId(chatId)
                 .userId(Long.valueOf(userId))
-                .title(title)
+                .title(normalizedTitle)
                 .locked(false)
-                .createdAt(LocalDateTime.now())
-                .updatedAt(LocalDateTime.now())
+                .createdAt(com.fancy.rideagenthub.util.BusinessTime.now())
+                .updatedAt(com.fancy.rideagenthub.util.BusinessTime.now())
                 .build();
         return chatMapper.insert(newChat);
     }
@@ -49,7 +83,7 @@ public class ChatInfoService {
     public void updateChatTime(String chatId){
         LambdaUpdateWrapper<Chat> updateWrapper = new LambdaUpdateWrapper<Chat>()
                 .eq(Chat::getChatId, chatId)
-                .set(Chat::getUpdatedAt, LocalDateTime.now());
+                .set(Chat::getUpdatedAt, com.fancy.rideagenthub.util.BusinessTime.now());
         chatMapper.update(null, updateWrapper);
     }
 
@@ -59,6 +93,7 @@ public class ChatInfoService {
         }
         Chat chat = chatMapper.selectOne(new LambdaQueryWrapper<Chat>()
                 .eq(Chat::getUserId, Long.valueOf(userId))
+                .eq(Chat::getHistoryDeleted, false)
                 .orderByDesc(Chat::getUpdatedAt)
                 .orderByDesc(Chat::getId)
                 .last("limit 1"));

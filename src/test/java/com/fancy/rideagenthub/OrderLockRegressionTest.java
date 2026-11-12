@@ -49,8 +49,16 @@ class OrderLockRegressionTest {
         TableInfoHelper.initTableInfo(new MapperBuilderAssistant(new MybatisConfiguration(), "order-lock-tests"), RideOrder.class);
     }
 
+    @org.junit.jupiter.api.BeforeEach
+    void identity() {
+        com.fancy.rideagenthub.security.UserTokenContext.set(com.fancy.rideagenthub.security.UserToken.builder()
+                .userId(2L).role("USER").build());
+        org.springframework.test.util.ReflectionTestUtils.setField(service, "paymentVerifier", mock(com.fancy.rideagenthub.service.PaymentVerifier.class));
+    }
+
     @AfterEach
     void cleanup() {
+        com.fancy.rideagenthub.security.UserTokenContext.clear();
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.clearSynchronization();
         }
@@ -130,6 +138,8 @@ class OrderLockRegressionTest {
 
     @Test
     void unlockFailureDoesNotReportCommittedPaymentAsFailure() {
+        when(orders.selectOne(any())).thenReturn(RideOrder.builder().orderId(100L).userId(2L).orderStatus(50)
+                .realPrice(java.math.BigDecimal.TEN).build());
         when(orders.update(isNull(), any())).thenReturn(1);
         doThrow(new IllegalStateException("Redis unavailable")).when(lock).unlock();
         assertTrue(service.payOrder("0100", 1, "trade"));

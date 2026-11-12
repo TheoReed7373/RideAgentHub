@@ -32,6 +32,11 @@ public class TicketTool {
             ToolContext toolContext){
         ToolNotifySupport.notifyToolListener(toolContext, "创建工单 (createTicket)");
         String userId = toolContext.getContext().get(ToolContextKeyConstants.USER_ID).toString();
+        Long linkedOrder = null;
+        if (orderId != null && !orderId.isBlank()) {
+            try { linkedOrder = Long.valueOf(orderId.trim()); }
+            catch (NumberFormatException e) { return "关联订单号必须是数字，请核对订单编号"; }
+        }
         TicketCreateReqDTO newTicket = TicketCreateReqDTO.builder()
                 .userId(userId)
                 .userType(1)
@@ -39,7 +44,7 @@ public class TicketTool {
                 .content(content)
                 .priority(priority == null ? 1 : priority)
                 .ticketType(type)
-                .orderId(orderId == null ? null : Long.valueOf(orderId))
+                .orderId(linkedOrder)
                 .build();
         return "工单已创建，工单编号：" + ticketService.submitTicket(newTicket);
     }

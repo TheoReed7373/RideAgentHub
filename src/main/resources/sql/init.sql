@@ -10,6 +10,11 @@ CREATE TABLE `sys_user` (
   `last_login_time` DATETIME DEFAULT NULL COMMENT '最后登录时间',
   `create_time` DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `update_time` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  `active_username` VARCHAR(50) GENERATED ALWAYS AS (IF(is_deleted = 0, username, NULL)) STORED,
+  `active_email` VARCHAR(100) GENERATED ALWAYS AS (IF(is_deleted = 0, email, NULL)) STORED,
+  UNIQUE KEY `uk_user_id` (`user_id`),
+  UNIQUE KEY `uk_active_username_role` (`active_username`, `role`),
+  UNIQUE KEY `uk_active_email_role` (`active_email`, `role`),
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户登录表';
 
@@ -108,8 +113,10 @@ create table `sys_chat`
     `user_id`         bigint not null,
     `title`           varchar(255) not null,
     `locked`          tinyint(1) DEFAULT 0 not null,
+    `history_deleted` tinyint(1) DEFAULT 0 not null,
     `created_at`      DATETIME DEFAULT current_timestamp not null,
-    `updated_at`      DATETIME DEFAULT current_timestamp not null
+    `updated_at`      DATETIME DEFAULT current_timestamp not null,
+    UNIQUE KEY `uk_chat_id` (`chat_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ;
 
 -- 工单主表
@@ -166,3 +173,10 @@ CREATE TABLE `sys_qa_es`
     `group_id` BIGINT NOT NULL , -- 雪花id
     `question` VARCHAR(255) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='rag问答对ES映射表';
+
+CREATE TABLE IF NOT EXISTS sys_qa_sync_job (
+    group_id BIGINT NOT NULL PRIMARY KEY,
+    version BIGINT NOT NULL,
+    next_attempt_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_qa_sync_due(next_attempt_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -42,6 +42,15 @@ public class OrderSearchTool {
     private final RideOrderMapper rideOrderMapper;
     private final AmapRouteService amapRouteService;
     private final OrderRouteService orderRouteService;
+    @jakarta.annotation.Resource private org.redisson.api.RedissonClient redisson;
+    private static final org.springframework.data.redis.core.script.DefaultRedisScript<Long> CANCEL =
+            new org.springframework.data.redis.core.script.DefaultRedisScript<>("""
+                if redis.call('HGET', KEYS[1], 'readyForCancel') ~= ARGV[1] then return 0 end
+                local verified = tonumber(redis.call('HGET', KEYS[1], 'cancelVerifiedAt') or '0')
+                if tonumber(ARGV[2]) - verified > 300000 then return 0 end
+                redis.call('HDEL', KEYS[1], 'readyForCancel', 'cancelVerifiedAt')
+                return 1
+                """, Long.class);
 
     private static final String REDIS_READY_FOR_CANCEL = "readyForCancel";
     private static final String REDIS_CANCEL_FEE = "cancelFee";
@@ -82,35 +91,9 @@ public class OrderSearchTool {
             return "用户ID不合法";
         }
 
-        List<RideOrderVO> matched = new ArrayList<>();
-        final int pageSize = 20;
-        int page = 1;
-        while (page <= 50) {
-            PageResult<RideOrderVO> pr = rideOrderService.getPassengerOrderHistory(userId, page, pageSize, null);
-            if (pr == null || pr.getRecords() == null || pr.getRecords().isEmpty()) {
-                break;
-            }
-
-            boolean shouldStop = false;
-            for (RideOrderVO vo : pr.getRecords()) {
-                LocalDateTime ct = vo == null ? null : vo.getCreateTime();
-                if (ct == null) {
-                    continue;
-                }
-                // 结果按 createTime desc，遇到比 start 更早的可停止继续翻页
-                if (ct.isBefore(start)) {
-                    shouldStop = true;
-                    continue;
-                }
-                if ((ct.isAfter(start) || ct.isEqual(start)) && (ct.isBefore(end) || ct.isEqual(end))) {
-                    matched.add(vo);
-                }
-            }
-            if (shouldStop) {
-                break;
-            }
-            page++;
-        }
+        List<RideOrderVO> found = rideOrderService.getPassengerOrdersByTime(userId, start, end, 201);
+        boolean truncated = found.size() > 200;
+        List<RideOrderVO> matched = truncated ? found.subList(0, 200) : found;
 
         if (matched.isEmpty()) {
             return String.format("在 %s ~ %s 未查询到订单。", startTime, endTime);
@@ -130,6 +113,7 @@ public class OrderSearchTool {
         if (useSimple) {
             sb.append("提示：如需某笔订单的详细信息请调用searchOrderById()。\n");
         }
+        if (truncated) sb.append("结果超过200笔，仅展示前200笔，请缩小查询时间范围。\n");
         return sb.toString();
     }
 
@@ -206,8 +190,8 @@ public class OrderSearchTool {
             if (!userId.isEmpty() && vo.getUserId() != null && !vo.getUserId().equals(userId)) {
                 return "无权限操作该订单";
             }
-        } catch (Exception ignored) {
-            // ignore
+        } catch (Exception invalidIdentity) {
+            return "用户身份无效";
         }
 
         Integer status = vo.getOrderStatus();
@@ -227,11 +211,12 @@ public class OrderSearchTool {
         // 司机是否接单 + 接单时长判断
         LocalDateTime acceptTime = vo.getDriverAcceptTime();
         if (acceptTime != null) {
-            long minutes = Math.max(0, Duration.between(acceptTime, LocalDateTime.now()).toMinutes());
+            long minutes = Math.max(0, Duration.between(acceptTime, com.fancy.rideagenthub.util.BusinessTime.now()).toMinutes());
             if (minutes > 5) {
                 BigDecimal cancelFee = calcCancelFee(minutes);
                 stringRedisTemplate.opsForHash().put(chatInfoKey, REDIS_CANCEL_FEE, cancelFee.toPlainString());
-                stringRedisTemplate.opsForHash().put(chatInfoKey, REDIS_READY_FOR_CANCEL, "true");
+                stringRedisTemplate.opsForHash().put(chatInfoKey, REDIS_READY_FOR_CANCEL, Long.valueOf(oid).toString());
+                stringRedisTemplate.opsForHash().put(chatInfoKey, "cancelVerifiedAt", String.valueOf(System.currentTimeMillis()));
                 return String.format("司机已接单超过5分钟(已接单%d分钟)。取消需支付取消费 %s 元给司机作为空驶补偿。请确认用户是否想取消。",
                         minutes, cancelFee.setScale(2, RoundingMode.HALF_UP).toPlainString());
             }
@@ -239,7 +224,8 @@ public class OrderSearchTool {
 
         // 免费取消
         stringRedisTemplate.opsForHash().delete(chatInfoKey, REDIS_CANCEL_FEE);
-        stringRedisTemplate.opsForHash().put(chatInfoKey, REDIS_READY_FOR_CANCEL, "true");
+        stringRedisTemplate.opsForHash().put(chatInfoKey, REDIS_READY_FOR_CANCEL, Long.valueOf(oid).toString());
+                stringRedisTemplate.opsForHash().put(chatInfoKey, "cancelVerifiedAt", String.valueOf(System.currentTimeMillis()));
         return "当前可以无责免费取消订单。";
     }
 
@@ -276,15 +262,17 @@ public class OrderSearchTool {
             if (!uid.isEmpty() && vo.getUserId() != null && !vo.getUserId().equals(uid)) {
                 return "无权限操作该订单";
             }
-        } catch (Exception ignored) {
-            // ignore
+        } catch (Exception invalidIdentity) {
+            return "用户身份无效";
         }
 
-        Object cancelFeeObj = stringRedisTemplate.opsForHash().get(chatInfoKey, REDIS_CANCEL_FEE);
-        String cancelFeeStr = cancelFeeObj == null ? null : cancelFeeObj.toString();
-
+        if (!Long.valueOf(1).equals(stringRedisTemplate.execute(CANCEL, List.of(chatInfoKey),
+                Long.valueOf(oid).toString(), String.valueOf(System.currentTimeMillis())))) {
+            return "取消确认对象不匹配、已过期或已使用，请重新检查此订单";
+        }
+        String cancelFeeStr;
         try {
-            rideOrderService.cancelOrder(oid, userId, 1, reason);
+            cancelFeeStr = rideOrderService.cancelOrder(oid, userId, 1, reason);
         } catch (BusinessException be) {
             return be.getMessage();
         } catch (Exception e) {
@@ -308,6 +296,26 @@ public class OrderSearchTool {
                                          @ToolParam(description = "目的地经度")String newDestLng,
                                          @ToolParam(description = "目的地纬度")String newDestLat,
                                          ToolContext toolContext){
+        String canonical;
+        try { canonical = Long.valueOf(orderId).toString(); } catch (RuntimeException e) { return "订单号不合法"; }
+        var lock = redisson.getLock(RedisKeyConstants.orderLockKey(canonical));
+        boolean acquired = false;
+        try {
+            acquired = lock.tryLock(3, java.util.concurrent.TimeUnit.SECONDS);
+            if (!acquired) return "订单正在处理中，请稍后重试";
+            return modifyDestinationUnderLock(canonical, newDestAddress, newDestLng, newDestLat, toolContext);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return "操作中断，请稍后重试";
+        } finally {
+            if (acquired) {
+                try { lock.unlock(); } catch (RuntimeException e) { log.warn("订单锁释放失败", e); }
+            }
+        }
+    }
+
+    private String modifyDestinationUnderLock(String orderId, String newDestAddress, String newDestLng,
+            String newDestLat, ToolContext toolContext) {
         log.info("[OrderSearchTool]: modifyOrderDestination(orderId={}, newDestAddress={}, lng={}, lat={})",
                 orderId, newDestAddress, newDestLng, newDestLat);
         ToolNotifySupport.notifyToolListener(toolContext, "修改订单目的地 (modifyOrderDestination)");
@@ -339,13 +347,14 @@ public class OrderSearchTool {
 
         try {
             Long uid = Long.parseLong(userIdStr);
-            if (order.getUserId() != null && !order.getUserId().equals(uid)) {
+            if (order.getUserId() == null || !order.getUserId().equals(uid)) {
                 return "无权限操作该订单";
             }
-        } catch (Exception ignored) {
-            // ignore
+        } catch (Exception invalidIdentity) {
+            return "用户身份无效";
         }
 
+        if (lng.abs().compareTo(BigDecimal.valueOf(180)) > 0 || lat.abs().compareTo(BigDecimal.valueOf(90)) > 0) return "目的地经纬度超出范围";
         Integer status = order.getOrderStatus();
         if (status == null) {
             return "订单状态异常";
@@ -380,11 +389,6 @@ public class OrderSearchTool {
 
         String oldTraceId = order.getMongoTraceId();
         String newTraceId = UUID.randomUUID().toString();
-        try {
-            orderRouteService.addOrder(newTraceId, route);
-        } catch (Exception e) {
-            return "保存新的路径规划结果失败，请稍后重试";
-        }
 
         BigDecimal distanceKm;
         try {
@@ -403,12 +407,18 @@ public class OrderSearchTool {
                 order.getVehicleType(),
                 order.getPriceRadio(),
                 alreadyDeparted);
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
 
-        int updated = rideOrderMapper.update(null, new LambdaUpdateWrapper<RideOrder>()
+        orderRouteService.addOrder(newTraceId, route);
+        int updated;
+        try {
+            updated = rideOrderMapper.update(null, new LambdaUpdateWrapper<RideOrder>()
                 .eq(RideOrder::getOrderId, oid)
+                .eq(RideOrder::getUserId, Long.valueOf(userIdStr))
                 .eq(RideOrder::getIsDeleted, 0)
                 .eq(RideOrder::getOrderStatus, status)
+                .eq(oldTraceId != null, RideOrder::getMongoTraceId, oldTraceId)
+                .isNull(oldTraceId == null, RideOrder::getMongoTraceId)
                 .set(RideOrder::getEndAddress, normalizeText(newDestAddress))
                 .set(RideOrder::getEndLat, lat)
                 .set(RideOrder::getEndLng, lng)
@@ -421,6 +431,10 @@ public class OrderSearchTool {
                 .set(RideOrder::getPriceExpedited, est.getEstPriceExpedited())
                 .set(RideOrder::getPriceRadio, est.getEstPriceRadio())
                 .set(RideOrder::getUpdateTime, now));
+        } catch (RuntimeException failure) {
+            try { orderRouteService.deleteByTraceId(newTraceId); } catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
 
         if (updated <= 0) {
             // 回滚：订单未更新成功，删除新写入的 Mongo 路径记录
@@ -442,7 +456,7 @@ public class OrderSearchTool {
         }
 
         if (alreadyDeparted) {
-            return String.format("已修改目的地并更新预估：预计里程%sKm，预计价格%s元（行程中已出发，乘算比例在原基础上+0.1）。",
+            return String.format("已修改目的地并更新预估：预计里程%sKm，预计价格%s元（按新路线和统一计价规则计算）。",
                     distanceKm.stripTrailingZeros().toPlainString(), est.getEstPrice().toPlainString());
         }
         return String.format("已修改目的地并更新预估：预计里程%sKm，预计价格%s元。",
@@ -465,70 +479,8 @@ public class OrderSearchTool {
                                                         Integer vehicleType,
                                                         BigDecimal existingRadio,
                                                         boolean alreadyDeparted) {
-        // 计价规则严格对齐 OrderTool#getEstPrice
-        final int MONEY_SCALE = 2;
-
-        BigDecimal durationSec;
-        try {
-            durationSec = durationSecStr == null ? BigDecimal.ZERO : new BigDecimal(durationSecStr.trim());
-        } catch (Exception ignored) {
-            durationSec = BigDecimal.ZERO;
-        }
-        if (durationSec.signum() < 0) {
-            durationSec = BigDecimal.ZERO;
-        }
-
-        boolean expedited = isExpedited != null && isExpedited == 1;
-        int vehicleTypeCode = vehicleType == null ? 1 : vehicleType;
-
-        BigDecimal startPrice = new BigDecimal("8.00");
-        BigDecimal startDistanceKm = new BigDecimal("2.0");
-        BigDecimal perKmFee = new BigDecimal("2.20");
-
-        BigDecimal overStartKm = distanceKm.subtract(startDistanceKm);
-        if (overStartKm.signum() < 0) {
-            overStartKm = BigDecimal.ZERO;
-        }
-        BigDecimal mileageFee = overStartKm.multiply(perKmFee);
-        BigDecimal priceBase = startPrice.add(mileageFee);
-
-        BigDecimal longDistanceThresholdKm = new BigDecimal("20.0");
-        BigDecimal longOverKm = distanceKm.subtract(longDistanceThresholdKm);
-        if (longOverKm.signum() < 0) {
-            longOverKm = BigDecimal.ZERO;
-        }
-        BigDecimal longDistanceSurchargePerKm = perKmFee.multiply(new BigDecimal("0.50"));
-        BigDecimal priceDistance = longOverKm.multiply(longDistanceSurchargePerKm);
-
-        BigDecimal minutes = durationSec.divide(new BigDecimal("60"), 0, RoundingMode.CEILING);
-        BigDecimal perMinFee = new BigDecimal("0.50");
-        BigDecimal priceTime = minutes.multiply(perMinFee);
-
-        BigDecimal priceExpedited = expedited ? new BigDecimal("5.00") : BigDecimal.ZERO;
-
-        BigDecimal vehicleMultiplier = switch (vehicleTypeCode) {
-            case 2 -> new BigDecimal("1.60");
-            case 3 -> new BigDecimal("2.50");
-            default -> BigDecimal.ONE;
-        };
-        BigDecimal expediteMultiplier = expedited ? new BigDecimal("0.20") : BigDecimal.ZERO;
-        BigDecimal defaultRadio = vehicleMultiplier.add(expediteMultiplier);
-
-        BigDecimal baseRadio = (existingRadio != null && existingRadio.signum() > 0) ? existingRadio : defaultRadio;
-        BigDecimal finalRadio = alreadyDeparted ? baseRadio.add(new BigDecimal("0.10")) : baseRadio;
-
-        BigDecimal subTotal = priceBase.add(priceTime).add(priceDistance);
-        BigDecimal estPrice = subTotal.add(priceExpedited).multiply(finalRadio)
-                .setScale(MONEY_SCALE, RoundingMode.HALF_UP);
-
-        return PriceEstimateVO.builder()
-                .estPrice(estPrice)
-                .estPriceRadio(finalRadio.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceBase(priceBase.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceTime(priceTime.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceDistance(priceDistance.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceExpedited(priceExpedited.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .build();
+        return com.fancy.rideagenthub.service.base.RidePricing.calculate(distanceKm.toPlainString(),
+                durationSecStr, vehicleType, isExpedited);
     }
 
     private String normalizeText(String value) {

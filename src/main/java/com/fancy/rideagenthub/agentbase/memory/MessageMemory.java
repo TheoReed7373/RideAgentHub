@@ -47,7 +47,8 @@ public class MessageMemory {
             return List.of();
         }
 
-        switchFocusChatIfNeeded(userId, chatId);
+        // 没有所属会话元数据时绝不读取按 chatId 缓存的旧数据，首次聊天由路由成功后创建元数据。
+        if (chatManager.isNewOwnedChat(userId, chatId)) return List.of();
 
         long heapLease = heapMemory.currentVersion(chatId);
         List<Message> heapAll = heapMemory.getAll(chatId);
@@ -91,6 +92,7 @@ public class MessageMemory {
             return;
         }
 
+        chatManager.assertOwned(userId, chatId, false);
         switchFocusChatIfNeeded(userId, chatId);
 
         long heapVersion = heapMemory.currentVersion(chatId);
@@ -118,7 +120,7 @@ public class MessageMemory {
             throw new IllegalArgumentException("chatId不能为空");
         }
 
-        switchFocusChatIfNeeded(userId, chatId);
+        chatManager.assertOwned(userId, chatId, false);
 
         long heapLease = heapMemory.currentVersion(chatId);
         List<Message> allMessages = heapMemory.getAll(chatId);
@@ -156,12 +158,20 @@ public class MessageMemory {
         if (chatId == null || chatId.isBlank()) {
             return;
         }
+        // 数据库墓碑先阻止所有实例从旧缓存读取，随后清理实际数据；此 chatId 不再复用。
+        chatManager.retireHistory(chatId);
         mysqlMemory.clear(chatId);
         try {
             redisMemory.clear(chatId);
         } finally {
             heapMemory.clear(chatId);
         }
+    }
+
+    /** 人工确认恢复必须使用数据库事实，避免一次持久化成功而缓存失败后重复保存工具应答。 */
+    public List<Message> getPersisted(String userId, String chatId, int lastN) {
+        chatManager.assertOwned(userId, chatId, false);
+        return MessageWindow.tail(mysqlMemory.getAll(chatId), lastN);
     }
 
     /**
@@ -198,7 +208,6 @@ public class MessageMemory {
         heapMemory.clear(prevChatId);
         redisMemory.expire(prevChatId, NON_FOCUS_CHAT_TTL);
         redisMemory.expire(newChatId, FOCUS_CHAT_TTL);
-        chatManager.lockChat(prevChatId);
     }
 
     private List<Message> tail(List<Message> messages, int lastN) {
@@ -208,9 +217,6 @@ public class MessageMemory {
         if (lastN <= 0) {
             return List.of();
         }
-        if (messages.size() <= lastN) {
-            return Collections.unmodifiableList(new ArrayList<>(messages));
-        }
-        return Collections.unmodifiableList(new ArrayList<>(messages.subList(messages.size() - lastN, messages.size())));
+        return MessageWindow.tail(messages, lastN);
     }
 }

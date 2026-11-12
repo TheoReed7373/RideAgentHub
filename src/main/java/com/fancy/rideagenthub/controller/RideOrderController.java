@@ -47,6 +47,7 @@ public class RideOrderController {
      * @return 价格估算信息
      */
     @PostMapping("/estimate")
+    @RequirePermission
     public Result estimate(@RequestBody PriceEstimateReqDTO req) {
         Point startPoint = new Point(req.getStartLat(), req.getStartLng());
         Point endPoint = new Point(req.getEndLat(), req.getEndLng());
@@ -65,6 +66,7 @@ public class RideOrderController {
     @PostMapping
     @RequirePermission
     public Result create(@RequestBody CreateOrderDTO req) {
+        req.setUserId(UserTokenContext.getUserIdInString());
         String orderId = rideOrderService.createOrder(req);
         return Result.ok(orderId);
     }
@@ -79,7 +81,6 @@ public class RideOrderController {
     @RequirePermission
     public Result detail(@PathVariable String orderId) {
         RideOrderVO vo = rideOrderService.getOrderDetail(orderId);
-        log.info(vo.toString());
         return Result.ok(vo);
     }
 
@@ -134,7 +135,11 @@ public class RideOrderController {
     @PostMapping("/{orderId}/cancel")
     @RequirePermission
     public Result cancel(@PathVariable String orderId, @RequestBody CancelOrderReqDTO req) {
-        String fee = rideOrderService.cancelOrder(orderId, UserTokenContext.getUserIdInString(), req.getCancelRole(), req.getCancelReason());
+        int role = UserTokenContext.hasAnyRole("DRIVER") ? 2 : 1;
+        if (req.getCancelRole() != null && req.getCancelRole() != role) {
+            throw new com.fancy.rideagenthub.exception.ForbiddenException("取消身份与当前登录角色不符");
+        }
+        String fee = rideOrderService.cancelOrder(orderId, UserTokenContext.getUserIdInString(), role, req.getCancelReason());
         return Result.ok(fee);
     }
 

@@ -46,6 +46,7 @@ public class TicketController {
     public Result submit(@RequestBody TicketCreateReqDTO req) {
         Long userId = UserTokenContext.getUserIdInLong();
         req.setUserId(String.valueOf(userId));
+        req.setUserType(UserTokenContext.hasAnyRole("DRIVER") ? 2 : 1);
         String ticketId = ticketService.submitTicket(req);
         return Result.ok(ticketId);
     }

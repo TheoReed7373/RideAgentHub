@@ -13,6 +13,26 @@ import java.util.Map;
 @Component
 @Slf4j
 public class MessageParser {
+    /** 坏记录后只从下一条用户消息重新建立完整上下文；不删除数据库原始记录。 */
+    public List<Message> unparseHistory(List<String> rows) {
+        List<Message> result = new ArrayList<>();
+        boolean recovering = false;
+        for (int i = 0; i < rows.size(); i++) {
+            String row = rows.get(i);
+            if (row == null || row.isBlank()) continue;
+            Message message;
+            try { message = unparse(row); }
+            catch (RuntimeException e) {
+                log.warn("会话历史存在损坏记录，从后续完整轮次恢复，记录偏移={}", i);
+                result.clear(); recovering = true; continue;
+            }
+            if (message == null) { result.clear(); recovering = true; continue; }
+            if (recovering && !(message instanceof UserMessage)) continue;
+            recovering = false;
+            result.add(message);
+        }
+        return result;
+    }
     public String parse(Message message){
         MessageType type = message.getMessageType();
         switch (type){
@@ -41,7 +61,7 @@ public class MessageParser {
                         ToolResponseMessage.ToolResponse toolResponse = new ToolResponseMessage.ToolResponse(
                                 response.id(),
                                 response.name(),
-                                "callId: " + response.id()
+                                response.responseData()
                         );
                         responses.add(toolResponse);
                     });
