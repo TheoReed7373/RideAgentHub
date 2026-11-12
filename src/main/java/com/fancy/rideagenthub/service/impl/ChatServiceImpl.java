@@ -53,6 +53,8 @@ public class ChatServiceImpl implements ChatService {
     private final ChatManager chatManager;
     private final ClassificationCache classificationCache;
     private final ChatRateLimiter chatRateLimiter;
+    @jakarta.annotation.Resource
+    private com.fancy.rideagenthub.service.base.OrderConfirmation orderConfirmation;
 
     public ChatServiceImpl(StringRedisTemplate stringRedisTemplate,
             MessageMemory messageMemory,
@@ -89,9 +91,14 @@ public class ChatServiceImpl implements ChatService {
         if (!canStartChat(id, param, sink, userId)) {
             return;
         }
-
+        chatManager.assertOwned(userId, id, true);
+        if ("yes".equals(redisTemplate.opsForHash().get(RedisKeyConstants.chatInfoKey(id), "break"))) {
+            sink.tryEmitNext(AgentEvent.notify("请先确认或拒绝当前订单，再继续对话"));
+            sink.tryEmitComplete();
+            return;
+        }
         String classification;
-        List<Message> messages = memory.get(userId, id, 1);
+        List<Message> messages = memory.get(userId, id, 100);
         Object classRedis = redisTemplate.opsForHash().get(RedisKeyConstants.chatInfoKey(id),
                 "classification");
         if (messages.isEmpty()) {
@@ -100,7 +107,7 @@ public class ChatServiceImpl implements ChatService {
         } else {
             // 对话不为空：分类依赖"上一轮路由结果 + 助理最后的回复"，两者都必须进缓存 key
             classification = resolveClassification(
-                    String.valueOf(classRedis), messages.getFirst().getText(), param.getPrompt());
+                    String.valueOf(classRedis), lastAssistantText(messages), param.getPrompt());
         }
         if (classification == null) {
             String failFtr = "路由失败，请换种方式问问题。";
@@ -195,6 +202,15 @@ public class ChatServiceImpl implements ChatService {
         };
     }
 
+    private String lastAssistantText(List<Message> messages) {
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if (messages.get(i) instanceof org.springframework.ai.chat.messages.AssistantMessage assistant) {
+                return assistant.getText();
+            }
+        }
+        return null;
+    }
+
     private boolean canStartChat(String id, ChatParamDTO param, Sinks.Many<AgentEvent> sink, String userId) {
         if (param == null || !StringUtils.hasText(param.getPrompt())) {
             sink.tryEmitNext(AgentEvent.error("消息内容不能为空"));
@@ -212,11 +228,17 @@ public class ChatServiceImpl implements ChatService {
 
     @Override
     public void resume(String id, ChatParamDTO chatParam, Sinks.Many<AgentEvent> sink, String userId) {
+        if (chatParam != null && chatParam.getConfirmed() != null && chatParam.getConfirmationId() != null
+                && !StringUtils.hasText(chatParam.getPrompt())) {
+            chatParam.setPrompt(Boolean.TRUE.equals(chatParam.getConfirmed()) ? "确认" : "拒绝");
+        }
         if (!canStartChat(id, chatParam, sink, userId)) {
             return;
         }
-        // 只有ORDER Agent才会需要HITL，这里直接转即可。
-        orderAgent.resume(sink, id, userId, chatParam.getPrompt());
+        chatManager.assertOwned(userId, id, false);
+        orderConfirmation.confirm(id, chatParam.getConfirmationId(), chatParam.getConfirmed());
+        String feedback = Boolean.TRUE.equals(chatParam.getConfirmed()) ? "用户已确认当前报价，可以创建订单。" : "用户拒绝当前报价，禁止创建订单。";
+        orderAgent.resume(sink, id, userId, feedback + chatParam.getPrompt());
     }
 
 }

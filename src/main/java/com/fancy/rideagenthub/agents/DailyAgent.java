@@ -64,7 +64,7 @@ public class DailyAgent {
         List<Message> history = new ArrayList<>(messageMemory.get(userId, chatId, HISTORY_SIZE));
 
         // 记录原始历史长度，用于后续只保存新增消息
-        int originalHistorySize = history.size();
+        int originalHistorySize = history.size() + (!history.isEmpty() && !(history.getFirst() instanceof SystemMessage) ? 1 : 0);
 
         // 构建系统提示
         String currentTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy年MM月dd日 HH:mm"));
@@ -94,6 +94,11 @@ public class DailyAgent {
 
     private void runLoopStep(List<Message> history, int originalHistorySize, Sinks.Many<AgentEvent> sink, String chatId,
             String userId) {
+        if (history.size() - originalHistorySize > 200) {
+            sink.tryEmitNext(AgentEvent.error("本轮工具调用次数过多，请重新发起请求"));
+            sink.tryEmitComplete();
+            return;
+        }
         List<ToolCallback> callbacks = List.of(ToolCallbacks.from(
             curWeatherTool, geoRegeoTool, poiSearchTool, userPOITool, dailyTool, toolRepPointerTool, poiAroundTool));
         Consumer<String> toolListener = (msg) -> sink.tryEmitNext(AgentEvent.tool(msg));
@@ -111,8 +116,7 @@ public class DailyAgent {
         StringBuilder contentBuffer = new StringBuilder();
         AtomicReference<AssistantMessage> assistantMessageRef = new AtomicReference<>();
 
-        this.openAiChatModel.stream(prompt)
-                .subscribe(
+        AgentStreams.subscribe(this.openAiChatModel.stream(prompt), sink,
                         chatResponse -> {
                             Generation generation = chatResponse.getResult();
                             if (generation == null) {

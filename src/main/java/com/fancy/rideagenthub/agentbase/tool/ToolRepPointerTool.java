@@ -16,13 +16,17 @@ import org.springframework.stereotype.Component;
 public class ToolRepPointerTool {
 
     private final ToolResponseMemory toolResponseMemory;
+    @jakarta.annotation.Resource
+    private com.fancy.rideagenthub.agentbase.chatinfo.ChatManager chatManager;
 
-    @Tool(description = "根据工具调用结果历史中的调用ID，查询调用过的工具的返回结果")
+    @Tool(name = "getCalling", description = "根据工具调用结果历史中的调用ID，查询调用过的工具的返回结果")
     public String getToolResponse(@ToolParam(description = "调用ID") String callId, ToolContext toolContext){
         log.info("[Tool Calling]: getToolResponse(): callId={}", callId);
         ToolNotifySupport.notifyToolListener(toolContext, "根据call_id查询调用过的工具结果 (getToolResponse)");
-        String response = toolResponseMemory.get(callId);
-        log.info("[Tool Result-response]: {}", response);
+        String chatId = toolContext.getContext().get(ToolContextKeyConstants.CHAT_ID).toString();
+        String userId = toolContext.getContext().get(ToolContextKeyConstants.USER_ID).toString();
+        chatManager.assertOwned(userId, chatId, false);
+        String response = toolResponseMemory.get(callId, chatId);
         return response;
     }
 
@@ -41,7 +45,12 @@ public class ToolRepPointerTool {
         if (chatId == null || chatId.isBlank()) {
             return;
         }
-        toolResponseMemory.save(callId, chatId, response);
+        try {
+            toolResponseMemory.save(callId, chatId, response);
+        } catch (RuntimeException e) {
+            // 新历史保留完整工具应答，辅助索引失败不能重放已经完成的真实工具。
+            log.warn("辅助工具结果索引写入失败，结果随会话保存", e);
+        }
     }
 
 }

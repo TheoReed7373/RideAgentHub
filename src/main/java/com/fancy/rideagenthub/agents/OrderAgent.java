@@ -52,6 +52,8 @@ public class OrderAgent {
     private final TrafficTool trafficTool;
     private final UserPOISearchTool userPOISearchTool;
     private final GeoRegeoTool geoRegeoTool;
+    @jakarta.annotation.Resource
+    private com.fancy.rideagenthub.service.base.OrderConfirmation orderConfirmation;
 
     private static final int HISTORY_SIZE = 100;
 
@@ -65,7 +67,7 @@ public class OrderAgent {
         List<Message> history = new ArrayList<>(messageMemory.get(userId, chatId, HISTORY_SIZE));
 
         // 记录原始历史长度，用于后续只保存新增消息
-        int originalHistorySize = history.size();
+        int originalHistorySize = history.size() + (!history.isEmpty() && !(history.getFirst() instanceof SystemMessage) ? 1 : 0);
 
         // 构建系统提示
         String currentTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy年MM月dd日 HH:mm"));
@@ -103,23 +105,21 @@ public class OrderAgent {
 
         // 检查 break 字段
         Object breakFlag = stringRedisTemplate.opsForHash().get(chatInfoKey, "break");
-        if (breakFlag == null || !"yes".equals(breakFlag.toString())) {
+        if (breakFlag == null || !"resuming".equals(breakFlag.toString())) {
             sink.tryEmitNext(AgentEvent.error("非法的恢复请求：对话不在等待确认状态"));
             sink.tryEmitComplete();
             return;
         }
 
-        // 删除 break 字段
-        stringRedisTemplate.opsForHash().delete(chatInfoKey, "break");
-
         // 获取历史消息
-        List<Message> history = new ArrayList<>(messageMemory.get(userId, chatId, HISTORY_SIZE));
+        List<Message> history = new ArrayList<>(messageMemory.getPersisted(userId, chatId, HISTORY_SIZE));
 
         // 记录原始历史长度，用于后续只保存新增消息
         int originalHistorySize = history.size();
 
         // 获取最后一个 AssistantMessage 的 notifyUser 工具调用 ID
-        String lastToolCallId = getLastNotifyUserToolCallId(history);
+        Object pending = stringRedisTemplate.opsForHash().get(chatInfoKey, "pendingToolCall");
+        String lastToolCallId = pending == null ? null : pending.toString();
         if (lastToolCallId == null) {
             sink.tryEmitNext(AgentEvent.error("无法找到待确认的工具调用"));
             sink.tryEmitComplete();
@@ -134,7 +134,16 @@ public class OrderAgent {
         ToolResponseMessage toolResponseMessage = ToolResponseMessage.builder()
                 .responses(List.of(toolResponse))
                 .build();
-        history.add(toolResponseMessage);
+        // 先持久化工具应答，再调用模型；模型失败后历史仍保持配对，可继续正常聊天。
+        boolean answered = history.stream().filter(ToolResponseMessage.class::isInstance)
+                .map(ToolResponseMessage.class::cast).flatMap(m -> m.getResponses().stream())
+                .anyMatch(r -> lastToolCallId.equals(r.id()));
+        if (!answered) {
+            messageMemory.save(userId, chatId, List.of(toolResponseMessage));
+            history.add(toolResponseMessage);
+        }
+        originalHistorySize = history.size();
+        stringRedisTemplate.opsForHash().delete(chatInfoKey, "break", "pendingToolCall", "confirmationAccepted");
 
         // 继续执行循环
         runLoopStep(history, originalHistorySize, sink, chatId, userId);
@@ -157,6 +166,11 @@ public class OrderAgent {
 
     private void runLoopStep(List<Message> history, int originalHistorySize, Sinks.Many<AgentEvent> sink, String chatId,
             String userId) {
+        if (history.size() - originalHistorySize > 200) {
+            sink.tryEmitNext(AgentEvent.error("本轮工具调用次数过多，请重新发起请求"));
+            sink.tryEmitComplete();
+            return;
+        }
         List<ToolCallback> callbacks = List.of(ToolCallbacks.from(
                 orderTool, poiSearchTool, toolRepPointerTool, trafficTool, userPOISearchTool, geoRegeoTool));
         Consumer<String> toolListener = (msg) -> sink.tryEmitNext(AgentEvent.tool(msg));
@@ -174,8 +188,7 @@ public class OrderAgent {
         StringBuilder contentBuffer = new StringBuilder();
         AtomicReference<AssistantMessage> assistantMessageRef = new AtomicReference<>();
 
-        this.openAiChatModel.stream(prompt)
-                .subscribe(
+        AgentStreams.subscribe(this.openAiChatModel.stream(prompt), sink,
                         chatResponse -> {
                             Generation generation = chatResponse.getResult();
                             if (generation == null)
@@ -238,6 +251,14 @@ public class OrderAgent {
 
             // 特殊处理 notifyUser 工具
             if ("notifyUser".equals(toolName)) {
+                // 同批后续调用没有执行，显式应答；确认调用的响应留到真实用户反馈后追加。
+                int index = toolCalls.indexOf(toolCall);
+                for (int i = index + 1; i < toolCalls.size(); i++) {
+                    var deferred = toolCalls.get(i);
+                    toolResponses.add(new ToolResponseMessage.ToolResponse(deferred.id(), deferred.name(),
+                            "尚未执行：请等待用户确认后按需重新调用。"));
+                }
+                if (!toolResponses.isEmpty()) history.add(ToolResponseMessage.builder().responses(toolResponses).build());
                 handleNotifyUser(toolCall, history, originalHistorySize, sink, chatId, userId, toolContext);
                 return; // 中断循环，等待用户确认
             }
@@ -283,16 +304,18 @@ public class OrderAgent {
         }
 
         try {
+            String confirmationId = orderConfirmation.begin(chatId, toolCall.id());
+            orderParams.put("confirmationId", confirmationId);
             String orderJson = objectMapper.writeValueAsString(orderParams);
 
             // 1. 发出 AgentEvent.confirm()
-            sink.tryEmitNext(AgentEvent.comfirm(orderJson));
 
             // 2. 保存新增的消息（从原始历史长度开始的子列表）
             saveNewMessages(userId, chatId, history, originalHistorySize);
 
             // 3. 设置 Redis break 标记
             stringRedisTemplate.opsForHash().put(chatInfoKey, "break", "yes");
+            sink.tryEmitNext(AgentEvent.comfirm(orderJson));
 
             // 4. 结束 sink
             sink.tryEmitComplete();

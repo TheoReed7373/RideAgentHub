@@ -128,6 +128,13 @@ public class CurWeatherTool {
      * 分析降水数据，生成描述性文本
      */
     private String analyzePrecipitation(List<QweatherMinutely> minutelyList) {
+        for (var period : minutelyList) {
+            try {
+                if (period == null || period.precip() == null) return "降水数据不完整，暂时无法判断";
+                double amount = Double.parseDouble(period.precip());
+                if (!Double.isFinite(amount) || amount < 0) return "降水数据格式异常，暂时无法判断";
+            } catch (NumberFormatException e) { return "降水数据格式异常，暂时无法判断"; }
+        }
         // 检查第一个时段是否有降水
         boolean isRainingNow = false;
         if (minutelyList.get(0) != null && minutelyList.get(0).precip() != null) {

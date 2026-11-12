@@ -26,6 +26,7 @@ import java.util.List;
  * </p>
  */
 public interface RideOrderService {
+    List<RideOrderVO> getPassengerOrdersByTime(String userId, LocalDateTime start, LocalDateTime end, int limit);
 
     /**
      * 根据起终点和车型估算行程价格

@@ -53,7 +53,7 @@ class ChatServiceRegressionTest {
         orders = mock(OrderAgent.class);
         daily = mock(DailyAgent.class);
         memory = mock(MessageMemory.class);
-        when(memory.get("1", "chat", 1)).thenReturn(List.of());
+        when(memory.get("1", "chat", 100)).thenReturn(List.of());
         manager = mock(ChatManager.class);
         service = new ChatServiceImpl(redis, memory, orders, mock(FallbackAgent.class), daily,
                 mock(SupportAgent.class), manager, cache, limiter, model);
@@ -147,7 +147,7 @@ class ChatServiceRegressionTest {
     @Test
     void nullHistoricalTextStillUsesMultiTurnClassifierPrompt() {
         Message history = mock(Message.class);
-        when(memory.get("1", "chat", 1)).thenReturn(List.of(history));
+        when(memory.get("1", "chat", 100)).thenReturn(List.of(history));
         when(hash.get(anyString(), eq("classification"))).thenReturn("DAILY");
         when(model.call(any(Prompt.class))).thenReturn(response("DAILY"));
         service.chat("chat", new ChatParamDTO("prompt"), sink, "1");

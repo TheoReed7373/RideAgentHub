@@ -63,12 +63,13 @@ public class UserAuthServiceImpl implements UserAuthService {
     public void createUser(UserAuth userAuth) {
         // 邮箱统一转小写
         if (userAuth.getEmail() != null) {
-            userAuth.setEmail(userAuth.getEmail().toLowerCase());
+            userAuth.setEmail(userAuth.getEmail().trim().toLowerCase(java.util.Locale.ROOT));
         }
         // 角色统一转大写
         if (userAuth.getRole() != null) {
             userAuth.setRole(userAuth.getRole().toUpperCase());
         }
+        userAuth.setUsername(userAuth.getUsername().trim());
         userAuth.setCreateTime(LocalDateTime.now());
         userAuth.setUpdateTime(LocalDateTime.now());
         userAuthMapper.insert(userAuth);

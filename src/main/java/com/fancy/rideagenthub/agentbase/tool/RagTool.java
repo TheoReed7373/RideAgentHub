@@ -26,6 +26,7 @@ public class RagTool {
         ToolNotifySupport.notifyToolListener(toolContext, "正在调用知识库搜索……" + queryStr);
         try {
             List<QaDocument> docs = ragService.searchAnswers(queryStr);
+            if (docs.isEmpty()) return "知识库未找到有效的相关信息，请明确告知用户并按需转人工处理。";
             StringBuilder sb = new StringBuilder();
             sb.append("找到以下相关知识库条目：\n");
             for (int i = 0; i < docs.size(); i++) {

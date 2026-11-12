@@ -16,6 +16,8 @@ public class MysqlMemory {
 
     private final ChatMessageMapper chatMessageMapper;
     private final MessageParser messageParser;
+    @jakarta.annotation.Resource
+    private com.fancy.rideagenthub.mapper.ChatMapper chatMapper;
 
     public MysqlMemory(ChatMessageMapper chatMessageMapper, MessageParser messageParser) {
         this.chatMessageMapper = chatMessageMapper;
@@ -35,18 +37,9 @@ public class MysqlMemory {
         if (rows == null || rows.isEmpty()) {
             return List.of();
         }
-        List<Message> desc = new ArrayList<>(rows.size());
-        for (ChatMessage row : rows) {
-            if (row == null || row.getMessageText() == null || row.getMessageText().isBlank()) {
-                continue;
-            }
-            Message msg = messageParser.unparse(row.getMessageText());
-            if (msg != null) {
-                desc.add(msg);
-            }
-        }
-        Collections.reverse(desc);
-        return desc;
+        List<String> json = new ArrayList<>();
+        for (int i = rows.size() - 1; i >= 0; i--) if (rows.get(i) != null) json.add(rows.get(i).getMessageText());
+        return messageParser.unparseHistory(json);
     }
 
     public List<Message> getAll(String chatId) {
@@ -61,23 +54,19 @@ public class MysqlMemory {
         if (rows == null || rows.isEmpty()) {
             return List.of();
         }
-        List<Message> result = new ArrayList<>(rows.size());
-        for (ChatMessage row : rows) {
-            if (row == null || row.getMessageText() == null || row.getMessageText().isBlank()) {
-                continue;
-            }
-            Message msg = messageParser.unparse(row.getMessageText());
-            if (msg != null) {
-                result.add(msg);
-            }
-        }
-        return result;
+        return messageParser.unparseHistory(rows.stream().filter(java.util.Objects::nonNull)
+                .map(ChatMessage::getMessageText).toList());
     }
 
     @Transactional
     public void append(String chatId, List<Message> messages) {
         if (chatId == null || messages == null || messages.isEmpty()) {
             return;
+        }
+        var chat = chatMapper.selectOne(new LambdaQueryWrapper<com.fancy.rideagenthub.domain.entity.Chat>()
+                .eq(com.fancy.rideagenthub.domain.entity.Chat::getChatId, chatId).last("FOR UPDATE"));
+        if (chat == null || Boolean.TRUE.equals(chat.getHistoryDeleted())) {
+            throw new com.fancy.rideagenthub.exception.BusinessException(410, "会话不存在或已清空");
         }
         for (Message message : messages) {
             if (message == null) {

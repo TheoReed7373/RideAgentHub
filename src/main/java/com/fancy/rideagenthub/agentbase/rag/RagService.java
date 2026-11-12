@@ -42,8 +42,13 @@ public class RagService {
     private final ElasticsearchClient esClient;
     private final QaInfoMapper qaInfoMapper;
     private final QaElasticMapMapper qaElasticMapMapper;
+    @jakarta.annotation.Resource private com.fancy.rideagenthub.mapper.QaSyncJobMapper syncJobs;
+    @jakarta.annotation.Resource(name = "ragExecutor") private java.util.concurrent.Executor executor;
+    @org.springframework.beans.factory.annotation.Value("${rag.search.timeout-ms:8000}")
+    private long searchTimeoutMillis = 8000;
 
-    private final SnowflakeIdWorker snowflakeIdWorker = new SnowflakeIdWorker(1, 1);
+    @jakarta.annotation.Resource
+    private SnowflakeIdWorker snowflakeIdWorker;
 
     public RagService(@Qualifier("dashscopeEmbeddingModel") EmbeddingModel embeddingModel,
                       ElasticsearchClient elasticsearchClient,
@@ -182,71 +187,19 @@ public class RagService {
 
     @Transactional
     public void addQA(RagQAAddDTO dto) {
-        log.info("Adding QA");
-        if (dto == null) {
-            throw new IllegalArgumentException("dto不能为空");
+        if (dto == null || dto.getQuestions() == null || dto.getAnswer() == null || dto.getAnswer().isBlank()) {
+            throw new IllegalArgumentException("问题和答案不能为空");
         }
-        if (dto.getQuestions() == null || dto.getQuestions().isEmpty()) {
-            throw new IllegalArgumentException("questions不能为空");
+        List<String> questions = dto.getQuestions().stream().filter(Objects::nonNull).map(String::trim)
+                .filter(q -> !q.isEmpty()).distinct().toList();
+        if (questions.isEmpty()) throw new IllegalArgumentException("问题不能为空");
+        long groupId = snowflakeIdWorker.nextId();
+        qaInfoMapper.insert(QaInfo.builder().groupId(groupId).answer(dto.getAnswer().trim()).build());
+        for (String question : questions) {
+            qaElasticMapMapper.insert(QaElasticMap.builder().groupId(groupId)
+                    .elasticId(snowflakeIdWorker.nextId()).question(question).build());
         }
-        if (dto.getAnswer() == null || dto.getAnswer().isBlank()) {
-            throw new IllegalArgumentException("answer不能为空");
-        }
-
-        Long groupId = snowflakeIdWorker.nextId();
-        String answer = dto.getAnswer().trim();
-
-        List<String> questions = dto.getQuestions().stream()
-                .filter(Objects::nonNull)
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .distinct()
-                .toList();
-        if (questions.isEmpty()) {
-            throw new IllegalArgumentException("questions不能为空");
-        }
-        List<String> insertedEsIds = new ArrayList<>(questions.size());
-        try {
-            // 先写 ES
-            for (String q : questions) {
-                long questionId = snowflakeIdWorker.nextId();
-                String qid = Long.toString(questionId);
-
-                QaDocument doc = new QaDocument();
-                doc.setId(qid);
-                doc.setGroupId(groupId.toString());
-                doc.setQuestion(q);
-                doc.setQuestionVector(vectorToList(embeddingModel.embed(q)));
-                doc.setAnswer(answer);
-
-                esClient.index(i -> i.index("qa_knowledge_base").id(qid).document(doc));
-                insertedEsIds.add(qid);
-            }
-            // 再写 MySQL
-            qaInfoMapper.insert(QaInfo.builder()
-                    .groupId(groupId)
-                    .answer(answer)
-                    .build());
-            for (int idx = 0; idx < insertedEsIds.size(); idx++) {
-                String qid = insertedEsIds.get(idx);
-                String qText = questions.get(idx);
-                qaElasticMapMapper.insert(QaElasticMap.builder()
-                        .groupId(groupId)
-                        .elasticId(Long.valueOf(qid))
-                        .question(qText)
-                        .build());
-            }
-        } catch (Exception ex) {
-            // MySQL 回滚，但 ES 需要补偿删除
-            for (String id : insertedEsIds) {
-                try {
-                    esClient.delete(d -> d.index("qa_knowledge_base").id(id));
-                } catch (Exception ignore) {
-                    // best effort
-                }
-            }
-            throw new RuntimeException("添加问答对失败", ex);
-        }
+        syncJobs.enqueue(groupId);
     }
 
     @Transactional
@@ -322,14 +275,6 @@ public class RagService {
                 }
             }
         }
-        // 先删 ES
-        for (String id : idSet) {
-            try {
-                esClient.delete(d -> d.index("qa_knowledge_base").id(id));
-            } catch (Exception e) {
-                // ES 中可能不存在，忽略
-            }
-        }
         // 再删 MySQL mapping
         if (!qidLongs.isEmpty()) {
             qaElasticMapMapper.delete(new LambdaQueryWrapper<QaElasticMap>()
@@ -337,6 +282,7 @@ public class RagService {
         }
         // 对于受影响的 group：若已无问题映射，则删除 qa_info
         for (Long gid : affectedGroupIds) {
+            syncJobs.enqueue(gid);
             Long left = qaElasticMapMapper.selectCount(
                     new LambdaQueryWrapper<QaElasticMap>().eq(QaElasticMap::getGroupId, gid));
             if (left == null || left == 0) {
@@ -358,20 +304,32 @@ public class RagService {
     private static final int WINDOW_SIZE = 100; // 每个队列取前100名参与融合
 
     public List<QaDocument> searchAnswers(String userQuery) {
+        if (userQuery == null || userQuery.isBlank()) return List.of();
+        List<CompletableFuture<?>> tasks = new ArrayList<>();
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(Math.max(1, searchTimeoutMillis));
         try {
             // 1. 准备向量
-            float[] vectorArray = embeddingModel.embed(userQuery);
+            var embeddingFuture = CompletableFuture.supplyAsync(() -> embeddingModel.embed(userQuery), executor);
+            tasks.add(embeddingFuture);
+            float[] vectorArray = embeddingFuture.get(remaining(deadline), java.util.concurrent.TimeUnit.NANOSECONDS);
             List<Float> queryVector = vectorToList(vectorArray);
             // 2. 并行执行两个查询 (Vector 和 BM25)
             // 使用 CompletableFuture 并行不仅快，而且解耦
             CompletableFuture<List<Hit<QaDocument>>> vectorFuture = CompletableFuture.supplyAsync(() ->
-                    searchVectorOnly(queryVector, WINDOW_SIZE)
+                    searchVectorOnly(queryVector, WINDOW_SIZE), executor
             );
+            tasks.add(vectorFuture);
             CompletableFuture<List<Hit<QaDocument>>> bm25Future = CompletableFuture.supplyAsync(() ->
-                    searchBm25Only(userQuery, WINDOW_SIZE)
+                    searchBm25Only(userQuery, WINDOW_SIZE), executor
             );
+            tasks.add(bm25Future);
             // 3. 等待结果返回
-            CompletableFuture.allOf(vectorFuture, bm25Future).join();
+            try {
+                CompletableFuture.allOf(vectorFuture, bm25Future).get(remaining(deadline), java.util.concurrent.TimeUnit.NANOSECONDS);
+            } finally {
+                if (!vectorFuture.isDone()) vectorFuture.cancel(true);
+                if (!bm25Future.isDone()) bm25Future.cancel(true);
+            }
             List<Hit<QaDocument>> vectorHits = vectorFuture.get();
             List<Hit<QaDocument>> bm25Hits = bm25Future.get();
             // 4. 执行 RRF 融合算法
@@ -419,10 +377,45 @@ public class RagService {
                     break;
                 }
             }
-            return finalResults;
+            return authoritative(finalResults);
         } catch (Exception e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             throw new RuntimeException("RRF Search failed", e);
+        } finally {
+            tasks.stream().filter(task -> !task.isDone()).forEach(task -> task.cancel(true));
         }
+    }
+
+    private long remaining(long deadline) throws java.util.concurrent.TimeoutException {
+        long remaining = deadline - System.nanoTime();
+        if (remaining <= 0) throw new java.util.concurrent.TimeoutException("知识库检索超时");
+        return remaining;
+    }
+
+    List<QaDocument> authoritative(List<QaDocument> candidates) {
+        List<Long> ids = new ArrayList<>();
+        for (QaDocument doc : candidates) {
+            try { ids.add(Long.valueOf(doc.getId())); } catch (RuntimeException ignored) { }
+        }
+        if (ids.isEmpty()) return List.of();
+        Map<Long, QaElasticMap> mappings = qaElasticMapMapper.selectList(new LambdaQueryWrapper<QaElasticMap>()
+                .in(QaElasticMap::getElasticId, ids)).stream().collect(Collectors.toMap(QaElasticMap::getElasticId, q -> q));
+        Set<Long> groups = mappings.values().stream().map(QaElasticMap::getGroupId).collect(Collectors.toSet());
+        if (groups.isEmpty()) return List.of();
+        Map<Long, QaInfo> infos = qaInfoMapper.selectList(new LambdaQueryWrapper<QaInfo>()
+                .in(QaInfo::getGroupId, groups)).stream().collect(Collectors.toMap(QaInfo::getGroupId, q -> q));
+        List<QaDocument> result = new ArrayList<>();
+        for (QaDocument doc : candidates) {
+            QaElasticMap mapping;
+            try { mapping = mappings.get(Long.valueOf(doc.getId())); } catch (RuntimeException e) { continue; }
+            if (mapping == null || !Objects.equals(mapping.getQuestion(), doc.getQuestion())
+                    || !Objects.equals(String.valueOf(mapping.getGroupId()), doc.getGroupId())) continue;
+            QaInfo info = infos.get(mapping.getGroupId());
+            if (info == null) continue;
+            doc.setAnswer(info.getAnswer());
+            result.add(doc);
+        }
+        return result;
     }
 
     // 辅助方法：纯向量查询
@@ -472,47 +465,12 @@ public class RagService {
      */
     @Transactional
     public void updateAnswer(RagQAUpdateAnswerDTO dto) {
-        if (dto == null) {
-            throw new IllegalArgumentException("dto不能为空");
-        }
-        if (dto.getGroupId() == null || dto.getGroupId().isBlank()) {
-            throw new IllegalArgumentException("groupId不能为空");
-        }
-        if (dto.getAnswer() == null || dto.getAnswer().isBlank()) {
-            throw new IllegalArgumentException("answer不能为空");
-        }
-        String groupIdStr = dto.getGroupId().trim();
-        Long groupId;
-        try {
-            groupId = Long.valueOf(groupIdStr);
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("groupId格式不合法");
-        }
-        String answer = dto.getAnswer().trim();
-
-        try {
-            UpdateByQueryResponse resp = esClient.updateByQuery(u -> u
-                    .index("qa_knowledge_base")
-                    .query(q -> q.term(t -> t.field("groupId").value(groupIdStr)))
-                    .script(s -> s
-                            .lang("painless")
-                            .source("ctx._source.answer = params.answer")
-                            .params(Map.of("answer", JsonData.of(answer)))
-                    )
-                    .conflicts(Conflicts.Proceed)
-                    .refresh(true)
-            );
-            if (resp.failures() != null && !resp.failures().isEmpty()) {
-                log.warn("ES update-by-query failures, groupId={}, failures={}", groupIdStr, resp.failures().size());
-                throw new RuntimeException("ES批量更新answer失败");
-            }
-        } catch (Exception e) {
-            throw new RuntimeException("ES批量更新answer失败", e);
-        }
-
-        qaInfoMapper.update(null, new LambdaUpdateWrapper<QaInfo>()
-                .set(QaInfo::getAnswer, answer)
-                .eq(QaInfo::getGroupId, groupId));
+        if (dto == null || dto.getGroupId() == null || dto.getAnswer() == null || dto.getAnswer().isBlank())
+            throw new IllegalArgumentException("答案组和答案不能为空");
+        Long groupId = Long.valueOf(dto.getGroupId().trim());
+        if (qaInfoMapper.update(null, new LambdaUpdateWrapper<QaInfo>().eq(QaInfo::getGroupId, groupId)
+                .set(QaInfo::getAnswer, dto.getAnswer().trim())) != 1) throw new IllegalArgumentException("答案组不存在");
+        syncJobs.enqueue(groupId);
     }
 
     /**
@@ -522,44 +480,14 @@ public class RagService {
      */
     @Transactional
     public void updateQuestion(RagQAUpdateQuestionDTO dto) {
-        if (dto == null) {
-            throw new IllegalArgumentException("dto不能为空");
-        }
-        if (dto.getQuestionId() == null || dto.getQuestionId().isBlank()) {
-            throw new IllegalArgumentException("questionId不能为空");
-        }
-        if (dto.getQuestion() == null || dto.getQuestion().isBlank()) {
-            throw new IllegalArgumentException("question不能为空");
-        }
-        String questionIdStr = dto.getQuestionId().trim();
-        Long questionId;
-        try {
-            questionId = Long.valueOf(questionIdStr);
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("questionId格式不合法");
-        }
-        String question = dto.getQuestion().trim();
-        List<Float> questionVector = vectorToList(embeddingModel.embed(question));
-
-        try {
-            Map<String, Object> partial = new HashMap<>();
-            partial.put("question", question);
-            partial.put("questionVector", questionVector);
-            UpdateResponse<QaDocument> resp = esClient.update(u -> u
-                    .index("qa_knowledge_base")
-                    .id(questionIdStr)
-                    .doc(partial)
-                    .refresh(Refresh.True)
-            , QaDocument.class);
-            if (resp.result() == null) {
-                throw new RuntimeException("ES更新question失败");
-            }
-        } catch (Exception e) {
-            throw new RuntimeException("ES更新question失败", e);
-        }
-
-        qaElasticMapMapper.update(null, new LambdaUpdateWrapper<QaElasticMap>()
-                .set(QaElasticMap::getQuestion, question)
-                .eq(QaElasticMap::getElasticId, questionId));
+        if (dto == null || dto.getQuestionId() == null || dto.getQuestion() == null || dto.getQuestion().isBlank())
+            throw new IllegalArgumentException("问题编号和问题不能为空");
+        Long questionId = Long.valueOf(dto.getQuestionId().trim());
+        QaElasticMap question = qaElasticMapMapper.selectOne(new LambdaQueryWrapper<QaElasticMap>()
+                .eq(QaElasticMap::getElasticId, questionId).last("FOR UPDATE"));
+        if (question == null) throw new IllegalArgumentException("问题不存在");
+        if (qaElasticMapMapper.update(null, new LambdaUpdateWrapper<QaElasticMap>().eq(QaElasticMap::getElasticId, questionId)
+                .set(QaElasticMap::getQuestion, dto.getQuestion().trim())) != 1) throw new IllegalArgumentException("问题已变化");
+        syncJobs.enqueue(question.getGroupId());
     }
 }
