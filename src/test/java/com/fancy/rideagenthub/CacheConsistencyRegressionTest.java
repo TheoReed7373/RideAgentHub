@@ -156,6 +156,7 @@ class CacheConsistencyRegressionTest {
         ValueOperations<String, String> values = mock(ValueOperations.class);
         when(redis.opsForValue()).thenReturn(values);
         when(values.increment(anyString())).thenReturn(1L);
+        when(redis.execute(any(org.springframework.data.redis.core.script.RedisScript.class), anyList())).thenReturn(1L);
         DelayedCacheEvictor delayed = mock(DelayedCacheEvictor.class);
         TicketPoolIndex pool = mock(TicketPoolIndex.class);
         TicketServiceImpl service = new TicketServiceImpl(mock(TicketMapper.class), mock(TicketChatMapper.class),
@@ -182,6 +183,7 @@ class CacheConsistencyRegressionTest {
         ValueOperations<String, String> values = mock(ValueOperations.class);
         when(redis.opsForValue()).thenReturn(values);
         when(values.increment(anyString())).thenReturn(1L);
+        when(redis.execute(any(org.springframework.data.redis.core.script.RedisScript.class), anyList())).thenReturn(1L);
         DelayedCacheEvictor delayed = mock(DelayedCacheEvictor.class);
         TicketPoolIndex pool = mock(TicketPoolIndex.class);
         TicketServiceImpl service = new TicketServiceImpl(mock(TicketMapper.class), mock(TicketChatMapper.class),

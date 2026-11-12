@@ -11,4 +11,8 @@ import lombok.NoArgsConstructor;
 @NoArgsConstructor
 public class ChatParamDTO {
     private String prompt;
+    private String confirmationId;
+    private Boolean confirmed;
+
+    public ChatParamDTO(String prompt) { this.prompt = prompt; }
 }

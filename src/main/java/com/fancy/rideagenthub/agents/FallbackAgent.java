@@ -37,7 +37,7 @@ public class FallbackAgent {
 
         // 获取历史消息
         List<Message> history = new ArrayList<>(messageMemory.get(userId, chatId, HISTORY_SIZE));
-        int originalHistorySize = history.size();
+        int originalHistorySize = history.size() + (!history.isEmpty() && !(history.getFirst() instanceof SystemMessage) ? 1 : 0);
 
         // System prompt（仅在历史为空时补齐）
         if (history.isEmpty()) {
@@ -67,8 +67,7 @@ public class FallbackAgent {
         StringBuilder contentBuffer = new StringBuilder();
         AtomicReference<AssistantMessage> assistantMessageRef = new AtomicReference<>();
 
-        this.openAiChatModel.stream(prompt)
-                .subscribe(
+        AgentStreams.subscribe(this.openAiChatModel.stream(prompt), sink,
                         chatResponse -> {
                             Generation generation = chatResponse.getResult();
                             if (generation == null) {

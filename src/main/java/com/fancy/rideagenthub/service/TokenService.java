@@ -6,6 +6,7 @@ import com.fancy.rideagenthub.security.UserToken;
  * Token 管理服务
  */
 public interface TokenService {
+    long currentVersion(Long userId);
 
     /**
      * 生成无 `-` 的 UUID Token

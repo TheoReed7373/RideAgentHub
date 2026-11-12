@@ -109,6 +109,18 @@ public class CreateOrderDTO {
             missingFields.add("scheduledTime");
         }
 
+        if (supplemented.getScheduledTime() != null && !supplemented.getScheduledTime().isAfter(com.fancy.rideagenthub.util.BusinessTime.now())) {
+            missingFields.add("scheduledTime必须晚于当前时间");
+        }
+        for (BigDecimal coordinate : new BigDecimal[]{startLat, endLat}) {
+            if (coordinate != null && coordinate.abs().compareTo(BigDecimal.valueOf(90)) > 0) missingFields.add("纬度超出范围");
+        }
+        for (BigDecimal coordinate : new BigDecimal[]{startLng, endLng}) {
+            if (coordinate != null && coordinate.abs().compareTo(BigDecimal.valueOf(180)) > 0) missingFields.add("经度超出范围");
+        }
+        if (vehicleType != null && (vehicleType < 1 || vehicleType > 3)) missingFields.add("vehicleType无效");
+        if (isReservation != 0 && isReservation != 1) missingFields.add("isReservation无效");
+        if (isExpedited != null && isExpedited != 0 && isExpedited != 1) missingFields.add("isExpedited无效");
         // 4. 地址补充：如果地址为空但经纬度存在，调用逆地理编码
         // 起点地址补充
         if (normalizeText(supplemented.getStartAddress()) == null

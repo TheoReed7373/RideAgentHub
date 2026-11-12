@@ -57,6 +57,19 @@ import java.util.function.Supplier;
 @RequiredArgsConstructor
 @Slf4j
 public class RideOrderServiceImpl implements RideOrderService {
+    @Override
+    public List<RideOrderVO> getPassengerOrdersByTime(String userId, LocalDateTime start, LocalDateTime end, int limit) {
+        if (start == null || end == null || end.isBefore(start) || limit < 1 || limit > 201)
+            throw new IllegalArgumentException("订单时间范围或数量无效");
+        return rideOrderMapper.selectList(new LambdaQueryWrapper<RideOrder>()
+                .eq(RideOrder::getUserId, convertToLong(userId)).eq(RideOrder::getIsDeleted, 0)
+                .ge(RideOrder::getCreateTime, start).le(RideOrder::getCreateTime, end)
+                .orderByDesc(RideOrder::getCreateTime).orderByDesc(RideOrder::getOrderId)
+                .last("LIMIT " + limit)).stream().map(this::toVO).toList();
+    }
+
+    @jakarta.annotation.Resource
+    private com.fancy.rideagenthub.service.PaymentVerifier paymentVerifier;
 
     private final RideOrderMapper rideOrderMapper;
     private final AmapRouteService amapRouteService;
@@ -68,7 +81,8 @@ public class RideOrderServiceImpl implements RideOrderService {
     private final DriverGeoIndex driverGeoIndex;
     private final RideOrderTimeoutProperties timeoutProperties;
     private final RedissonClient redissonClient;
-    private final SnowflakeIdWorker snowflakeIdWorker = new SnowflakeIdWorker(1, 1);
+    @jakarta.annotation.Resource
+    private SnowflakeIdWorker snowflakeIdWorker;
 
     /**
      * 获取订单状态机锁的最长等待时长（秒）
@@ -87,6 +101,12 @@ public class RideOrderServiceImpl implements RideOrderService {
                 || endPoint.getLat() == null || endPoint.getLng() == null) {
             throw new IllegalArgumentException("起终点经纬度不能为空");
         }
+        if (startPoint.getLat().abs().compareTo(BigDecimal.valueOf(90)) > 0
+                || endPoint.getLat().abs().compareTo(BigDecimal.valueOf(90)) > 0
+                || startPoint.getLng().abs().compareTo(BigDecimal.valueOf(180)) > 0
+                || endPoint.getLng().abs().compareTo(BigDecimal.valueOf(180)) > 0) {
+            throw new IllegalArgumentException("起终点经纬度超出范围");
+        }
 
         // 调用高德路径规划获取估算里程和时间
         var estRoute = amapRouteService.getDrivingRouteEst(
@@ -100,85 +120,7 @@ public class RideOrderServiceImpl implements RideOrderService {
     }
 
     private PriceEstimateVO calculatePrice(String estKm, String estTime, Integer vehicleType, Integer isExpedited) {
-        // 计价规则：金额 2 位小数 HALF_UP
-        final int MONEY_SCALE = 2;
-
-        BigDecimal distanceKm;
-        try {
-            distanceKm = estKm == null ? BigDecimal.ZERO : new BigDecimal(estKm.trim());
-        } catch (Exception ignored) {
-            distanceKm = BigDecimal.ZERO;
-        }
-        if (distanceKm.signum() < 0) {
-            distanceKm = BigDecimal.ZERO;
-        }
-
-        BigDecimal durationSec;
-        try {
-            durationSec = estTime == null ? BigDecimal.ZERO : new BigDecimal(estTime.trim());
-        } catch (Exception ignored) {
-            durationSec = BigDecimal.ZERO;
-        }
-        if (durationSec.signum() < 0) {
-            durationSec = BigDecimal.ZERO;
-        }
-
-        boolean expedited = isExpedited != null && isExpedited == 1;
-
-        int vehicleTypeCode = vehicleType == null ? 1 : vehicleType;
-
-        // 1) 计算基础里程费（起步价 + 里程费）
-        // - 起步价 8.00，含 2.0km
-        // - 里程费 2.20/km（仅超出 2km 的部分）
-        BigDecimal startPrice = new BigDecimal("8.00");
-        BigDecimal startDistanceKm = new BigDecimal("2.0");
-        BigDecimal perKmFee = new BigDecimal("2.20");
-
-        BigDecimal overStartKm = distanceKm.subtract(startDistanceKm);
-        if (overStartKm.signum() < 0) {
-            overStartKm = BigDecimal.ZERO;
-        }
-        BigDecimal mileageFee = overStartKm.multiply(perKmFee);
-        BigDecimal priceBase = startPrice.add(mileageFee);
-
-        // 2) 计算远途/空驶费：超出 20km 的部分，加收"里程费的 50%"
-        BigDecimal longDistanceThresholdKm = new BigDecimal("20.0");
-        BigDecimal longOverKm = distanceKm.subtract(longDistanceThresholdKm);
-        if (longOverKm.signum() < 0) {
-            longOverKm = BigDecimal.ZERO;
-        }
-        BigDecimal longDistanceSurchargePerKm = perKmFee.multiply(new BigDecimal("0.50"));
-        BigDecimal priceDistance = longOverKm.multiply(longDistanceSurchargePerKm);
-
-        // 3) 计算时长费：0.50/min。秒 -> 分钟，向上取整
-        BigDecimal minutes = durationSec.divide(new BigDecimal("60"), 0, RoundingMode.CEILING);
-        BigDecimal perMinFee = new BigDecimal("0.50");
-        BigDecimal priceTime = minutes.multiply(perMinFee);
-
-        // 4) 加急：固定调度费 5.00 + 动态倍率 +0.2
-        BigDecimal priceExpedited = expedited ? new BigDecimal("5.00") : BigDecimal.ZERO;
-
-        // 5) 车型倍率：按文档：1->1.0, 2->1.6, 3->2.5
-        BigDecimal vehicleMultiplier = switch (vehicleTypeCode) {
-            case 2 -> new BigDecimal("1.60");
-            case 3 -> new BigDecimal("2.50");
-            default -> BigDecimal.ONE;
-        };
-        BigDecimal expediteMultiplier = expedited ? new BigDecimal("0.20") : BigDecimal.ZERO;
-        BigDecimal finalMultiplier = vehicleMultiplier.add(expediteMultiplier);
-
-        // 6) 最终价：(小计价格 + 固定加急费) * (车型倍率 + 加急动态倍率)
-        BigDecimal subTotal = priceBase.add(priceTime).add(priceDistance);
-        BigDecimal estPrice = subTotal.add(priceExpedited).multiply(finalMultiplier);
-
-        return PriceEstimateVO.builder()
-                .estPrice(estPrice.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceRadio(finalMultiplier.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceBase(priceBase.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceTime(priceTime.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceDistance(priceDistance.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceExpedited(priceExpedited.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .build();
+        return com.fancy.rideagenthub.service.base.RidePricing.calculate(estKm, estTime, vehicleType, isExpedited);
     }
 
     @Override
@@ -187,9 +129,10 @@ public class RideOrderServiceImpl implements RideOrderService {
             throw new IllegalArgumentException("createOrderDTO不能为空");
         }
 
-        boolean userIdMissing = dto.getUserId() == null;
-        if(userIdMissing) {
-            dto.setUserId(UserTokenContext.getUserIdInString());
+        // HTTP 与异步 Agent 都必须显式传递可信身份；不信任客户端预估价和轨迹引用。
+        if (UserTokenContext.isLoggedIn()) dto.setUserId(UserTokenContext.getUserIdInString());
+        if (dto.getUserId() == null || dto.getUserId().isBlank()) {
+            throw new BusinessException(401, "缺少下单身份");
         }
         if (dto.getVehicleType() == null) {
             dto.setVehicleType(1);
@@ -200,6 +143,7 @@ public class RideOrderServiceImpl implements RideOrderService {
         if (dto.getIsReservation() == null) {
             dto.setIsReservation(0);
         }
+        if (dto.getIsReservation() == 0) dto.setScheduledTime(null);
 
         // 调用 DTO 的校验与补充方法
         CreateOrderDTO.ValidationResult result = dto.validateAndSupplement(amapGeoRegeoService);
@@ -214,12 +158,8 @@ public class RideOrderServiceImpl implements RideOrderService {
 
         // 使用补充后的DTO
         CreateOrderDTO validatedDto = result.supplementedDTO();
-        boolean needRoutePlan = userIdMissing
-                && (normalizeText(validatedDto.getMongoTraceId()) == null
-                || validatedDto.getEstDistance() == null
-                || validatedDto.getEstPrice() == null
-                || validatedDto.getRadio() == null);
-        if (needRoutePlan) {
+        Long orderId = snowflakeIdWorker.nextId();
+        {
             if (validatedDto.getStartLat() == null || validatedDto.getStartLng() == null
                     || validatedDto.getEndLat() == null || validatedDto.getEndLng() == null) {
                 throw new IllegalArgumentException("起终点经纬度不能为空");
@@ -232,11 +172,7 @@ public class RideOrderServiceImpl implements RideOrderService {
             if (estRoute == null || estRoute.getEstKm() == null || estRoute.getEstTime() == null) {
                 throw new BusinessException(502, "路径规划失败：返回里程/时间为空");
             }
-            String traceId = normalizeText(validatedDto.getMongoTraceId());
-            if (traceId == null) {
-                traceId = UUID.randomUUID().toString();
-            }
-            orderRouteService.addOrder(traceId, estRoute);
+            String traceId = UUID.randomUUID().toString();
             validatedDto.setMongoTraceId(traceId);
             try {
                 validatedDto.setEstDistance(new BigDecimal(estRoute.getEstKm()));
@@ -250,11 +186,11 @@ public class RideOrderServiceImpl implements RideOrderService {
                     validatedDto.getIsExpedited());
             validatedDto.setEstPrice(estPrice.getEstPrice());
             validatedDto.setRadio(estPrice.getEstPriceRadio());
+            orderRouteService.addOrder(traceId, estRoute);
         }
         String startAddress = normalizeText(validatedDto.getStartAddress());
         String endAddress = normalizeText(validatedDto.getEndAddress());
 
-        Long orderId = snowflakeIdWorker.nextId();
         RideOrder order = RideOrder.builder()
                 .orderId(orderId)
                 .userId(convertToLong(validatedDto.getUserId()))
@@ -267,7 +203,7 @@ public class RideOrderServiceImpl implements RideOrderService {
                 .orderStatus(RideOrderStatus.CREATED.getCode())
                 .cancelRole(null)
                 .cancelReason(null)
-                .createTime(LocalDateTime.now())
+                .createTime(com.fancy.rideagenthub.util.BusinessTime.now())
                 .scheduledTime(validatedDto.getScheduledTime())
                 .driverAcceptTime(null)
                 .driverArriveTime(null)
@@ -289,11 +225,17 @@ public class RideOrderServiceImpl implements RideOrderService {
                 .priceDistance(BigDecimal.ZERO)
                 .priceExpedited(BigDecimal.ZERO)
                 .priceRadio(validatedDto.getRadio() == null ? BigDecimal.ZERO : validatedDto.getRadio())
-                .updateTime(LocalDateTime.now())
+                .updateTime(com.fancy.rideagenthub.util.BusinessTime.now())
                 .isDeleted(0)
                 .build();
 
-        rideOrderMapper.insert(order);
+        try {
+            rideOrderMapper.insert(order);
+        } catch (RuntimeException failure) {
+            try { orderRouteService.deleteByTraceId(order.getMongoTraceId()); }
+            catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
         if (order.getOrderId() == null) {
             throw new BusinessException(500, "订单创建失败");
         }
@@ -329,7 +271,7 @@ public class RideOrderServiceImpl implements RideOrderService {
             }
 
             // 阶段二：DB 乐观锁落库 —— 预检只是加速，DB 才是最终裁决者
-            LocalDateTime now = LocalDateTime.now();
+            LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
             int updated = rideOrderMapper.update(null,
                     new LambdaUpdateWrapper<RideOrder>()
                             .eq(RideOrder::getOrderId, orderId)
@@ -433,7 +375,7 @@ public class RideOrderServiceImpl implements RideOrderService {
         String orderId = convertToLong(rawOrderId).toString();
         Long driverIdLong = convertToLong(driverId);
         return withOrderLock(orderId, () -> {
-            LocalDateTime now = LocalDateTime.now();
+            LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
             int updated = rideOrderMapper.update(null,
                     new LambdaUpdateWrapper<RideOrder>()
                             .eq(RideOrder::getOrderId, orderId)
@@ -465,7 +407,7 @@ public class RideOrderServiceImpl implements RideOrderService {
         String orderId = convertToLong(rawOrderId).toString();
         Long driverIdLong = convertToLong(driverId);
         return withOrderLock(orderId, () -> {
-            LocalDateTime now = LocalDateTime.now();
+            LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
             int updated = rideOrderMapper.update(null,
                     new LambdaUpdateWrapper<RideOrder>()
                             .eq(RideOrder::getOrderId, orderId)
@@ -498,7 +440,7 @@ public class RideOrderServiceImpl implements RideOrderService {
                         .eq(RideOrder::getOrderId, orderId)
                         .eq(RideOrder::getIsDeleted, 0)
                         .set(RideOrder::getMongoTraceId, normalized)
-                        .set(RideOrder::getUpdateTime, LocalDateTime.now()));
+                        .set(RideOrder::getUpdateTime, com.fancy.rideagenthub.util.BusinessTime.now()));
 
         if (updated <= 0) {
             throw new BusinessException(404, "订单不存在");
@@ -545,7 +487,7 @@ public class RideOrderServiceImpl implements RideOrderService {
         }
         orderRouteService.updateRealPolyline(traceId, normalizedPolyline);
 
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
         LocalDateTime finishTime = arriveTime != null ? arriveTime : now;
 
         // 计算实际里程
@@ -637,11 +579,26 @@ public class RideOrderServiceImpl implements RideOrderService {
             throw new IllegalArgumentException("orderId不能为空");
         }
         String orderId = convertToLong(rawOrderId).toString();
-        return withOrderLock(orderId, () -> payOrderUnderLock(orderId));
+        String userId = UserTokenContext.getUserIdInString();
+        if (payChannel == null || tradeNo == null || tradeNo.isBlank()) {
+            throw new BusinessException(400, "支付渠道和交易号不能为空");
+        }
+        return withOrderLock(orderId, () -> {
+            RideOrder order = getRequiredOrder(orderId);
+            if (!Objects.equals(order.getUserId(), Long.valueOf(userId))) {
+                throw new BusinessException(403, "只能支付自己的订单");
+            }
+            if (!Objects.equals(order.getOrderStatus(), RideOrderStatus.FINISHED_WAIT_PAY.getCode())) {
+                throw new BusinessException(409, "当前订单状态不允许支付");
+            }
+            if (paymentVerifier == null) throw new BusinessException(503, "支付核验尚未配置");
+            paymentVerifier.verifyPaid(orderId, userId, payChannel, tradeNo, order.getRealPrice());
+            return payOrderUnderLock(orderId);
+        });
     }
 
     private Boolean payOrderUnderLock(String orderId) {
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
         int updated = rideOrderMapper.update(null,
                 new LambdaUpdateWrapper<RideOrder>()
                         .eq(RideOrder::getOrderId, orderId)
@@ -661,6 +618,9 @@ public class RideOrderServiceImpl implements RideOrderService {
 
     @Override
     public String cancelOrder(String rawOrderId, String operatorId, Integer cancelRole, String cancelReason) {
+        if (!Objects.equals(cancelRole, 1) && !Objects.equals(cancelRole, 2)) {
+            throw new BusinessException(403, "外部操作不允许使用系统取消身份");
+        }
         if (rawOrderId == null || rawOrderId.isBlank()) {
             throw new IllegalArgumentException("orderId不能为空");
         }
@@ -723,14 +683,14 @@ public class RideOrderServiceImpl implements RideOrderService {
         if (cancelRole == 1 && order.getDriverId() != null) {
             LocalDateTime acceptTime = order.getDriverAcceptTime();
             if (acceptTime != null) {
-                long minutes = java.time.Duration.between(acceptTime, LocalDateTime.now()).toMinutes();
+                long minutes = java.time.Duration.between(acceptTime, com.fancy.rideagenthub.util.BusinessTime.now()).toMinutes();
                 if (minutes > 5) {
                     cancelFee = calcCancelFee(minutes);
                 }
             }
         }
 
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
         int updated = rideOrderMapper.update(null,
                 new LambdaUpdateWrapper<RideOrder>()
                         .eq(RideOrder::getOrderId, orderId)
@@ -801,7 +761,7 @@ public class RideOrderServiceImpl implements RideOrderService {
             return;
         }
 
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
         switch (status) {
             case CREATED -> handleAcceptTimeout(order, now);
             case DRIVER_ACCEPTED -> handleArriveTimeout(order, now);
@@ -923,7 +883,7 @@ public class RideOrderServiceImpl implements RideOrderService {
      */
     private void systemCancel(RideOrder order, int expectedStatus, String reason) {
         String orderId = order.getOrderId().toString();
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
         int updated = rideOrderMapper.update(null,
                 new LambdaUpdateWrapper<RideOrder>()
                         .eq(RideOrder::getOrderId, order.getOrderId())
@@ -1313,8 +1273,8 @@ public class RideOrderServiceImpl implements RideOrderService {
                 .orderId(order.getOrderId() != null ? order.getOrderId().toString() : null)
                 .userId(order.getUserId() != null ? order.getUserId().toString() : null)
                 .driverId(order.getDriverId() != null ? order.getDriverId().toString() : null)
-                .estRoute(routeLine.getEstPolyline())
-                .realRoute(routeLine.getRealPolyline() != null ? routeLine.getRealPolyline() : null)
+                .estRoute(routeLine == null ? null : routeLine.getEstPolyline())
+                .realRoute(routeLine == null ? null : routeLine.getRealPolyline())
                 .vehicleType(order.getVehicleType())
                 .isReservation(order.getIsReservation())
                 .isExpedited(order.getIsExpedited())
@@ -1410,6 +1370,16 @@ public class RideOrderServiceImpl implements RideOrderService {
         }
         String trimmed = value.trim();
         return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    private BigDecimal requiredNonnegative(String value, String field) {
+        try {
+            BigDecimal number = new BigDecimal(value.trim());
+            if (number.signum() < 0) throw new IllegalArgumentException();
+            return number;
+        } catch (RuntimeException e) {
+            throw new BusinessException(502, "路径规划返回的" + field + "无效", e);
+        }
     }
 
     private String generateSafetyCode() {

@@ -58,4 +58,7 @@ public class UserToken implements Serializable {
      * 过期时间（毫秒时间戳）
      */
     private long expiresAtEpochMs;
+    private long sessionVersion;
+    /** 凭据摘要用于拒绝重置密码期间尚未完成签发的旧登录，不能直接保存密码。 */
+    private String credentialStamp;
 }

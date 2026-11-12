@@ -21,7 +21,15 @@ public class ChatManager {
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
-    public static Duration expireLock = Duration.ofMinutes(60);
+    public static final Duration expireLock = Duration.ofMinutes(60);
+
+    public void assertOwned(String userId, String chatId, boolean allowNew) {
+        chatInfoService.assertOwned(userId, chatId, allowNew);
+    }
+
+    public boolean isNewOwnedChat(String userId, String chatId) { return chatInfoService.isNewOwnedChat(userId, chatId); }
+
+    public void retireHistory(String chatId) { chatInfoService.retireHistory(chatId); }
 
     public void lockChat(String chatId){
         chatInfoService.lockChat(chatId);
@@ -46,7 +54,7 @@ public class ChatManager {
         if(locked == null){
             return chatInfoService.checkLock(chatId);
         }else{
-            return "true".equals(locked); //其实这里始终为真
+            return "true".equals(locked);
         }
     }
 

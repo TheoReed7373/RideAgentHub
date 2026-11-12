@@ -43,7 +43,7 @@ public class UserController {
         Long userId = UserTokenContext.getUserIdInLong();
         UserLocation location = userService.getUserLocation(userId.toString());
         if (location == null) {
-            return Result.fail(404, "用户定位数据不存在");
+            throw new com.fancy.rideagenthub.exception.BusinessException(404, "用户定位数据不存在");
         }
         return Result.ok(location);
     }

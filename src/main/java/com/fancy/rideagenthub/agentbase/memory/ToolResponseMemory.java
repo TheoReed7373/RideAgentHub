@@ -1,73 +1,44 @@
 package com.fancy.rideagenthub.agentbase.memory;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.fancy.rideagenthub.constant.RedisKeyConstants;
 import com.fancy.rideagenthub.domain.entity.ChatToolResponse;
 import com.fancy.rideagenthub.mapper.ChatToolResponseMapper;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
-
 import java.time.Duration;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 @Component
+@Slf4j
 public class ToolResponseMemory {
-
-    private static final Duration DEFAULT_TOOL_CACHE_TTL = Duration.ofHours(24);
-
-    private final Map<String, String> heapCache = new ConcurrentHashMap<>();
-    private final StringRedisTemplate redisTemplate;
-    private final ChatToolResponseMapper chatToolResponseMapper;
-
-    public ToolResponseMemory(StringRedisTemplate redisTemplate, ChatToolResponseMapper chatToolResponseMapper) {
-        this.redisTemplate = redisTemplate;
-        this.chatToolResponseMapper = chatToolResponseMapper;
+    private static final Duration TTL = Duration.ofHours(24);
+    private final StringRedisTemplate redis;
+    private final ChatToolResponseMapper mapper;
+    public ToolResponseMemory(StringRedisTemplate redis, ChatToolResponseMapper mapper) {
+        this.redis = redis;
+        this.mapper = mapper;
     }
-
     public void save(String callId, String chatId, String response) {
-        if (callId == null || callId.isBlank() || chatId == null || chatId.isBlank() || response == null) {
-            return;
-        }
-        heapCache.put(callId, response);
-
-        String key = RedisKeyConstants.toolResponseKey(callId);
-        redisTemplate.opsForValue().set(key, response, DEFAULT_TOOL_CACHE_TTL);
-
-        ChatToolResponse row = ChatToolResponse.builder()
-                .callId(callId)
-                .chatId(chatId)
-                .response(response)
-                .build();
-        chatToolResponseMapper.insert(row);
+        if (callId == null || callId.isBlank() || chatId == null || chatId.isBlank() || response == null) return;
+        mapper.insert(ChatToolResponse.builder().callId(callId).chatId(chatId).response(response).build());
+        cache(chatId, callId, response);
     }
-
-    public String get(String callId) {
-        if (callId == null || callId.isBlank()) {
-            return null;
-        }
-        String inHeap = heapCache.get(callId);
-        if (inHeap != null) {
-            return inHeap;
-        }
-        String key = RedisKeyConstants.toolResponseKey(callId);
-        String inRedis = redisTemplate.opsForValue().get(key);
-        if (inRedis != null) {
-            heapCache.put(callId, inRedis);
-            redisTemplate.expire(key, DEFAULT_TOOL_CACHE_TTL);
-            return inRedis;
-        }
-        ChatToolResponse row = chatToolResponseMapper.selectOne(
-                new LambdaQueryWrapper<ChatToolResponse>()
-                        .eq(ChatToolResponse::getCallId, callId)
-                        .orderByDesc(ChatToolResponse::getId)
-                        .last("limit 1")
-        );
-        if (row == null) {
-            return null;
-        }
-        heapCache.put(callId, row.getResponse());
-        redisTemplate.opsForValue().set(key, row.getResponse(), DEFAULT_TOOL_CACHE_TTL);
+    public String get(String callId, String chatId) {
+        if (callId == null || callId.isBlank() || chatId == null || chatId.isBlank()) return null;
+        try {
+            String cached = redis.opsForValue().get(key(chatId, callId));
+            if (cached != null) return cached;
+        } catch (RuntimeException e) { log.warn("工具结果缓存读取失败", e); }
+        ChatToolResponse row = mapper.selectOne(new LambdaQueryWrapper<ChatToolResponse>()
+                .eq(ChatToolResponse::getCallId, callId).eq(ChatToolResponse::getChatId, chatId)
+                .orderByDesc(ChatToolResponse::getId).last("LIMIT 1"));
+        if (row == null) return null;
+        cache(chatId, callId, row.getResponse());
         return row.getResponse();
+    }
+    private String key(String chatId, String callId) { return "chat:tool:v2:" + chatId + ":" + callId; }
+    private void cache(String chatId, String callId, String response) {
+        try { redis.opsForValue().set(key(chatId, callId), response, TTL); }
+        catch (RuntimeException e) { log.warn("工具结果缓存写入失败，已持久化", e); }
     }
 }

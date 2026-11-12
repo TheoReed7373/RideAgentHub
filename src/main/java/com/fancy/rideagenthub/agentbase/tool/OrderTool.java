@@ -44,6 +44,8 @@ public class OrderTool {
     private OrderRouteService orderRouteService;
     @Resource
     private ChatManager chatManager;
+    @Resource
+    private com.fancy.rideagenthub.service.base.OrderConfirmation orderConfirmation;
 
     @Tool(description = "保存新订单相关参数")
     public String saveNewOrderParam(@ToolParam(description = "订单相关参数Map") OrderParams params,
@@ -52,7 +54,12 @@ public class OrderTool {
         ToolNotifySupport.notifyToolListener(toolContext, "保存新订单相关参数 (saveNewOrderParam)");
         // 遍历入参并填入
         String chatInfoKey = RedisKeyConstants.chatInfoKey(toolContext.getContext().get(ToolContextKeyConstants.CHAT_ID).toString());
+        if (params == null || params.slots() == null) return "请提供有效订单参数";
+        stringRedisTemplate.opsForHash().delete(chatInfoKey, "ReadyforRoute", "ReadyforConfirm", "ReadyForCreate",
+                "quoteId", "confirmedQuote", "EST_TIME", "EST_DISTANCE_KM");
         for (OrderInfoEnum key : params.slots.keySet()) {
+            if (key == OrderInfoEnum.EST_PRICE || key == OrderInfoEnum.EST_DISTANCE_KM || key == OrderInfoEnum.MONGO_TRACE_ID)
+                continue;
             redisPut(chatInfoKey, key.name(), params.slots.get(key));
         }
         String allParams = params.slots.keySet().stream()
@@ -101,13 +108,13 @@ public class OrderTool {
                     }
                 }
                 case SCHEDULED_TIME -> {
-                    if (!value.matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}")) {
+                    if (TimeUtil.parse(value) == null || !TimeUtil.parse(value).isAfter(com.fancy.rideagenthub.util.BusinessTime.now())) {
                         errorList.add(key);
                         redisDel(chatInfoKey, key.name());
                     }
                 }
                 case START_LAT, END_LAT, START_LNG, END_LNG -> {
-                    if (!value.matches("\\d+\\.\\d+")) {
+                    if (!validCoordinate(value, key == OrderInfoEnum.START_LAT || key == OrderInfoEnum.END_LAT)) {
                         errorList.add(key);
                         redisDel(chatInfoKey, key.name());
                     }
@@ -139,14 +146,12 @@ public class OrderTool {
         if(redisGetObj(chatInfoKey,OrderInfoEnum.MONGO_TRACE_ID.name()) == null){
             noRoute = false;
         }
-        //先获取是否有MONGO_TRACE_ID，如果有则需要删除。
-        if(redisGetObj(chatInfoKey,OrderInfoEnum.MONGO_TRACE_ID.name()) != null && !noRoute){
-            orderRouteService.deleteByTraceId(redisGet(chatInfoKey, OrderInfoEnum.MONGO_TRACE_ID.name()));
-            redisDel(chatInfoKey, OrderInfoEnum.MONGO_TRACE_ID.name());
-        }
         if (redisGetObj(chatInfoKey, "ReadyforRoute") == null) {
             return "请使用isNewOrderReady()先检查订单参数是否完备";
         }
+        String oldTrace = redisGetObj(chatInfoKey, OrderInfoEnum.MONGO_TRACE_ID.name()) == null ? null :
+                redisGet(chatInfoKey, OrderInfoEnum.MONGO_TRACE_ID.name());
+        if (redisGetObj(chatInfoKey, "EST_TIME") == null || redisGetObj(chatInfoKey, "EST_DISTANCE_KM") == null) noRoute = false;
         String startLat = redisGet(chatInfoKey, OrderInfoEnum.START_LAT.name());
         String startLng = redisGet(chatInfoKey, OrderInfoEnum.START_LNG.name());
         String endLat = redisGet(chatInfoKey, OrderInfoEnum.END_LAT.name());
@@ -162,7 +167,7 @@ public class OrderTool {
             putPricePara(chatInfoKey, estPrice);
             redisPut(chatInfoKey, OrderInfoEnum.EST_PRICE.name(), estPrice.getEstPrice().toPlainString());
             redisDel(chatInfoKey, "ReadyforRoute");
-            redisPut(chatInfoKey, "ReadyforConfirm", "true");
+            orderConfirmation.quoted(toolContext.getContext().get(ToolContextKeyConstants.CHAT_ID).toString());
             return String.format("新订单完成算价，预计里程%sKm，预计耗时%s分钟，预计价格%s元。请使用notifyUser()通知用户确认。",
                     redisGet(chatInfoKey, OrderInfoEnum.EST_DISTANCE_KM.name()),
                     TimeUtil.getMinutes(redisGet(chatInfoKey, "EST_TIME")), estPrice.getEstPrice());
@@ -170,11 +175,11 @@ public class OrderTool {
         String mongoId = UUID.randomUUID().toString();
         EstRouteVO estRoute = amapRouteService.getDrivingRouteEst(Double.parseDouble(startLng),
                 Double.parseDouble(startLat), Double.parseDouble(endLng), Double.parseDouble(endLat));
-        orderRouteService.addOrder(mongoId, estRoute);
         PriceEstimateVO estPrice = getEstPrice(estRoute.getEstKm(), estRoute.getEstTime(),
                 redisGet(chatInfoKey, OrderInfoEnum.IS_RESERVATION.name()),
                 redisGet(chatInfoKey, OrderInfoEnum.IS_EXPEDITED.name()),
                 redisGet(chatInfoKey, OrderInfoEnum.VEHICLE_TYPE.name()));
+        orderRouteService.addOrder(mongoId, estRoute);
         putPricePara(chatInfoKey, estPrice);
         redisPut(chatInfoKey, OrderInfoEnum.MONGO_TRACE_ID.name(), mongoId);
         redisPut(chatInfoKey, OrderInfoEnum.EST_PRICE.name(), estPrice.getEstPrice().toPlainString());
@@ -182,8 +187,12 @@ public class OrderTool {
         redisPut(chatInfoKey, "EST_TIME", estRoute.getEstTime());
         // 最后在redis中放ReadyforConfirm:true的标记供HITL用户验证。
         redisDel(chatInfoKey, "ReadyforRoute");
-        redisPut(chatInfoKey, "ReadyforConfirm", "true");
+        orderConfirmation.quoted(toolContext.getContext().get(ToolContextKeyConstants.CHAT_ID).toString());
 
+        if (oldTrace != null && !oldTrace.equals(mongoId)) {
+            try { orderRouteService.deleteByTraceId(oldTrace); }
+            catch (RuntimeException e) { log.warn("旧规划轨迹清理失败", e); }
+        }
         return String.format("新订单完成路径规划和算价，预计里程%sKm，预计全程耗时%s分钟，预计价格%s元。请使用notifyUser()通知用户确认。", estRoute.getEstKm(),
                 TimeUtil.getMinutes(estRoute.getEstTime()), estPrice.getEstPrice());
     }
@@ -399,8 +408,8 @@ public class OrderTool {
         log.info("[OrderTool]: markOrderReadyForCreate()");
         ToolNotifySupport.notifyToolListener(toolContext, "用户确认参数无误后，标记订单为可创建态 (markOrderReadyForCreate)");
         String chatInfoKey = RedisKeyConstants.chatInfoKey(toolContext.getContext().get(ToolContextKeyConstants.CHAT_ID).toString());
-        redisPut(chatInfoKey, "ReadyForCreate", "true");
-        return "订单可创建，使用createOrder()创建";
+        String chatId = toolContext.getContext().get(ToolContextKeyConstants.CHAT_ID).toString();
+        return orderConfirmation.isConfirmed(chatId) ? "订单已取得用户确认，可以创建" : "尚未取得用户对当前报价的确认";
     }
 
     @Tool(description = "创建订单")
@@ -429,7 +438,10 @@ public class OrderTool {
                 .estDistance(new BigDecimal(redisGet(chatInfoKey, OrderInfoEnum.EST_DISTANCE_KM.name())))
                 .radio(new BigDecimal(redisGet(chatInfoKey, PriceEnum.PRICE_RADIO.name())))
                 .build();
+        orderConfirmation.consume(toolContext.getContext().get(ToolContextKeyConstants.CHAT_ID).toString());
         String orderId = rideOrderService.createOrder(orderDTO);
+        try { orderRouteService.deleteByTraceId(orderDTO.getMongoTraceId()); }
+        catch (RuntimeException e) { log.warn("订单预览轨迹清理失败", e); }
         String estDistanceKm = redisGet(chatInfoKey, OrderInfoEnum.EST_DISTANCE_KM.name());
         String estTimeSec = redisGet(chatInfoKey, "EST_TIME");
         String estPriceStr = redisGet(chatInfoKey, OrderInfoEnum.EST_PRICE.name());
@@ -476,7 +488,14 @@ public class OrderTool {
 
     // 确定有才能用！
     private String redisGet(String key, String hashKey) {
-        return stringRedisTemplate.opsForHash().get(key, hashKey).toString();
+        Object value = stringRedisTemplate.opsForHash().get(key, hashKey);
+        if (value == null) throw new IllegalArgumentException("订单缺少字段：" + hashKey + "，请重新检查参数和报价");
+        return value.toString();
+    }
+
+    private boolean validCoordinate(String value, boolean latitude) {
+        try { return new BigDecimal(value).abs().compareTo(BigDecimal.valueOf(latitude ? 90 : 180)) <= 0; }
+        catch (RuntimeException e) { return false; }
     }
 
     private Object redisGetObj(String key, String hashKey) {
@@ -489,99 +508,8 @@ public class OrderTool {
 
     private PriceEstimateVO getEstPrice(String estKm, String estTime, String isRev, String isExped,
             String vehicleType) {
-        // estTime是秒单位注意换算，estKm是公里单位，可能包含小数点。
-        BigDecimal distanceKm;
-        try {
-            distanceKm = estKm == null ? BigDecimal.ZERO : new BigDecimal(estKm.trim());
-        } catch (Exception ignored) {
-            distanceKm = BigDecimal.ZERO;
-        }
-        if (distanceKm.signum() < 0) {
-            distanceKm = BigDecimal.ZERO;
-        }
-
-        BigDecimal durationSec;
-        try {
-            durationSec = estTime == null ? BigDecimal.ZERO : new BigDecimal(estTime.trim());
-        } catch (Exception ignored) {
-            durationSec = BigDecimal.ZERO;
-        }
-        if (durationSec.signum() < 0) {
-            durationSec = BigDecimal.ZERO;
-        }
-
-        boolean expedited;
-        if (isExped == null) {
-            expedited = false;
-        } else {
-            String v = isExped.trim();
-            expedited = "1".equals(v) || "true".equalsIgnoreCase(v) || "yes".equalsIgnoreCase(v)
-                    || "y".equalsIgnoreCase(v);
-        }
-
-        int vehicleTypeCode;
-        try {
-            vehicleTypeCode = vehicleType == null ? 1 : Integer.parseInt(vehicleType.trim());
-        } catch (Exception ignored) {
-            vehicleTypeCode = 1;
-        }
-
-        // 计价规则：金额 2 位小数 HALF_UP
-        final int MONEY_SCALE = 2;
-
-        // 1) 计算基础里程费（起步价 + 里程费）
-        // - 起步价 8.00，含 2.0km
-        // - 里程费 2.20/km（仅超出 2km 的部分，且这里用“基准单价”计算全部超里程）
-        BigDecimal startPrice = new BigDecimal("8.00");
-        BigDecimal startDistanceKm = new BigDecimal("2.0");
-        BigDecimal perKmFee = new BigDecimal("2.20");
-
-        BigDecimal overStartKm = distanceKm.subtract(startDistanceKm);
-        if (overStartKm.signum() < 0) {
-            overStartKm = BigDecimal.ZERO;
-        }
-        BigDecimal mileageFee = overStartKm.multiply(perKmFee);
-        BigDecimal priceBase = startPrice.add(mileageFee);
-
-        // 2) 计算远途/空驶费：超出 20km 的部分，加收“里程费的 50%”
-        BigDecimal longDistanceThresholdKm = new BigDecimal("20.0");
-        BigDecimal longOverKm = distanceKm.subtract(longDistanceThresholdKm);
-        if (longOverKm.signum() < 0) {
-            longOverKm = BigDecimal.ZERO;
-        }
-        BigDecimal longDistanceSurchargePerKm = perKmFee.multiply(new BigDecimal("0.50"));
-        BigDecimal priceDistance = longOverKm.multiply(longDistanceSurchargePerKm);
-
-        // 3) 计算时长费：0.50/min。
-        // 约定：秒 -> 分钟，向上取整到整数分钟（与常见计费习惯一致，且避免低估）。
-        BigDecimal minutes = durationSec.divide(new BigDecimal("60"), 0, RoundingMode.CEILING);
-        BigDecimal perMinFee = new BigDecimal("0.50");
-        BigDecimal priceTime = minutes.multiply(perMinFee);
-
-        // 4) 加急：固定调度费 5.00 + 动态倍率 +0.2
-        BigDecimal priceExpedited = expedited ? new BigDecimal("5.00") : BigDecimal.ZERO;
-
-        // 5) 车型倍率：按文档：1->1.0, 2->1.6, 3->2.5
-        BigDecimal vehicleMultiplier = switch (vehicleTypeCode) {
-            case 2 -> new BigDecimal("1.60");
-            case 3 -> new BigDecimal("2.50");
-            default -> BigDecimal.ONE;
-        };
-        BigDecimal expediteMultiplier = expedited ? new BigDecimal("0.20") : BigDecimal.ZERO;
-        BigDecimal finalMultiplier = vehicleMultiplier.add(expediteMultiplier);
-
-        // 6) 最终价：(小计价格 + 固定加急费) * (车型倍率 + 加急动态倍率)
-        BigDecimal subTotal = priceBase.add(priceTime).add(priceDistance);
-        BigDecimal estPrice = subTotal.add(priceExpedited).multiply(finalMultiplier);
-
-        return PriceEstimateVO.builder()
-                .estPrice(estPrice.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceRadio(finalMultiplier.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceBase(priceBase.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceTime(priceTime.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceDistance(priceDistance.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .estPriceExpedited(priceExpedited.setScale(MONEY_SCALE, RoundingMode.HALF_UP))
-                .build();
+        return com.fancy.rideagenthub.service.base.RidePricing.calculate(estKm, estTime,
+                Integer.valueOf(vehicleType), "1".equals(isExped) ? 1 : 0);
     }
 }
 

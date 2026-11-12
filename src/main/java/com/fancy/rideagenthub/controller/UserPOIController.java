@@ -39,7 +39,7 @@ public class UserPOIController {
     public Result get(@PathVariable Long id) {
         UserPOI poi = userPOIService.findById(id);
         if (poi == null) {
-            return Result.fail(404, "兴趣点不存在");
+            throw new com.fancy.rideagenthub.exception.BusinessException(404, "兴趣点不存在");
         }
         return Result.ok(poi);
     }

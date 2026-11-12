@@ -145,17 +145,17 @@ public class DailyTool {
 
     private static BigDecimal parseKmFromMeters(String distanceMeters) {
         if (distanceMeters == null || distanceMeters.isBlank()) {
-            return BigDecimal.ZERO;
+            throw new IllegalArgumentException("路径距离缺失或无效，无法估算");
         }
         try {
             BigDecimal meters = new BigDecimal(distanceMeters.trim());
             if (meters.signum() <= 0) {
-                return BigDecimal.ZERO;
+                throw new IllegalArgumentException("路径距离缺失或无效，无法估算");
             }
             // 保留更高精度参与计算，展示时再四舍五入到2位。
             return meters.divide(new BigDecimal("1000"), 6, RoundingMode.HALF_UP);
         } catch (Exception ignored) {
-            return BigDecimal.ZERO;
+            throw new IllegalArgumentException("路径距离缺失或无效，无法估算");
         }
     }
 
@@ -205,29 +205,29 @@ public class DailyTool {
 
     private static long ceilMinutesSafe(String durationSeconds) {
         if (durationSeconds == null || durationSeconds.isBlank()) {
-            return 0;
+            throw new IllegalArgumentException("路径时长缺失或无效，无法估算");
         }
         try {
             long seconds = Long.parseLong(durationSeconds.trim());
             if (seconds <= 0) {
-                return 0;
+                throw new IllegalArgumentException("路径时长缺失或无效，无法估算");
             }
             return (seconds + 59) / 60;
         } catch (NumberFormatException ignored) {
-            return 0;
+            throw new IllegalArgumentException("路径时长缺失或无效，无法估算");
         }
     }
 
     private static String calcKmSafe(String distanceMeters) {
         if (distanceMeters == null || distanceMeters.isBlank()) {
-            return "0";
+            throw new IllegalArgumentException("路径距离缺失或无效，无法估算");
         }
         try {
             BigDecimal meters = new BigDecimal(distanceMeters.trim());
             BigDecimal km = meters.divide(new BigDecimal("1000"), 2, RoundingMode.HALF_UP);
             return km.toPlainString();
         } catch (NumberFormatException ignored) {
-            return "0";
+            throw new IllegalArgumentException("路径距离缺失或无效，无法估算");
         }
     }
 

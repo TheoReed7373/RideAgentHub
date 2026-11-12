@@ -35,6 +35,8 @@ public class Chat implements Serializable {
 
 	@TableField("locked")
 	private Boolean locked;
+    @TableField("history_deleted")
+    private Boolean historyDeleted;
 
 	@TableField("created_at")
 	private LocalDateTime createdAt;

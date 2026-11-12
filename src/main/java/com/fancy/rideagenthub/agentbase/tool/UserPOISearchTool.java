@@ -40,6 +40,7 @@ public class UserPOISearchTool {
         ToolNotifySupport.notifyToolListener(toolContext, "根据兴趣点标签获取用户兴趣点详细信息");
         Long userId = Long.valueOf(toolContext.getContext().get(ToolContextKeyConstants.USER_ID).toString());
         UserPOI result = userPOIService.findByPoiTag(userId, poiTag);
+        if (result == null) return "未找到该标签，请先保存兴趣点或提供具体地址";
         return "兴趣点标签：" + result.getPoiTag() + "；" +
                 "兴趣点名：" + result.getPoiName() + "；" +
                 "兴趣点地址：" + result.getPoiAddress() + "；" +

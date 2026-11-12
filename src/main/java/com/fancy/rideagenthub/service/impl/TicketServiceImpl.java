@@ -69,8 +69,19 @@ public class TicketServiceImpl implements TicketService {
     private final DelayedCacheEvictor delayedCacheEvictor;
     private final RedisLock redisLock;
     private final TicketPoolIndex ticketPoolIndex;
+    @jakarta.annotation.Resource
+    private com.fancy.rideagenthub.mapper.RideOrderMapper rideOrderMapper;
 
     // Redis key prefix for ticket no generation
+    private static final org.springframework.data.redis.core.script.DefaultRedisScript<Long> TICKET_SEQUENCE =
+            new org.springframework.data.redis.core.script.DefaultRedisScript<>("""
+                local number = redis.call('INCR', KEYS[1])
+                if redis.call('TTL', KEYS[1]) < 0 then redis.call('EXPIRE', KEYS[1], 172800) end
+                return number
+                """, Long.class);
+    private void requireUpdated(int rows) {
+        if (rows != 1) throw new BusinessException(409, "工单状态已发生变化，请刷新后重试");
+    }
     private static final String TICKET_NO_PREFIX = "ticket:no:";
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyyMMdd");
     private static final long TICKET_STATS_CACHE_BASE_SECONDS = 20L;
@@ -97,6 +108,15 @@ public class TicketServiceImpl implements TicketService {
     @Override
     @Transactional
     public String submitTicket(TicketCreateReqDTO req) {
+        if (req == null) throw new IllegalArgumentException("工单参数不能为空");
+        if (req.getOrderId() != null) {
+            var order = rideOrderMapper.selectOne(new LambdaQueryWrapper<com.fancy.rideagenthub.domain.entity.RideOrder>()
+                    .eq(com.fancy.rideagenthub.domain.entity.RideOrder::getOrderId, req.getOrderId())
+                    .eq(com.fancy.rideagenthub.domain.entity.RideOrder::getIsDeleted, 0));
+            Long owner = req.getUserId() == null ? null : Long.valueOf(req.getUserId());
+            Long related = order == null ? null : (Integer.valueOf(2).equals(req.getUserType()) ? order.getDriverId() : order.getUserId());
+            if (related == null || !related.equals(owner)) throw new BusinessException(403, "只能关联自己的订单");
+        }
         // 1. 参数校验
         if (req.getUserId() == null) {
             throw new IllegalArgumentException("用户ID不能为空");
@@ -132,8 +152,8 @@ public class TicketServiceImpl implements TicketService {
                 .ticketStatus(TicketStatus.PENDING_ASSIGN.getCode())
                 .title(req.getTitle())
                 .content(req.getContent())
-                .createdAt(LocalDateTime.now())
-                .updatedAt(LocalDateTime.now())
+                .createdAt(com.fancy.rideagenthub.util.BusinessTime.now())
+                .updatedAt(com.fancy.rideagenthub.util.BusinessTime.now())
 
                 .build();
 
@@ -147,7 +167,7 @@ public class TicketServiceImpl implements TicketService {
                 .senderId(0L)
                 .senderRole(TicketSenderRole.SYSTEM.getCode())
                 .content("工单已创建，等待客服处理")
-                .createdAt(LocalDateTime.now())
+                .createdAt(com.fancy.rideagenthub.util.BusinessTime.now())
                 .build();
         ticketChatMapper.insert(systemChat);
 
@@ -179,8 +199,9 @@ public class TicketServiceImpl implements TicketService {
         // 4. 更新状态为已关闭
         LambdaUpdateWrapper<Ticket> updateWrapper = new LambdaUpdateWrapper<>();
         updateWrapper.eq(Ticket::getTicketId, ticketId)
+                .eq(Ticket::getTicketStatus, ticket.getTicketStatus())
                 .set(Ticket::getTicketStatus, TicketStatus.CLOSED.getCode())
-                .set(Ticket::getUpdatedAt, LocalDateTime.now());
+                .set(Ticket::getUpdatedAt, com.fancy.rideagenthub.util.BusinessTime.now());
 
         int rows = ticketMapper.update(null, updateWrapper);
 
@@ -191,7 +212,7 @@ public class TicketServiceImpl implements TicketService {
                     .senderId(userId)
                     .senderRole(TicketSenderRole.SYSTEM.getCode())
                     .content("用户已关闭工单")
-                    .createdAt(LocalDateTime.now())
+                    .createdAt(com.fancy.rideagenthub.util.BusinessTime.now())
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单关闭成功: ticketId={}, userId={}", ticketId, userId);
@@ -225,8 +246,9 @@ public class TicketServiceImpl implements TicketService {
         // 4. 更新状态为已完成
         LambdaUpdateWrapper<Ticket> updateWrapper = new LambdaUpdateWrapper<>();
         updateWrapper.eq(Ticket::getTicketId, req.getTicketId())
+                .eq(Ticket::getTicketStatus, ticket.getTicketStatus())
                 .set(Ticket::getTicketStatus, TicketStatus.COMPLETED.getCode())
-                .set(Ticket::getUpdatedAt, LocalDateTime.now());
+                .set(Ticket::getUpdatedAt, com.fancy.rideagenthub.util.BusinessTime.now());
 
         int rows = ticketMapper.update(null, updateWrapper);
 
@@ -242,7 +264,7 @@ public class TicketServiceImpl implements TicketService {
                     .senderId(Long.parseLong(req.getUserId()))
                     .senderRole(TicketSenderRole.SYSTEM.getCode())
                     .content(feedbackMsg)
-                    .createdAt(LocalDateTime.now())
+                    .createdAt(com.fancy.rideagenthub.util.BusinessTime.now())
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单确认结单: ticketId={}, satisfied={}", req.getTicketId(), req.getSatisfied());
@@ -448,10 +470,11 @@ public class TicketServiceImpl implements TicketService {
         // 3. 乐观锁更新
         LambdaUpdateWrapper<Ticket> updateWrapper = new LambdaUpdateWrapper<>();
         updateWrapper.eq(Ticket::getTicketId, ticketId)
+                .eq(Ticket::getTicketStatus, ticket.getTicketStatus())
                 .eq(Ticket::getTicketStatus, TicketStatus.PENDING_ASSIGN.getCode()) // 乐观锁条件
                 .set(Ticket::getHandlerId, handlerId)
                 .set(Ticket::getTicketStatus, TicketStatus.PROCESSING.getCode())
-                .set(Ticket::getUpdatedAt, LocalDateTime.now());
+                .set(Ticket::getUpdatedAt, com.fancy.rideagenthub.util.BusinessTime.now());
 
         int rows = ticketMapper.update(null, updateWrapper);
 
@@ -462,7 +485,7 @@ public class TicketServiceImpl implements TicketService {
                     .senderId(handlerId)
                     .senderRole(TicketSenderRole.SYSTEM.getCode())
                     .content("客服已接单，正在处理中")
-                    .createdAt(LocalDateTime.now())
+                    .createdAt(com.fancy.rideagenthub.util.BusinessTime.now())
                     .build();
             ticketChatMapper.insert(systemChat);
             log.info("工单认领成功: ticketId={}, handlerId={}", ticketId, handlerId);
@@ -484,14 +507,15 @@ public class TicketServiceImpl implements TicketService {
         if(ticket.getTicketStatus().equals(TicketStatus.COMPLETED.getCode()) || ticket.getTicketStatus().equals(TicketStatus.CLOSED.getCode())){
             throw new BusinessException(400, "工单已处理完成，无法转交");
         }
-        if(ticket.getHandlerId().equals(handlerId)){
+        if(java.util.Objects.equals(ticket.getHandlerId(), handlerId)){
             throw new BusinessException(400, "无法再分配给当前处理人");
         }
         boolean unHandled = ticket.getTicketStatus().equals(TicketStatus.PENDING_ASSIGN.getCode());
         // 2. 更新handlerId与状态
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
         LambdaUpdateWrapper<Ticket> updateWrapper = new LambdaUpdateWrapper<>();
         updateWrapper.eq(Ticket::getTicketId, ticketId)
+                .eq(Ticket::getTicketStatus, ticket.getTicketStatus())
                 .set(Ticket::getHandlerId, handlerId)
                 .set(Ticket::getTicketStatus, TicketStatus.PROCESSING.getCode())
                 .set(Ticket::getUpdatedAt, now);
@@ -534,10 +558,14 @@ public class TicketServiceImpl implements TicketService {
         if (!ticket.getHandlerId().equals(Long.parseLong(req.getOperatorId()))) {
             throw new IllegalArgumentException("无权处理此工单");
         }
+        if (!List.of(TicketStatus.PROCESSING.getCode(), TicketStatus.WAIT_USER_CONFIRM.getCode())
+                .contains(ticket.getTicketStatus())) {
+            throw new BusinessException(409, "当前工单状态不允许处理");
+        }
 
         // 3. 根据actionType执行不同操作
         String actionType = req.getActionType();
-        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime now = com.fancy.rideagenthub.util.BusinessTime.now();
 
         switch (actionType) {
             case TicketHandleReqDTO.ACTION_REPLY:
@@ -550,10 +578,12 @@ public class TicketServiceImpl implements TicketService {
                 // 处理完成，状态流转为待用户确认
                 LambdaUpdateWrapper<Ticket> resolveWrapper = new LambdaUpdateWrapper<>();
                 resolveWrapper.eq(Ticket::getTicketId, ticket.getTicketId())
+                        .eq(Ticket::getTicketStatus, ticket.getTicketStatus())
+                        .eq(Ticket::getHandlerId, ticket.getHandlerId())
                         .set(Ticket::getTicketStatus, TicketStatus.WAIT_USER_CONFIRM.getCode())
                         .set(Ticket::getProcessResult, req.getContent())
                         .set(Ticket::getUpdatedAt, now);
-                ticketMapper.update(null, resolveWrapper);
+                requireUpdated(ticketMapper.update(null, resolveWrapper));
 
                 insertChatMessage(req, TicketSenderRole.CUSTOMER_SERVICE.getCode());
                 insertSystemMessage(req.getTicketId(), "客服已处理完成，等待用户确认");
@@ -564,10 +594,12 @@ public class TicketServiceImpl implements TicketService {
                 // 转交：重置handlerId为空，状态回到待分配
                 LambdaUpdateWrapper<Ticket> transferWrapper = new LambdaUpdateWrapper<>();
                 transferWrapper.eq(Ticket::getTicketId, ticket.getTicketId())
+                        .eq(Ticket::getTicketStatus, ticket.getTicketStatus())
+                        .eq(Ticket::getHandlerId, ticket.getHandlerId())
                         .set(Ticket::getHandlerId, null)
                         .set(Ticket::getTicketStatus, TicketStatus.PENDING_ASSIGN.getCode())
                         .set(Ticket::getUpdatedAt, now);
-                ticketMapper.update(null, transferWrapper);
+                requireUpdated(ticketMapper.update(null, transferWrapper));
 
                 insertChatMessage(req, TicketSenderRole.CUSTOMER_SERVICE.getCode());
                 insertSystemMessage(req.getTicketId(), "工单已转交，等待其他客服处理");
@@ -578,10 +610,12 @@ public class TicketServiceImpl implements TicketService {
                 // 驳回：关闭工单
                 LambdaUpdateWrapper<Ticket> rejectWrapper = new LambdaUpdateWrapper<>();
                 rejectWrapper.eq(Ticket::getTicketId, ticket.getTicketId())
+                        .eq(Ticket::getTicketStatus, ticket.getTicketStatus())
+                        .eq(Ticket::getHandlerId, ticket.getHandlerId())
                         .set(Ticket::getTicketStatus, TicketStatus.CLOSED.getCode())
                         .set(Ticket::getProcessResult, "驳回: " + req.getContent())
                         .set(Ticket::getUpdatedAt, now);
-                ticketMapper.update(null, rejectWrapper);
+                requireUpdated(ticketMapper.update(null, rejectWrapper));
 
                 insertChatMessage(req, TicketSenderRole.CUSTOMER_SERVICE.getCode());
                 insertSystemMessage(req.getTicketId(), "工单已驳回关闭");
@@ -626,7 +660,7 @@ public class TicketServiceImpl implements TicketService {
         insertChatMessage(req, senderRole);
 
         // 3. 更新工单时间
-        updateTicketTime(ticket.getTicketId(), LocalDateTime.now());
+        updateTicketTime(ticket.getTicketId(), com.fancy.rideagenthub.util.BusinessTime.now());
 
         // 4. 如果是用户发消息，工单状态若为"待用户确认"，自动回调为"处理中"
         if (senderRole == TicketSenderRole.PASSENGER.getCode() || senderRole == TicketSenderRole.DRIVER.getCode()) {
@@ -634,7 +668,7 @@ public class TicketServiceImpl implements TicketService {
                 LambdaUpdateWrapper<Ticket> updateWrapper = new LambdaUpdateWrapper<>();
                 updateWrapper.eq(Ticket::getTicketId, ticket.getTicketId())
                         .set(Ticket::getTicketStatus, TicketStatus.PROCESSING.getCode())
-                        .set(Ticket::getUpdatedAt, LocalDateTime.now());
+                        .set(Ticket::getUpdatedAt, com.fancy.rideagenthub.util.BusinessTime.now());
                 ticketMapper.update(null, updateWrapper);
                 insertSystemMessage(req.getTicketId(), "用户回复消息，工单状态变更为处理中");
             }
@@ -675,11 +709,8 @@ public class TicketServiceImpl implements TicketService {
         String redisKey = TICKET_NO_PREFIX + dateStr;
 
         // Redis自增获取当日序号
-        Long seq = stringRedisTemplate.opsForValue().increment(redisKey);
-        if (seq == 1) {
-            // 设置过期时间为2天
-            stringRedisTemplate.expire(redisKey, java.time.Duration.ofDays(2));
-        }
+        Long seq = stringRedisTemplate.execute(TICKET_SEQUENCE, List.of(redisKey));
+        if (seq == null) throw new BusinessException(503, "工单编号服务不可用");
 
         return String.format("T%s%s%05d", dateStr, typeCode, seq);
     }
@@ -690,6 +721,7 @@ public class TicketServiceImpl implements TicketService {
     private Ticket getTicketByTicketId(String ticketId) {
         LambdaQueryWrapper<Ticket> queryWrapper = new LambdaQueryWrapper<>();
         queryWrapper.eq(Ticket::getTicketId, ticketId);
+        if (TransactionSynchronizationManager.isActualTransactionActive()) queryWrapper.last("FOR UPDATE");
         Ticket ticket = ticketMapper.selectOne(queryWrapper);
         if (ticket == null) {
             throw new IllegalArgumentException("工单不存在: " + ticketId);
@@ -706,7 +738,7 @@ public class TicketServiceImpl implements TicketService {
                 .senderId(Long.parseLong(req.getOperatorId()))
                 .senderRole(senderRole)
                 .content(req.getContent())
-                .createdAt(LocalDateTime.now())
+                .createdAt(com.fancy.rideagenthub.util.BusinessTime.now())
                 .build();
         ticketChatMapper.insert(chat);
     }
@@ -720,7 +752,7 @@ public class TicketServiceImpl implements TicketService {
                 .senderId(0L)
                 .senderRole(TicketSenderRole.SYSTEM.getCode())
                 .content(content)
-                .createdAt(LocalDateTime.now())
+                .createdAt(com.fancy.rideagenthub.util.BusinessTime.now())
                 .build();
         ticketChatMapper.insert(systemChat);
     }
@@ -951,8 +983,9 @@ public class TicketServiceImpl implements TicketService {
         // 6. 更新优先级
         LambdaUpdateWrapper<Ticket> updateWrapper = new LambdaUpdateWrapper<>();
         updateWrapper.eq(Ticket::getTicketId, ticketId)
+                .eq(Ticket::getTicketStatus, ticket.getTicketStatus())
                 .set(Ticket::getPriority, targetLevel)
-                .set(Ticket::getUpdatedAt, LocalDateTime.now());
+                .set(Ticket::getUpdatedAt, com.fancy.rideagenthub.util.BusinessTime.now());
 
         int rows = ticketMapper.update(null, updateWrapper);
 
@@ -996,8 +1029,9 @@ public class TicketServiceImpl implements TicketService {
         // 5. 更新优先级
         LambdaUpdateWrapper<Ticket> updateWrapper = new LambdaUpdateWrapper<>();
         updateWrapper.eq(Ticket::getTicketId, ticketId)
+                .eq(Ticket::getTicketStatus, ticket.getTicketStatus())
                 .set(Ticket::getPriority, targetLevel)
-                .set(Ticket::getUpdatedAt, LocalDateTime.now());
+                .set(Ticket::getUpdatedAt, com.fancy.rideagenthub.util.BusinessTime.now());
 
         int rows = ticketMapper.update(null, updateWrapper);
 
@@ -1044,12 +1078,12 @@ public class TicketServiceImpl implements TicketService {
                 .senderId(userId)
                 .senderRole(senderRole)
                 .content(content)
-                .createdAt(LocalDateTime.now())
+                .createdAt(com.fancy.rideagenthub.util.BusinessTime.now())
                 .build();
         ticketChatMapper.insert(chat);
 
         // 5. 更新工单时间
-        updateTicketTime(ticketId, LocalDateTime.now());
+        updateTicketTime(ticketId, com.fancy.rideagenthub.util.BusinessTime.now());
 
         log.info("用户补充工单信息: ticketId={}, userId={}", ticketId, userId);
 

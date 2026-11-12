@@ -219,16 +219,6 @@ public class RedisMemory {
         if (jsonList == null || jsonList.isEmpty()) {
             return List.of();
         }
-        List<Message> result = new ArrayList<>(jsonList.size());
-        for (String json : jsonList) {
-            if (json == null || json.isBlank()) {
-                continue;
-            }
-            Message msg = messageParser.unparse(json);
-            if (msg != null) {
-                result.add(msg);
-            }
-        }
-        return result;
+        return messageParser.unparseHistory(jsonList);
     }
 }

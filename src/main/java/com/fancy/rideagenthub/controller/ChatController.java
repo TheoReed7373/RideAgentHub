@@ -35,25 +35,21 @@ public class ChatController {
     private MessageMemory messageMemory;
     @Resource
     private MessageParser messageParser;
+    @Resource
+    private com.fancy.rideagenthub.service.base.ChatRequestRunner requestRunner;
 
     @RequirePermission
     @PostMapping("/c/{id}")
     public Flux<AgentEvent> chat(@PathVariable String id, @RequestBody ChatParamDTO chatParam) {
         String userId = UserTokenContext.getUserIdInString();
-        Sinks.Many<AgentEvent> sink = Sinks.many().unicast().onBackpressureBuffer();
-        // 异步启动
-        CompletableFuture.runAsync(() -> chatService.chat(id, chatParam, sink, userId));
-        return sink.asFlux();
+        return requestRunner.run(userId, id, chatParam, false);
     }
 
     @RequirePermission
     @PostMapping("/r/{id}")
     public Flux<AgentEvent> resume(@PathVariable String id, @RequestBody ChatParamDTO chatParam) {
         String userId = UserTokenContext.getUserIdInString();
-        Sinks.Many<AgentEvent> sink = Sinks.many().unicast().onBackpressureBuffer();
-        // 异步启动
-        CompletableFuture.runAsync(() -> chatService.resume(id, chatParam, sink, userId));
-        return sink.asFlux();
+        return requestRunner.run(userId, id, chatParam, true);
     }
 
     @RequirePermission
@@ -68,7 +64,7 @@ public class ChatController {
         String userId = UserTokenContext.getUserIdInString();
         RestoreChatVO vo = chatManager.restoreChat(userId);
         if (vo == null) {
-            return Result.fail(404, "没有可恢复的对话");
+            throw new com.fancy.rideagenthub.exception.BusinessException(404, "没有可恢复的对话");
         }
         List<Message> messages = messageMemory.get(userId, vo.getChatId(), 100);
         vo.setMessages(messageParser.simpleParse(messages));
@@ -78,6 +74,7 @@ public class ChatController {
     @RequirePermission
     @PostMapping("/lock/{id}")
     public Result lockChat(@PathVariable String id) {
+        chatManager.assertOwned(UserTokenContext.getUserIdInString(), id, false);
         chatManager.lockChat(id);
         return Result.ok();
     }
