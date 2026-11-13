@@ -2,7 +2,35 @@
 
 > **Redis 考点**：把无状态会话（Token）集中存进 Redis（String + JSON），再用一个 Set 建「用户 → 全部 token」的反向索引，实现按用户批量踢下线。
 > **来源**：`docs/01-redis-application-points.md` 一、现状盘点（「短信登录 / 共享 Session」）
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/impl/TokenServiceImpl.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/impl/TokenServiceImpl.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文、`文件:行号` 与 `redis-cli` 命令写于改造前快照，**作为缺陷推导教材保留，不删除**；凡与本节冲突，一律以本节与当前源码为准。下表是已确认的失效点。
+
+| # | 正文中的旧说法 | 当前代码事实（证据：`service/impl/TokenServiceImpl.java`） |
+|---|---|---|
+| 1 | 4.4 / 六-2、六-3 称 `deleteToken` 是「`GET→SREM→DEL` 三步非原子、顺序不能反、当前保留现状」 | ✅ 已修复：`REMOVE` 一段 Lua 内**先 `DEL KEYS[1]` 再 `SREM KEYS[2]`** 原子执行（`:43-47`）；残留仅为 `deleteToken()` 中一次 `GET` 取 userId 与 Lua 之间的读改窗口（`:84-92`），不是旧三步顺序 |
+| 2 | 落点表称 `saveToken` 非原子、`addTokenToUserIndex` 做 `SADD`+`EXPIRE`、`removeTokenFromUserIndex` 做 `SREM` | 写入统一由 `SAVE` Lua 一次完成（`:29-35`）；`addTokenToUserIndex` 直接抛 `UnsupportedOperationException`，`removeTokenFromUserIndex` 委托 `deleteToken`（`:102-107`） |
+| 3 | 4.3 称索引 TTL×2 由 `addTokenToUserIndex`「每次登录重置」 | TTL×2 在 `SAVE` Lua 内一次 `EXPIRE`（`:33`）；`:93` 是 `deleteAllTokensByUserId` 起始行 |
+| 4 | 标题「共享 Session」易读成单一共享 key | **每个 token 一个独立 String** `auth:token:{token}`，共享的是用户级 Set `auth:user_tokens:{userId}` |
+| 5 | 全篇未展开会话版本围栏与凭据摘要 | `auth:session-version:{userId}` 无 TTL、`SAVE` 先验 `ARGV[4]`、`REVOKE` `INCR`、`getToken` 比对 DB `CredentialStamp.of(user.getPassword())`（`:29-42,48,66-78`）。**每次读令牌都有一次 Redis + DB 往返**，这正是「没有独立权限缓存」的代价；不能把「切面不查库」误写成「鉴权链不查库」 |
+
+> 下方八章的反向索引、TTL×2、踢下线推导**仍然正确**，保留作主体；以下几处实现已重写，读代码时按当前类名 + 方法名定位。
+
+| 项 | 当前实现 |
+|---|---|
+| 三个 key | `auth:token:{token}`、`auth:user_tokens:{userId}`、**新增** `auth:session-version:{userId}`（无 TTL） |
+| 字段 | `UserToken` 增加 `sessionVersion`、`credentialStamp`（`security/CredentialStamp.java`） |
+| 发布 / 撤销 / 删除 | `service/impl/TokenServiceImpl.java`（注意是 `impl` 不是 `base`）内 **3 段内联 Lua**：`SAVE`（先验版本再原子 `SET`+`SADD`+`EXPIRE` 索引）、`REVOKE`（`INCR` 版本 + 遍历删全部令牌 + 删索引）、`REMOVE`（`DEL`+`SREM`）。旧「GET→SREM→DEL 三步非原子」✅ 已修复 |
+| 读取校验 | `getToken` 三重校验：`sessionVersion == currentVersion()`、DB `is_deleted=0 && status=1` 且 role 匹配、`CredentialStamp.of(user.getPassword())` 匹配；任一不符返回 null（401）。改密/撤销后的旧令牌无法复活 |
+| 全量撤销 | 事务活跃时注册 `TransactionSynchronization.afterCommit()` 再 `revoke`，避免业务回滚后误撤销；`addTokenToUserIndex` 直接抛 `UnsupportedOperationException`，禁止绕过 Lua 单独写索引 |
+| 完整鉴权链 | `AuthTokenInterceptor.preHandle` → `security/UserTokenContext`（ThreadLocal，`afterCompletion` 清理）→ `aspect/PermissionAspect` → `@RequirePermission`；异常经 `GlobalExceptionHandler` 映射 401/403/404/409/410 |
+
+**验证命令修订**：`GET auth:session-version:{userId}` 应无 TTL（`-1`）；改密后旧 token 应返回 401。`SecurityRedisIntegrationTest`、`SecurityRepairRegressionTest` 覆盖撤销围栏与改密用例。详见 [`../agent/03-security-and-boundaries.md`](../agent/03-security-and-boundaries.md)、[`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) 3.3。
 
 ---
 

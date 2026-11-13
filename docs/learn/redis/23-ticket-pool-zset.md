@@ -2,7 +2,35 @@
 
 > **Redis 考点**：用 ZSet 的 score 编码多级排序（位权拼接）；"已预热"标记 + 重建锁解决"空集合"与"未建索引"不可区分的问题；缓存与 DB 的一致性策略。
 > **来源**：`docs/01-redis-application-points.md` P1-3
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/base/TicketPoolIndex.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/TicketPoolIndex.java`、`service/impl/TicketServiceImpl.java`（`afterTicketMutation`）
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二/四/七章写于「`ensureWarm` 双检 + 逐条 `ZREM/ZADD` + 每次写入续期」的改造前版本，**作为推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 二/四/七章把 `ensureWarm` 双检、`rebuild`、`syncByTicketId` 逐条 `ZREM/ZADD` 且每次写入续期、`ready="1"` 当成当前实现 | 当前是 `INVALIDATE_TICKET_POOLS` / `PUBLISH_TICKET_POOL` / `READ_TICKET_POOL` **三支 Lua** + 版本/锁令牌发布（`RedisScripts.java:88-124`、`TicketPoolIndex.java:48-122`）；`ready` 值为 **`{version}:{count}`**，冷启动须经重建锁而非自动回填 |
+| 2 | 七章 `GET ticket:pool:ready:0 # "1"`、`DEL` 两个 key 触发重建 | 全部失效；应补 `GET ticket:pool:version`（**无 TTL**）并按 `{version}:{count}` 断言 |
+| 3 | 4.1 代码块 `updatedAt.atZone(ZoneId.systemDefault())`、6.7「score 依赖时区与时钟，多实例必须同区」 | 当前 `score = priority * 1e13 + updatedAt.toInstant(ZoneOffset.UTC).toEpochMilli()`（`TicketPoolIndex.java:33,154-158`），**固定 UTC 已消除时区/夏令时漂移**，`ZoneId.systemDefault()` 的缺陷不再存在 |
+| 4 | member 写为「`ticket.id` 主键字符串形式」 | 实为 `String.format(Locale.ROOT, "%019d", id)` **补零 19 位**（`:107-108`）：score 相同时 ZSet 按 member 字典序排，补零后字典序等于数值序，分页才不会在等分处错乱 |
+| 5 | 仍有效的项 | `PRIORITY_WEIGHT=1e13`、`ZREVRANGE` 读取、`ticket:pool:version` 用 `SET` 无 EX（无 TTL）、`INDEX_TTL=2h` 仅发布时 `PEXPIRE`，与代码一致 |
+
+> score 位权拼接复合排序、`ZREVRANGE` 分页、事务快照不发布的推导**全部保留**；实现已从「逐条同步 + `ensureWarm` 双检」换成「整池失效 + 版本/锁令牌原子发布」。
+
+| 项 | 当前实现 |
+|---|---|
+| 写路径 | `INVALIDATE_TICKET_POOLS` 换 `ticket:pool:version` + 循环 `DEL` 全部状态池；`ensureWarm` / `rebuild` 已删除 |
+| 读路径 | `slice/readSlice/isCurrent`：`READ_TICKET_POOL` 校验 `ready`，未命中则抢重建锁、全量回表、`PUBLISH_TICKET_POOL` 校验版本与锁令牌后原子发布 |
+| ready 值 | **`{version}:{count}`**（不是 `"1"`），与版本 key 联合校验，可区分空池与数据丢失；`ticket:pool:version` **无 TTL**（与聊天历史版本 key 同属 `PERSIST` 模式，见 [09 篇](09-lease-token.md) 4.8） |
+| TTL | 固定 **2 小时**，写入不续期；只有发布时 `PEXPIRE` 一次；空池不建 ZSet |
+| score / 成员 | `priority * 1e13 + updatedAt.toInstant(ZoneOffset.UTC).toEpochMilli()`；空值按 `0L`；成员为 `String.format(Locale.ROOT, "%019d", id)` 补零，使字典序等于主键数值序；固定 UTC 消除实例时区/夏令时影响 |
+| 回表校验 | `PoolSlice(version, total, ids)`；`selectByIds` 后数量/状态/版本任一不符 → **整页退回 DB**（不再 `filter(nonNull)` 容忍缺行）；offset 用 `long` 防溢出；仅 3 条 warn，无 info 重建日志 |
+
+**验证修订**：观察 `ticket:pool:ready:4` 的值（形如 `{version}:0`）稳定、`ticket:pool:version` 未被更换；`TicketPoolRedisIntegrationTest` / `TicketPoolDatabaseIntegrationTest` 覆盖。详见 [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) 3.1。
 
 ---
 

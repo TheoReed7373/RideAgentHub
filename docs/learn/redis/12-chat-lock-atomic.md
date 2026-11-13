@@ -2,13 +2,92 @@
 
 > **Redis 考点**：写字段与设过期必须同生共死 —— `HSET` 成功而 `EXPIRE` 失败会留下永不过期的 key；顺带看一个 Cache-Aside 双写与 TTL 语义互相打架的真实案例。
 > **来源**：`docs/02-cache-consistency-race.md` 3.1
-> **完整路径**：`src/main/java/com/fancy/taxiagent/agentbase/chatinfo/ChatManager.java`（95 行）、`src/main/java/com/fancy/taxiagent/service/base/ChatInfoService.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/agentbase/chatinfo/ChatManager.java`（历史快照 95 行；当前 103 行）、`service/base/ChatInfoService.java`、`service/base/ChatRequestRunner.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现总览】（先看这一节，再读下方改造前推导）
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文与 mermaid 时序写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 单轮执行锁写成 `if (!lock.tryLock(3, TimeUnit.SECONDS))`、时序图标「(3s)」 | `ChatRequestRunner.java:36` 是 **`tryLockAsync(0, -1, SECONDS, owner)`**：`waitTime=0` 不排队、`leaseTime=-1` 走看门狗（**无显式 TTL**）、`owner` 为随机持有者令牌；`:38` 的 3 秒只是 `acquisition.get(3, SECONDS)` 的 Future 等待上限，`:40` 还有 `thenAccept` 延迟补偿解锁；释放走 `:60` `doFinally → unlockAsync(owner)` |
+| 2 | 4.2 `HASH_SET_WITH_EXPIRE` 代码块末行 `return 1` | 实际 `return redis.call('EXPIRE', KEYS[1], ARGV[3])`（`RedisScripts.java:136-139`），返回值是 `EXPIRE` 结果，**仍不反映字段是否新建** |
+| 3 | 反复引用 `//其实这里始终为真` 注释、七章 `GET /chat/restorable`、把 `MessageMemory.java:196` 列为锁定入口 | 注释已换（`ChatManager.java:51-59`）；端点是 `GET /chat/v2/restore`（`ChatController.java:56`）；写 `locked` 的入口只剩 3 处。旧推断的前提已不成立 |
+| 4 | `chat:info` 与 `chat:execution` 容易混为一把锁 | `HASH_SET_WITH_EXPIRE` 写的是 `chat:info:{chatId}` 的 `locked=true` + `EXPIRE 3600s`，`getRestorableChat` 续的也是 `chat:info`，`restoreChat` 对它 `persist()`；**`chat:execution:{chatId}` 是 `ChatRequestRunner` 里独立的 Redisson `RLock`，与这段 Lua 无关** |
+
+---
+
+### 1. 业务背景：两个 key、两种语义
+
+本篇标题里的「会话锁」和后来新增的「单轮执行锁」**不是同一个东西**，这是当前代码最容易混淆的一处：
+
+| | 对话锁定 | 单轮执行锁 |
+|---|---|---|
+| key | `chat:info:{chatId}` Hash 的 `locked` 字段 | `chat:execution:{chatId}`（Redisson 锁） |
+| 解决的问题 | 订单创建后或切换话题时，禁止在旧会话里继续追加普通聊天 | 同一会话**同时**只能跑一轮 SSE 请求，防止并发写历史/相互解锁 |
+| 生命周期 | 60 分钟；`POST /restore` 会 `persist` 成永久 | 3 秒抢锁；`doFinally` 释放；客户端断开**不提前放锁** |
+| 代码落点 | `agentbase/chatinfo/ChatManager.lockChat` / `service/base/ChatInfoService` | `service/base/ChatRequestRunner.run` |
+
+### 2. 架构与完整执行链
+
+```mermaid
+flowchart LR
+    C[ChatController] --> R["ChatRequestRunner.run(...)"]
+    R --> V["UUID.fromString 格式校验"]
+    R --> L["Redisson 单轮锁 chat:execution:{chatId} (3s)"]
+    R --> O["chats.assertOwned(userId, chatId)"]
+    R --> S["publish().autoConnect(2) 后台订阅"]
+    S --> G["AgentStreams.guard: 3 分钟 takeUntilOther + 统一异常出口"]
+    R --> F["doFinally 释放单轮锁"]
+    C --> CM["ChatManager.lockChat → HASH_SET_WITH_EXPIRE Lua"]
+```
+
+`POST /chat/v2/c/{id}`、`POST /chat/v2/r/{id}` 都先过 `ChatRequestRunner`；`GET/POST /chat/v2/restore` 与 `POST /chat/v2/lock/{id}` 才直接操作会话 Hash。
+
+**单轮执行锁的关键实现**（`service/base/ChatRequestRunner.java`）：
+
+```java
+RLock lock = redissonClient.getLock("chat:execution:" + chatId);
+if (!lock.tryLock(3, TimeUnit.SECONDS)) { sink.tryEmitError(...); return; }
+chats.assertOwned(userId, chatId);              // 会话不存在 → 404，停用 → 410
+Flux<AgentEvent> stream = service.chat(...).guard(...);
+stream.publish().autoConnect(2).subscribe(...);  // 后台订阅，不依赖客户端是否还连着
+// doFinally → lock.unlock()
+```
+
+为什么用 `publish().autoConnect(2)`：把流的订阅与客户端 SSE 连接解耦，**客户端断开不会取消后台执行、也不会提前释放锁**；否则「用户刷新页面 → 旧请求被取消 → 锁释放 → 新请求进来」会让同一会话的两轮写历史交叉。`AgentStreams.guard` 用 `takeUntilOther(Mono.delay(Duration.ofMinutes(3)))` 给模型调用设 3 分钟上限，并把异常 `tryEmitError` 后结束 sink；完成回调失败也会结束流 —— 解决旧版「`CompletableFuture.runAsync` 异常静默丢弃、SSE 永不结束」的问题。
+
+### 3. 会话锁的当前状态（对应原文三/四/六章）
+
+- **锁定入口只剩 3 个**：`ChatController` 的 `POST /chat/v2/lock/{chatId}`、`ChatStatusTool`、`OrderTool.createOrder` 创建后锁会话。原文列的第 4 个 `MessageMemory.java:196` 是错的 —— `MessageMemory` 全文 **0 处 `lockChat`**，它只在 `switchFocusChatIfNeeded` 里清 L1 并设 L2 TTL。
+- `HASH_SET_WITH_EXPIRE` Lua 现在是 `HSET` + `return redis.call('EXPIRE', KEYS[1], ARGV[3])`，返回 `1`/`0` 而非恒定 `1`；`//其实这里始终为真` 注释已删除，`isLocked` 改成两分支判断。
+- `getRestorableChatId(String userId)`（**有参**）先按 DB 做归属过滤，再读 Redis Hash 找可恢复会话；旧的无参签名与 `GET /chat/restorable` 路径都已过时。
+
+### 4. GET / POST `/restore` 的差异（6.2 TTL 矛盾的来源）
+
+| 端点 | 返回 | 副作用 |
+|---|---|---|
+| `GET /chat/v2/restore` | `Result<Boolean>` | 只判定 + 续 60 分钟，不返回历史 |
+| `POST /chat/v2/restore` | `Result<RestoreChatVO>`（chatId + 最近 100 条 `MessageParser.simpleParse` 消息，TOOL 消息被丢弃） | `unlockChat` + **`persist(chatInfoKey)`** |
+
+`ChatInfoService.restoreChat()` 里的 `persist` 就是把 `chat:info` 从「60 分钟 TTL」变成 `-1`（永久）的那一步，**原文 6.2 关于 TTL 语义自相矛盾的核心结论完全成立**：同一个 key 在 `lockChat` 里被设 3600 秒、在 `restoreChat` 里被永久化，两者没有统一的状态机。这一点至今未修，读原文六章时按现状理解即可。
+
+### 5. 边界、常见问题与面试延伸
+
+- `chatId` 只需是合法 UUID 格式且会话属于当前用户，**不必来自 `/chat/v2/newuuid`**（`ChatRequestRunner` 只做 `UUID.fromString`）。
+- 归属失败 404、停用会话 410，由 `ChatInfoService.assertOwned` + `GlobalExceptionHandler` 映射。
+- 「原子化」只覆盖 `HSET`+`EXPIRE` 这一次 EVAL；DB 更新与 Redis 写入仍是两步（Cache-Aside 双写），原文四章的分析仍有效。
+- 面试追问：「为什么要单轮锁？」→ 防并发写历史与重复消费确认令牌；「客户端断开为什么不提前放锁？」→ 后台订阅让业务执行与客户端连接解耦；「`persist` 是 bug 吗？」→ 它让「可恢复会话」永久留存，但与 `lockChat` 的 60 分钟语义冲突，属于**已知的语义矛盾**。
+- 详见 [`../agent/01-orchestration-and-sse.md`](../agent/01-orchestration-and-sse.md)、[10 篇](10-lua-scripts-overview.md) 3.1 脚本表。
 
 ---
 
 ## 一、业务场景
 
-TaxiAgent 的对话被设计成**一次性**的：一个 `chatId` 从「闲聊 / 下单」开始，一旦完成下单，或者用户主动切换话题，这个对话就被**锁定**，前端提示用户「为了更好地帮你处理新的需求，这个对话先到这里，开启新对话继续吧～」（`ChatServiceImpl.java:84`）。
+RideAgentHub 的对话被设计成**一次性**的：一个 `chatId` 从「闲聊 / 下单」开始，一旦完成下单，或者用户主动切换话题，这个对话就被**锁定**，前端提示用户「为了更好地帮你处理新的需求，这个对话先到这里，开启新对话继续吧～」（`ChatServiceImpl.java:84`）。
 
 锁定的入口有四个：
 
@@ -364,10 +443,10 @@ mysql> SELECT locked FROM chat WHERE chat_id = '{chatId}';
 
 ## 八、延伸阅读
 
-- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— `HASH_SET_WITH_EXPIRE` 在 7 个脚本中的位置，以及"为什么单线程 Lua 等于原子"
+- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— `HASH_SET_WITH_EXPIRE` 在**当前 22 个主脚本**中的位置（旧「7 个脚本」已过时），以及"为什么单线程 Lua 等于原子"
 - [`11-two-phase-confirm-token.md`](11-two-phase-confirm-token.md) —— 同一个 `chat:info:{chatId}` Hash 上的工具令牌；4.1.5 讨论了"令牌与槽位挤在一个 Hash"的取舍
 - [`13-distributed-lock.md`](13-distributed-lock.md) —— 6.3 建议的修法所需的分布式锁（手写 `RedisLock` 与 Redisson `RLock`）
-- [`09-lease-token.md`](09-lease-token.md) —— 版本号与数据为何必须同生命周期，与本文 6.2 的"TTL 只挂在整个 key 上"是同一类约束
+- [`09-lease-token.md`](09-lease-token.md) —— **版本 key 为何必须 `PERSIST` 永久保留**（该篇 4.8 结论已反转），与本文 6.2「TTL 只挂在整个 key 上」是同一类约束的不同处理
 - [`03-cache-penetration-bloom.md`](03-cache-penetration-bloom.md) —— `classification` / `OrderId` 这类"缓存即判据"的读路径与缓存穿透
 - 项目内素材：`docs/02-cache-consistency-race.md` 3.1
 - Redis 官方文档：[HSET](https://redis.io/commands/hset/)、[EXPIRE](https://redis.io/commands/expire/)、[PERSIST](https://redis.io/commands/persist/)

@@ -2,7 +2,33 @@
 
 > **Redis 考点**：以"输入指纹"为 key 缓存昂贵的外部调用结果；指纹的字段选择（为什么不能只用 prompt）；空结果的取舍；TTL 长度与结论稳定期的关系。
 > **来源**：`docs/01-redis-application-points.md` P1-1
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/base/ClassificationCache.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/ClassificationCache.java`、`service/impl/ChatServiceImpl.java`、`config/ChatProperties.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇 3.1/4.2/4.3/五章的指纹推导写于 `\0` 分隔版本，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 以 `SEPARATOR='\0'`、`nullToEmpty`、`SHA256("CTX\0"+...)` 与「`\0` 不可注入」为核心论证 | 当前 `raw = "v2" + encode(ctxFeature) + encode(ctxText) + encode(prompt)`，`encode` 是**长度前缀** `len:value`、null → `-1:`（`ClassificationCache.java:96,120-123`）；双指纹 `fingerprint("CTXv2"+encode(ctxFeature))` 与 `fingerprint(raw)`，SHA-256 → hex 截断到 `fingerprintLength`，clamp `[8,64]`，默认 32；key `chat:classify:{ctx指纹}:{prompt指纹}`。原理应改写为「**长度前缀防拼接注入，并区分 null 与空串**」 |
+| 2 | 4.1 `resolveClassification` 代码块 | 缺 `normalizeClassification()` 五标签白名单、模型调用 `try/catch` 降级返回 null、以及 **`classification != null` 才 `put`**（`ChatServiceImpl.java:164-203`、`ClassificationCache.java:76-89`）。边界：缓存值被污染 / 模型返回未知标签时，归一化与降级如何生效 |
+| 3 | 6.7 `memory.get(userId, id, 1)` 取第 0 条 | 当前 `get(...,100)` + `lastAssistantText` 参与指纹（`ChatServiceImpl.java:101,109-110,205-212`） |
+| 4 | 仍有效的项 | TTL 21600s（6h）、读不续期、`TTL <= 0` 时 `get`/`put` 短路禁用、读写异常 try/catch 降级，均与代码一致 |
+
+> 输入指纹缓存昂贵外部调用、空结果不缓存、固定窗口双倍放行的推导**保留**；以下实现细节已重写。
+
+| 项 | 当前实现 |
+|---|---|
+| 指纹构造 | `ClassificationCache.buildKey` 用 `"v2" + encode(ctxFeature) + encode(ctxText) + encode(prompt)`，`encode()` 是**长度前缀**（`null → "-1:"`）；第一段指纹为 `SHA256("CTXv2"+encode(ctxFeature))` 前 32 位。旧 `\0` 分隔符 / `SEPARATOR` 常量已删除 —— 长度前缀防止分隔符注入并区分 null 与空串 |
+| 上下文 | `ChatServiceImpl` 用 `memory.get(userId, id, 100)` + `lastAssistantText(messages)`（倒序找最后一条 `AssistantMessage`），不再是 `messages.getFirst()` / `get(...,1)`；单轮判定用 `SINGLE_TURN_CONTEXT` |
+| 缓存/模型 | `resolveClassification()` 内联：先查缓存并 `normalizeClassification`（只接受 5 个标签）、模型调用 `try/catch` 降级返回 `null`、`classification != null` 才 `put`；**`TTL ≤ 0` 时禁用分类缓存的分支已经实现**（不是「建议补入」） |
+| 守卫前置 | 限流、参数非空、`break=yes` 检查、`DANGER` 拦截都在分类之前；`classRedis == "ORDER"` 时会话粘滞；`resume` 也受限流约束（`ChatServiceRegressionTest` 覆盖） |
+| 提示词出处 | `config/ChatProperties.java` 的 `CLASSIFIER_SYS_PROMPT` 与三大领域提示词，属于**流程约束**而非普通文案 |
+
+**验证修订**：`chat:classify:` 前缀、TTL 21600、指纹 32 位不变；`ChatGuardRegressionTest` 覆盖指纹构造、缓存跳过模型、TTL≤0 禁用。详见 [`../agent/01-orchestration-and-sse.md`](../agent/01-orchestration-and-sse.md)。
 
 ---
 

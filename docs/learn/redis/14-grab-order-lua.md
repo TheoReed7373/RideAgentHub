@@ -2,7 +2,40 @@
 
 > **Redis 考点**：用 Lua 脚本把「多次读-判-写」合并成一次原子执行，实现秒杀式的资格校验 + 扣减。
 > **来源**：`docs/01-redis-application-points.md` P0-1
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/base/OrderGrabService.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/OrderGrabService.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文与七章 `redis-cli` 命令写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实（`service/base/OrderGrabService.java`） |
+|---|---|---|
+| 1 | 4.3「`rollbackGrab` 读-写非原子，属已知残留窗口」、4.4「`releaseDriver(String driverId)` 写 `__IDLE__`」、六章「`warmUpDriverActive` 窗口 / 状态缓存 2 小时 / 占位 6 小时」 | 当前统一 `CACHE_TTL=5min`、只有 `__IDLE__`（`:29-30`）；回滚经 `afterCompletion → rollbackGrab`（`:87-94,112-119`）并用 `RELEASE_LOCK_IF_MATCH` 原子 CAS（`:115`）；`releaseDriver` 为**双参** `(driverId, orderId)`（`:122-126`）；预热已并入 `tryGrab` 事务 |
+| 2 | 七章 `SET order:status:{orderId} 10` 未带 `EX` | 应为 `SET order:status:123 10 EX 300`；`driver:active:{driverId}` 期望 `__IDLE__` 且 TTL ≈300 |
+| 3 | 延伸阅读「项目全部 **7 个** Lua 脚本」 | 当前 **22 个主脚本 + 11 个内联 = 33 段**，见 [10 篇 3.1](10-lua-scripts-overview.md) |
+
+### 【补充】当前抢单链路（本篇二～八章未覆盖）
+
+`@Transactional(MANDATORY)` 要求调用方已有事务；**两道行锁**串行化同一司机与同一订单：司机账号 `SELECT ... FOR UPDATE`（`:45-50`）、在途订单 `LIMIT 1 FOR UPDATE`（`:56-62`）。随后按 DB 权威值回填 `driver:active` 与 `order:status`（`:63-75`），再执行 `GRAB_ORDER_ATOMIC`（`RedisScripts.java:238-247`）：`statusKey != '10'` → `-1`；`driverActiveKey != '__IDLE__'` → `-2`；否则 `SET driverActiveKey = orderId EX ARGV[4]` → `1`。
+
+`GrabResult`（`:36-38`）有**四态**：`SUCCESS`（1）、`DRIVER_BUSY`（-2）、`ORDER_NOT_GRABBABLE`（其它返回值）、`ORDER_NOT_FOUND`（回表查无单，`:71-73`，**不执行 Lua**）。提交后由 `afterCommit` 用 `SYNC_ORDER_STATUS` 单调推进状态（`:101-105`；`RedisScripts.java:250-257`，数值回退时先删缓存）；事务回滚由 `afterCompletion` 触发 `rollbackGrab`。真正的 DB 条件更新（`orderStatus=10 && driverId is null → 20`）在 `RideOrderServiceImpl.java:275-284`，**不在本类**。
+
+这套设计的边界：Redis 占位只是**预检与快速失败**，正确性最终由 DB 行锁 + 条件更新保证；5 分钟 TTL 只用于「释放路径因进程崩溃未执行」时防止司机被永久锁为忙。
+
+> 秒杀模型「判断与占位一步完成」、返回码设计、DB 条件更新兜底的推导**全部保留**；以下实现细节已重写。
+
+| 项 | 当前实现 |
+|---|---|
+| TTL | `OrderGrabService.CACHE_TTL` 统一 **5 分钟（300s）**；`__MISSING__`、2h / 6h 分档已删除，`__IDLE__` 保留 |
+| 事务与预热 | 预热合并进 `tryGrab`，标注 `@Transactional(propagation = MANDATORY)`；事务内两处 `FOR UPDATE`（**司机账号行锁**、**在途订单行锁**）→ 写 5 分钟状态 → `GRAB_ORDER_ATOMIC` Lua 预检占位 → DB 条件更新裁决。旧 `warmUpDriverActive` 独立方法已删除 |
+| 回滚 | `releaseDriver(driverId, orderId)` 签名含 `orderId`；回滚经 `afterCompletion` 走 `RELEASE_LOCK_IF_MATCH` 校验令牌，不再「读写非原子」✅ 已修复 |
+| 状态同步 | 新增 `SYNC_ORDER_STATUS` Lua：**单调推进**，只允许新状态 ≥ 当前状态（相等刷新 TTL）；回池到 `CREATED` 这类数值回退必须先由 `refreshOrderStatus` 删缓存 key，否则脚本拒绝覆盖 |
+| 统一订单锁 | 7 个状态变更（接单 / 到达 / 开始 / 结束 / 支付 / 取消 / 超时）共用 `withOrderLock`（Redisson 看门狗），锁竞争 409 时**不触碰** Mapper / 延迟队列 / 缓存 |
+
+**验证修订**：`SET order:status:123 10 EX 300`（不是 7200/21600）；`OrderGrabIntegrationTest` 覆盖两处行锁与回滚，`OrderLockRegressionTest` 覆盖锁竞争不触碰业务。详见 [`13-distributed-lock.md`](13-distributed-lock.md)、[`10-lua-scripts-overview.md`](10-lua-scripts-overview.md)。
 
 ---
 

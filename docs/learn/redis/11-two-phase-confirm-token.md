@@ -2,7 +2,85 @@
 
 > **Redis 考点**：用 Hash 字段做「一次性令牌」把住工具调用的关口 —— 前置校验通过才写入令牌，后置动作校验令牌才放行；令牌的「校验 + 消费」必须原子，否则并发请求可以双双通过。
 > **来源**：`docs/01-redis-application-points.md`（两阶段确认令牌一栏）、`docs/02-cache-consistency-race.md` 3.3
-> **完整路径**：`src/main/java/com/fancy/taxiagent/agentbase/tool/OrderTool.java`（三阶段令牌链）、`src/main/java/com/fancy/taxiagent/agentbase/tool/OrderSearchTool.java`（取消令牌）
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/agentbase/tool/OrderTool.java`（三阶段令牌链）、`OrderSearchTool.java`（取消令牌）、`src/main/java/com/fancy/rideagenthub/service/base/OrderConfirmation.java`（服务端确认令牌）
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现总览】（先看这一节，再读下方改造前推导）
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文与七章 `redis-cli` 命令写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实（`service/base/OrderConfirmation.java`） |
+|---|---|---|
+| 1 | 篇首称「第五章 `set` / `setIfAbsent` 竞态推导 ✅ 保留」，但第五章现仅为设计取舍表 | 该反例推导已被删除且未被等价覆盖，见下方【原文要点恢复】；篇首「保留」断言不成立 |
+| 2 | 把 `quoted()` 归给 `OrderTool`，写 `OrderTool.quoted/saveNewOrderParam` | `quoted()` 在 `OrderConfirmation:41-48`；`OrderTool` 只在算价末尾调用它，`saveNewOrderParam` 才 `HDEL` 7 个字段（`OrderTool.java:58-59,170,190`） |
+| 3 | 「C 套报价 15 分钟 + 24h」易被读成两个独立 TTL | **24h 是 `chat:info:{chatId}` 的 key TTL**（`:47`）；**15 分钟是 `CONFIRM`/`CONSUME` 内 `now - quoteCreatedAt > 900000` 的字段时间戳比较**（`:19,34`），不是字段级 TTL |
+| 4 | 七章命令手工 `HSET ReadyForCreate true`、`readyForCancel=true`、#8 期望 TTL `-1` | `CONSUME` 要求 `quoteId == confirmedQuote == ReadyForCreate` 三者相等（`:33-38`），手工 `true` 必然失败；`readyForCancel` 现值为 orderId（`OrderSearchTool.java:218,227`）；报价后 `chat:info` TTL 为 24h。**本章命令只适用于改造前快照**，当前验证应改走 `/chat/v2/r/{id}` 并观察 `break` 由 `yes` → `resuming` |
+
+### 【原文要点恢复】`set` vs `setIfAbsent` 的幂等反例（改造前）
+
+被删推导的核心是：**用 `set(key, value)` 覆盖式签发令牌，两个并发请求都会「成功」，令牌失去一次性语义；改用 `setIfAbsent` 才能让第二次写入失败**。这正是当前 `CONFIRM` Lua 里 `state == 'resuming'` 分支的含义 —— 相同决定返回 1（幂等重放）、不同决定返回 0（409），而 `CONSUME` 用一次 `HDEL` 保证创建权限只能消费一次。把「条件写入」从 Java 侧挪进 Lua，是为了让「校验 + 状态变更」不可被打断。
+
+---
+
+### 1. 业务背景与问题定义
+
+下单、取消订单是**高风险写操作**，不能让模型凭一段对话文本自行签发权限。改造前用 Redis Hash 字段当「流程门禁」，但令牌由工具自己写、校验与删除非原子、不绑定订单号、无有效期、还能重复下单（`ReadyForCreate` 永不删除）。当前把「确认」提升为**服务端签发、前端原样回传、一次性消费**的状态机：`service/base/OrderConfirmation.java` + `domain/dto/ChatParamDTO.java` 的 `confirmationId` / `confirmed`。原文 1.2 的「两套令牌」分析框架保留作历史演进，但当前是**三套**：
+
+| | 机制 | 代码 | 时效 |
+|---|---|---|---|
+| A | 槽位 / 算价令牌（`ReadyforConfirm`、`quoteId`） | `agentbase/tool/OrderTool.quoted/saveNewOrderParam` | `quoted()` 给 `chat:info` 设 24h TTL |
+| B | 取消令牌（`readyForCancel` + `cancelVerifiedAt`） | `agentbase/tool/OrderSearchTool.CANCEL` Lua | 5 分钟（300000ms），绑定 orderId |
+| C | **服务端确认令牌**（`confirmationId` = `quoteId`） | `service/base/OrderConfirmation` 的 `CONFIRM`/`CONSUME` 两段内联 Lua | 报价 15 分钟（900000ms），创建权限一次性消费 |
+
+### 2. 状态机与字段（`chat:info:{chatId}` Hash）
+
+`break` 从单态变成**两态**：`yes` = 等待用户确认，`resuming` = 确认已登记、等待 Agent 恢复。字段由 Lua 统一维护：`quoteId`、`ReadyforConfirm`、`quoteCreatedAt`、`ReadyForCreate`、`confirmedQuote`、`confirmationAccepted`、`pendingToolCall`、`break`（注意大小写：`ReadyforConfirm` 与 `ReadyForCreate`）。另有会话级 `classification` / `locked` / `OrderId` 与订单槽位。
+
+```mermaid
+stateDiagram-v2
+    [*] --> 报价中: OrderTool.quoted() 签发 quoteId + 24h TTL
+    报价中 --> 等待确认: OrderConfirmation.begin() 置 break=yes, pendingToolCall
+    等待确认 --> 恢复中: CONFIRM Lua 校验 15 分钟 + 置 break=resuming + 签发 ReadyForCreate
+    恢复中 --> 已创建: CONSUME Lua 一次性 HDEL → createOrder() → lockChat → 写 OrderId
+    等待确认 --> [*]: 拒绝 / 超时 / 新报价使旧 confirmationId 失配
+```
+
+### 3. 端到端执行链（准确的调用顺序）
+
+1. `OrderTool.quoted()`：`HDEL` 旧的 `ReadyForCreate`/`confirmedQuote` → 写 `quoteId = UUID`、`ReadyforConfirm=true`、`quoteCreatedAt=now` → `expire(chatInfoKey, 24h)`。**新报价会让旧 confirmationId 失配失效**。
+2. `OrderAgent.handleNotifyUser` → `orderConfirmation.begin(chatId, toolCallId)`：要求存在有效报价（否则 409），写 `pendingToolCall` + `break=yes`，返回 `confirmationId` 并写进 `orderJson` → `AgentEvent.comfirm(orderJson)`。
+3. 前端 `POST /chat/v2/r/{chatId}` 传 `{"confirmationId":"...", "confirmed":true, "prompt":"可选"}`，**必须原样回传，不能从用户文字推断 `confirmed`**。
+4. `ChatServiceImpl.resume` → `orderConfirmation.confirm(...)` → **CONFIRM Lua**：校验 `quoteId` 匹配；仅 `confirmed=yes` 时校验 `now - quoteCreatedAt <= 900000`；`break == resuming` 时只有 `confirmationAccepted` 相同才返回 1（**相同决定幂等重放**），不同决定返回 0；首次确认置 `break=resuming`、写 `confirmationAccepted`，yes 时写 `confirmedQuote`/`ReadyForCreate = quoteId`。
+5. 以**固定 feedback**（「用户已确认当前报价，可以创建订单。」/「用户拒绝当前报价，禁止创建订单。」）+ 可选补充说明调 `OrderAgent.resume()`：校验 `break=="resuming"` → `messageMemory.getPersisted` → 从 `pendingToolCall` 取 toolCallId → **先持久化 `ToolResponseMessage`** 再进工具循环 → 一次 `HDEL break, pendingToolCall, confirmationAccepted`。
+6. `markOrderReadyForCreate()` **降级为只读查询**（`return orderConfirmation.isConfirmed(chatId) ? "订单已取得用户确认，可以创建" : ...`），不再签发创建权限。
+7. `createOrder()`：检查 `ReadyForCreate` → **`orderConfirmation.consume(chatId)`**（CONSUME Lua：校验 15 分钟 + `quoteId == confirmedQuote == ReadyForCreate` → `HDEL` 两字段 → 返回 1）→ `rideOrderService.createOrder` → `chatManager.lockChat` → 写 `OrderId`。消费失败一律 409「确认已失效或已被使用，请重新核对订单」。
+
+### 4. 底层原理与缺陷修复状态
+
+原子性来自**内联 Lua**（不放在 `RedisScripts.java`）：`CONFIRM`/`CONSUME` 在 `OrderConfirmation`，`CANCEL` 在 `OrderSearchTool`。所以原文 4.2.3「建议新增 `CONSUME_TOKEN_IF_PRESENT` 脚本放在 `RedisScripts` 与其余 6 个并列」既是**已落地**又不准确：脚本名是 `CANCEL`/`CONFIRM`/`CONSUME`，且在 Service 内联。
+
+- ✅ **已修复**：「校验 + 删除」非原子导致的并发双通过；`ReadyForCreate` 永不被删除 / 可重复下单；令牌不绑定订单号；无 `confirmationId`；无独立 TTL；参数覆盖使旧令牌失效（现在是 `saveNewOrderParam` 主动 `HDEL` 7 个字段）。
+- ⚠️ **仍在**：`OrderSearchTool` 的 `hasKey` 预检（`:240`）、`finally` 冗余 `delete`（`:282`）、**令牌消费与业务执行分离**（`:269` vs `:275`，消费成功但业务失败不可回滚）。
+- 📐 幂等边界：`resuming` 状态下相同决定可重放，不同决定返回 0；超时返回 409。
+
+### 5. 完整示例与异常
+
+输入：`{"confirmationId":"q-8c1","confirmed":true}`。中间状态：`break=yes → resuming`，`confirmedQuote=q-8c1`。输出：创建订单成功、会话锁定。异常：① 少传 `confirmationId` → 400；② 报价超过 15 分钟 → 409；③ 重放同一请求 → `CONFIRM` 返回 1（幂等），但 `CONSUME` 第二次返回 0 → 409，不会重复下单；④ 用户改了目的地重新报价 → 旧 `q-8c1` 失配 → 409。
+
+### 6. 面试延伸与原文对照
+
+| 原文表述 | 当前判定 |
+|---|---|
+| 「系统中有两套令牌实现」 | ❌ 三套（保留原划分作演进对照） |
+| 「`ReadyForCreate` 永不被删除 / 可重复下单」 | ❌ 已由 `CONSUME` 一次性 `HDEL` 修复 |
+| 「非原子消费，建议新增脚本」 | ❌ 核心竞态已修，但脚本名/落点不同 |
+| 「令牌不绑定订单号 / 无 confirmationId / 无独立 TTL」 | ❌ 全部已落地（B 绑 orderId + 5 分钟、C 有 15 分钟 + 24h） |
+| 「7 个 Lua 脚本 / 与其余 6 个并列」 | ❌ 当前 22 个主脚本 + 11 个内联 |
+| 第五章 set/setIfAbsent 竞态推导 | ✅ **保留**，是理解「为什么要原子消费」的最佳反例 |
+
+详见 [`25-agent-hitl-state.md`](25-agent-hitl-state.md)、[`../agent/01-orchestration-and-sse.md`](../agent/01-orchestration-and-sse.md)、[`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) 3.3。
 
 ---
 
@@ -315,7 +393,9 @@ T2  :294              HDEL readyForCancel
 
 #### 4.2.4 用 Lua 把「校验 + 删除」合并
 
-这正是 [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) 里 7 个脚本的统一模式。新增一个脚本（放在 `RedisScripts.java`，与其余 6 个并列）：
+这正是 [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) 里 Lua 脚本的统一模式（**当时共 7 个脚本**；当前 22 个主脚本 + 11 个内联）。
+
+> 【当前状态】下面「建议新增一个脚本，放在 `RedisScripts.java` 与其余 6 个并列」是**改造前建议**，落地方案不同：实际新增的是 3 段**业务类内联**脚本 —— `OrderConfirmation.CONFIRM`、`OrderConfirmation.CONSUME`、`OrderSearchTool.CANCEL`，见本篇开头【当前实现总览】。以下代码与建议保留作「为什么必须原子消费」的设计推导：
 
 ```lua
 -- KEYS[1] = chat:info:{chatId}
@@ -557,7 +637,7 @@ redis-cli TTL chat:info:{chatId}
 
 ## 八、延伸阅读
 
-- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— 7 个 Lua 脚本的原子性总表，以及 `HEXISTS` 返回值、`false` vs `nil` 的坑
+- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— **22 个主脚本 + 11 个内联脚本**的原子性总表（3.3 节列出 `CONFIRM`/`CONSUME`/`CANCEL`），以及 `HEXISTS` 返回值、`false` vs `nil` 的坑（旧「7 个脚本」已过时）
 - [`13-distributed-lock.md`](13-distributed-lock.md) —— `RELEASE_LOCK_IF_MATCH` 的「令牌比对 + 原子删除」，本篇文章 4.2.4 的修法就是同一个模式
 - [`12-chat-lock-atomic.md`](12-chat-lock-atomic.md) —— 同一个 `chat:info:{chatId}` Hash 上的会话锁，以及 TTL 语义矛盾
 - [`14-grab-order-lua.md`](14-grab-order-lua.md) —— 另一处「原子预检 + 令牌」的落地（司机抢单）

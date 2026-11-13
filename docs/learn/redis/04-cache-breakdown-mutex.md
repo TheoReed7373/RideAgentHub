@@ -2,7 +2,32 @@
 
 > **Redis 考点**：热点 key 失效瞬间，用 `setIfAbsent` 互斥锁把并发回源收敛成一次，配合 double check 与「拿不到锁就等一会儿 / 最终降级直查 DB」，让**缓存故障绝不升级为接口故障**。
 > **来源**：`docs/01-redis-application-points.md` 一、现状盘点（「缓存击穿（互斥锁 + 双检）」）与 P1-2
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/impl/TicketServiceImpl.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/impl/TicketServiceImpl.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文、`文件:行号` 与 `redis-cli` 命令写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。下表是已确认的失效点。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 4.3 `tryLock` 代码块对非法参数 `return null` | 实际抛 `IllegalArgumentException`（`service/base/RedisLock.java:23-25`），`RedisLockRegressionTest:37-49` 有断言 |
+| 2 | 引用 `RedisLock.java:49-56/65-71/12-27/22-26 长类注释`、`RedisScripts.java:53-59` | 该类现 42 行、仅 `:13` 一行注释；`tryLock` 在 `:22-28`、`unlock` 在 `:31-41`；`RELEASE_LOCK_IF_MATCH` 在 `RedisScripts.java:142-147`。旧行号与「类注释自己声明」措辞均悬空 |
+| 3 | 延迟双删只给调用侧代码，未交代第二次删除的失败语义 | `DelayedCacheEvictor` 为单线程 daemon（`:20-24`）：任务被拒绝或 `delete` 失败**只 `log.warn` 不重试**（`:30-42`），`@PreDestroy` 关闭（`:44-55`）。**进程重启会丢掉第二次删除**，脏窗口最终靠统计缓存 20~30 秒 TTL 收敛；唯一生产延迟实参是 500ms |
+| 4 | 仍有效、可照做的验证项 | `TTL 20~30`、锁 TTL 5s、抢锁失败 3 次×60ms 后降级直查且**不写缓存**、500ms 延迟、解锁 Lua `KEYS[1]/ARGV[1]` 参数个数，均与 `TicketServiceImpl.java:87-91,1135-1250,1278-1280` 一致 |
+
+> 双检 + 有限重试 + 降级直查 DB 的推导**完全保留**；以下为当前 `service/base/RedisLock.java` 的真实行为（类已从 72 行缩到 42 行、长类注释删除）。
+
+| 项 | 当前实现 |
+|---|---|
+| `tryLock` 参数校验 | `key` 为空 / `ttl` 非法时**抛 `IllegalArgumentException`**，不再静默返回 `null`；只有「竞争失败」返回 `null` |
+| `unlock` | 返回 **`void`** 且吞掉释放异常（只打 warn）；释放走 `RELEASE_LOCK_IF_MATCH` Lua 校验令牌，失败由固定 **5 秒 TTL** 兜底 |
+| 旧「静默返回 null / 引用长类注释 / 返回 boolean」 | ❌ 全部过时；`docs/02` 3.2「无条件删除误删他人锁」✅ 已修复 |
+| 调用点 | `TicketServiceImpl.getTicketStatistics`（5s，3×60ms 有限重试）、`OrderGeoPool.search`（10s）、`TicketPoolIndex.slice`（10s）；订单状态机另用 Redisson **看门狗**锁 |
+
+**验证修订**：`RedisLockRegressionTest` 覆盖参数校验与令牌释放；观察 TTL 时手写锁固定 5s，订单锁会被看门狗续回。详见 [`13-distributed-lock.md`](13-distributed-lock.md)、[`10-lua-scripts-overview.md`](10-lua-scripts-overview.md)。
 
 ---
 

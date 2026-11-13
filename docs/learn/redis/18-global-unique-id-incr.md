@@ -2,7 +2,32 @@
 
 > **Redis 考点**：用 `INCR` 的原子自增在分布式环境下生成有序、可读、长度可控的业务单号。
 > **来源**：`docs/01-redis-application-points.md` 第一节（现状盘点）
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/impl/TicketServiceImpl.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/impl/TicketServiceImpl.java`、`config/IdGeneratorConfig.java`、`util/SnowflakeIdWorker.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇四/六/七章的 `INCR`+`EXPIRE` 推导写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 代码块 `if (seq == 1) expire`、6.2「`INCR` 与 `EXPIRE` 不是原子的」 | `TICKET_SEQUENCE` 是**类内内联 Lua**（`TicketServiceImpl.java:76-81`）：`INCR KEYS[1]`，**仅 `TTL < 0` 时 `EXPIRE 172800`（48 小时）**，单段 Lua 内原子完成；没有 `seq==1` 判断 |
+| 2 | 6.2「`seq` 为 null 静默生成畸形编号」、6.1「全仓无 `DuplicateKeyException` 捕获 → 500」、验证 #4 期望 500、#1「`TTL -1` = TTL 丢失问题」 | `seq == null` 抛 `BusinessException(503)`（`:713`）；`GlobalExceptionHandler.java:26-28` 把 `DuplicateKeyException` 映射为 **409**；`TTL < 0` 表示「key 尚无过期时间」，是脚本的正常判断分支，不是缺陷 |
+| 3 | 5.3 / 6.1「换雪花 ID 是未来演进」 | 雪花 ID 与 Redisson 节点**永久租约**已落地（`IdGeneratorConfig`、`SnowflakeIdWorker`），与 `INCR` 日序号**两套并存**；`Config.jacksonCustomizer()` 还把超过 `2^53-1` 的 `Long` 序列化成字符串防前端丢精度 |
+
+> 「`INCR` 生成可读日序号 → 序号回退由唯一索引拒绝」的主结论与号段/雪花/DB 自增的方案对比**保留**；以下三条旧断言已修。
+
+| 项 | 当前实现 |
+|---|---|
+| 原子性 | `TICKET_SEQUENCE` Lua（`TicketServiceImpl:76-81`）：`INCR` 且仅当 `TTL < 0` 才 `EXPIRE 172800`，不再「`INCR`+`EXPIRE` 非原子」 |
+| null / 撞号 | `seq == null` 现在抛 **503**（不再生成畸形编号）；`DuplicateKeyException` 经 `GlobalExceptionHandler` 映射 **409** |
+| 两套并存 | 对外工单号仍用 INCR；**内部主键改用雪花 ID**：`config/IdGeneratorConfig` + `util/SnowflakeIdWorker`，用于订单 ID / userId / RAG 主键。旧「本项目恰好三条全反、换雪花是未来演进方向」❌ 已过时 |
+| 节点租约 | Redisson `id:node:{dc}:{worker}` **永久租约**（`leaseTime=-1` + 看门狗）；重复节点配置启动即抛异常，`nextId()` 校验 `isHeldByThread(owner)`，租约丢失则拒绝发号（`SecurityRedisIntegrationTest` 覆盖） |
+| 精度防护 | `config/Config.jacksonCustomizer()`：`BigDecimal` 与超过 `9007199254740991`（`2^53-1`）的 `Long` 序列化为字符串，防前端丢精度 |
+
+**面试延伸**：「为什么不全部换成雪花？」→ 工单号要可读（日期 + 类型码），雪花 ID 要全局唯一且趋势递增，两者服务不同诉求，因此并存。详见 [`../agent/03-security-and-boundaries.md`](../agent/03-security-and-boundaries.md)。
 
 ---
 

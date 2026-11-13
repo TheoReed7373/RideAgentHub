@@ -1,8 +1,9 @@
 # 缓存一致性竞态盘点：延迟双删 / 墓碑 / Lease
 
-> 目标：定位 TaxiAgent 中"DB 更新导致缓存脏数据"的真实竞态点，
+> 目标：定位 RideAgentHub（旧名 TaxiAgent）中"DB 更新导致缓存脏数据"的真实竞态点，
 > 并为延迟双删、墓碑机制、Facebook Lease 令牌三种解法找到最合适的落点。
-> 代码引用格式为 `文件:行号`，基于 `main` 分支 `8d5d574`。
+> 代码引用格式为 `文件:行号`，基于历史提交 `8d5d574`（`import TaxiAgent project`，属已被重写合并的旧分支）。
+> **本文性质**：通篇「现状」「排查结论」「附带缺陷」描述的都是**改造前**快照。三解法与四个附带缺陷的当前状态（✅ 已修复 / ⚠️ 部分修复 / ❌ 仍存在 / 📐 设计中）在各节以【当前状态】框追加说明；竞态推导、时序图、方案对比属于教学主体，**原样保留**。章节编号（2.x/3.x）是 25 篇学习笔记「来源」的锚点，**保持不变**。
 
 ---
 
@@ -10,18 +11,20 @@
 
 先把**不存在竞态**的缓存划掉，避免过度设计。
 
-| 缓存 | 数据可变？ | 有失效路径？ | 回填语义 | 结论 |
+> 【当前状态说明】下表「无失效路径」「双写非原子」「会丢数据」都是**改造前**的排查结论，是全文推导的起点，不删除；最右列追加当前代码的状态。`ESMemory` 空实现与布隆「重建期穿透」两格至今成立，保留。
+
+| 缓存 | 数据可变？ | 有失效路径？（改造前） | 回填语义（改造前） | 结论：改造前 → 当前状态 |
 |---|---|---|---|---|
-| `TokenServiceImpl` | — | — | — | ✅ **安全**：Redis 本身是数据源，无 DB 双写 |
-| `EmailCodeService` | — | — | — | ✅ **安全**：同上，验证码只存在于 Redis |
-| `ToolResponseMemory:28-72` | 否 | — | `set` 覆盖 | ✅ **安全**：tool 结果按 `callId` 不可变 |
-| `HeapMemory` | 是 | — | `overwrite` | ➖ L1 进程内，由 `MessageMemory` 统一调度 |
-| `ESMemory` | — | — | — | ➖ 空实现（规划中） |
-| `UserUsernameBloomFilterService:41-61` | 只增 | 仅 `rebuild` 全量 | — | ⚠️ 非双写竞态，是**重建期穿透**（见 3.3） |
-| `CityCodeUtil` | 是 | **无** | 全量 `set` | ⚠️ **真竞态**，TTL 7 天 → 见 2.2 |
-| `TicketServiceImpl` 统计缓存 | 高频 | **无** | `set` 覆盖 | ⚠️ **真竞态** → 见 2.1 |
-| `ChatManager` / `ChatInfoService` | 是 | 双写 | — | ⚠️ **真竞态**，DB+Redis 双写非原子 → 见 3.1 |
-| `RedisMemory` / `MessageMemory` | 是 | 双写 L2/L3 | **`clear` + 全量 `append`** | ⚠️⚠️ **真竞态且会丢数据** → 见 2.3 |
+| `TokenServiceImpl` | — | — | — | ✅ **安全**：Redis 本身是数据源，无 DB 双写 —— 结论不变；当前改为 `SAVE`/`REVOKE`/`REMOVE` 三段 Lua 原子发布 + 会话版本围栏 |
+| `EmailCodeService` | — | — | — | ✅ **安全**：同上 —— 当前四段 Lua + 5 次错误上限 |
+| `ToolResponseMemory` | 否 | — | `set` 覆盖 | ✅ **安全**：工具结果按 `(callId, chatId)` 不可变 —— 当前 key 含 chatId、Redis + MySQL 两级；`set` 覆盖与 MySQL 重复行问题见 `docs/01` 第三节 |
+| `HeapMemory` | 是 | — | `overwrite` | ➖ L1 进程内，由 `MessageMemory` 统一调度 —— 当前租约失效时**保留**并发写入内容，不清空 |
+| `ESMemory` | — | — | — | ➖ 空实现（规划中）—— **结论不变**：当前仍是空类、`MemoryAdvisor` 返回 `null`，均 0 调用方（📐 设计中） |
+| `UserUsernameBloomFilterService` | 只增 | 仅 `rebuild` 全量 | — | ⚠️ 非双写竞态，是**重建期穿透**（见 **3.4**；原「见 3.3」是交叉引用笔误） —— ❌ 缺陷仍在，后果由 DB 唯一索引兜底 |
+| `CityCodeUtil` | 是 | **无** | 全量 `set` | ⚠️ **真竞态**（TTL 7 天）→ ⚠️ **部分实现**：读侧版本 + 墓碑两段 Lua 已就位，但 `invalidate()` 写路径未接入 → 见 2.2 |
+| `TicketServiceImpl` 统计缓存 | 高频 | **无** | `set` 覆盖 | ⚠️ **真竞态** → ✅ **已解决**：统一失效 + 提交后立即删除 + 500ms 二次删除 → 见 2.1 |
+| `ChatManager` / `ChatInfoService` | 是 | 双写 | — | ⚠️ **真竞态**（DB+Redis 双写非原子）→ ⚠️ **部分修复**：`HSET`+`EXPIRE` 已 Lua 原子化，`restoreChat` 的 `persist` 仍在 → 见 3.1 |
+| `RedisMemory` / `MessageMemory` | 是 | 双写 L2/L3 | **`clear` + 全量 `append`** | ⚠️⚠️ **真竞态且会丢数据** → ✅ **已解决**：取租约 + 版本校验原子回填；版本 key `PERSIST` 永久保留 → 见 2.3 |
 
 三个真竞态点的差异，正好对应三种解法的适用边界：
 
@@ -29,13 +32,36 @@
 - **2.2 墓碑机制** —— "TTL 太长，时间窗口猜不准"，用**状态标记**替代猜时间
 - **2.3 Lease 令牌** —— "回填本身就是破坏性覆盖"，只有**版本校验**能解
 
+### 当前状态总表（四态标注）
+
+> 下表把「已修复 / 部分修复 / 仍存在 / 设计中」一次说清，避免读者把改造前的缺陷标注当成现状。所有 `文件:行号` 均为历史快照，当前按类名 + 方法名定位。
+
+| 本文位置 | 改造前标注 | 当前代码事实 | 状态 | 主要证据 |
+|---|---|---|---|---|
+| 2.1 / 一 | 「10 个写方法没有一个碰缓存」「无失效路径」 | 10 个写方法逐个调 `afterTicketMutation()`，先注册索引同步再 `evictTicketStatistics()`，删除包 try/catch 且必定调度 500ms 二次删除 | ✅ 已修复 | `TicketServiceImpl.afterTicketMutation` / `evictTicketStatistics`、`DelayedCacheEvictor` |
+| 2.2 / 一 | 「没有任何失效路径」「大小写 key 分裂」 | `normalized = trim().toLowerCase(Locale.ROOT)` 统一 key 与 DB 查询；`.and()` 已包裹 `.or()` | ✅ 已修复（key 规范化） | `CityCodeUtil.getCityCode`、`RedisKeyConstants.amapCityCodeKey` |
+| 2.2 / 3.3 裁决 | 「墓碑建议已全部实现 / 已彻底修复」 | `INVALIDATE_CITY_CODE` / `CACHE_CITY_CODE_IF_VERSION_MATCH` 两段 Lua 与版本 key 齐备并通过回归测试，但 `invalidate()` 生产代码 **0 调用方** | ⚠️ 部分实现（机制已就位·写路径未接入） | `CityCodeUtil.invalidate`、`RedisCacheRegressionTest` |
+| 2.3 / 一 | 「破坏性 `overwrite`，唯一一处会丢数据」 | 取租约 + 版本校验回填；`clear()` 走 `CLEAR_HISTORY_WITH_VERSION_BUMP` 原子脚本；版本 key 五处 `PERSIST` | ✅ 已修复（且设计结论反转） | `MessageMemory`、`RedisMemory`、`RedisScripts:169-235` |
+| 3.1 | `lockChat` 的 `put` + `expire` 非原子 | `HASH_SET_WITH_EXPIRE` Lua 把 HSET 与 EXPIRE 合并；`//其实这里始终为真` 注释已删除 | ✅ 已修复（原子化部分） | `ChatManager.lockChat`、`RedisScripts.HASH_SET_WITH_EXPIRE` |
+| 3.1 / 附注 | `restoreChat` 去掉 TTL | `ChatInfoService.restoreChat()` 仍 `persist(chatInfoKey)`，TTL 语义矛盾未梳理 | ⚠️ 部分修复（整体） | `ChatInfoService.restoreChat`、`POST /chat/v2/restore` |
+| 3.2 | `finally` 无条件 `delete(lockKey)` 误删他人锁 | 手写锁统一由 `RedisLock` 管理，释放走 `RELEASE_LOCK_IF_MATCH` 校验 UUID 令牌 | ✅ 已修复 | `RedisLock.unlock`、`RedisScripts.RELEASE_LOCK_IF_MATCH` |
+| 3.3 | 「校验 + 删除非原子」「3.3 未修复」 | `OrderSearchTool.CANCEL` Lua 把「校验令牌 + 绑定 orderId + 5 分钟时效 + `HDEL`」原子化；`OrderConfirmation.CONSUME` 一次性消费创建权限 | ✅ 核心竞态已修复 | `OrderSearchTool.CANCEL`、`OrderConfirmation` |
+| 3.3 残留 | — | `hasKey` 预检（`:240`）、`finally` 冗余 `delete`（`:282`）、令牌消费与业务执行分离（`:269` vs `:275`）仍在 | ⚠️ 部分修复（整体） | `OrderSearchTool.cancelOrder` |
+| 3.4 | 布隆 `delete()` + `tryInit()` 原地重建 | 代码未变；但 `isUsernameAvailable` 已直查 DB + 生成列唯一索引兜底，后果从「落库重名用户」变为「重建期假阴性」 | ❌ 仍存在（后果已变） | `UserUsernameBloomFilterService.rebuild`、`sql/init.sql` |
+| `docs/01` 三、缺陷 1 | 「重复 tool call 会覆盖已有结果」 | Redis 仍用 `set`；MySQL 每次 `insert` 新行、靠 `orderByDesc(id) LIMIT 1` 取最新 | ❌ 仍存在（且更重） | `ToolResponseMemory.save/get` |
+| 验证码 / Token | 「可重复消费 / 三步非原子」 | `EmailCodeService` 四段 Lua + 5 次上限；`TokenServiceImpl` 三段 Lua + 会话版本 / 凭据摘要三重校验 | ✅ 已修复 | `SecurityRedisIntegrationTest` |
+| 锁与队列 | 固定 10s 租约、`rollbackGrab` 非原子、延迟队列无 DB 兜底、`INCR`+`EXPIRE` 非原子 | 订单锁启用 Redisson 看门狗；回滚走 `RELEASE_LOCK_IF_MATCH`；`OrderTimeoutJob` 每分钟扫 DB 并重排失败；`TICKET_SEQUENCE` Lua | ✅ 已修复 | `RideOrderServiceImpl.withOrderLock`、`OrderTimeoutJob`、`TicketServiceImpl` |
+| `CHECK_DRIVER_ONLINE` | 作为第 7 个脚本讲解 | 脚本已删除，改由 `UPDATE_/REMOVE_/READ_DRIVER_LOCATION` 三脚本 + Redis `TIME` 实现 | 已废弃 | `RedisScripts:10-45`、`DriverGeoIndex` |
+
 ---
 
 ## 二、三处真竞态
 
 ### 2.1 延迟双删 → `TicketServiceImpl` 工单统计缓存
 
-**现状**
+> 【当前状态 · ✅ 已修复】「没有任何一处删除」「10 个写方法没有一个碰缓存」是**改造前**结论。当前 `TicketServiceImpl.afterTicketMutation()` 被 10 个写方法逐个调用，且顺序刻意是**先注册 `afterCommit(() -> ticketPoolIndex.syncByTicketId(...))`，再 `evictTicketStatistics()`**（统计缓存删除失败不阻止索引版本推进）；第一次删除包在 `try/catch(RuntimeException)` 里，失败只 `log.warn`，无论成败都调度 `DelayedCacheEvictor` 的 500ms 二次删除。`updateTicketTime` 是辅助方法，由调用方统一覆盖失效，不算遗漏。下面 `:985/:1002/:1035` 等行号是历史快照，当前按 `getTicketStatistics` / `evictTicketStatistics` / `afterTicketMutation` 方法名定位（约 `:1135-1171`、`:1236-1251`）。TTL 20+0~10 秒未变，但已叠加延迟双删；下文「延迟双删是过度设计」的**教学判断仍然成立**，保留作设计取舍的证据。详见 [07 篇](learn/redis/07-delayed-double-delete.md)、[23 篇](learn/redis/23-ticket-pool-zset.md)。
+
+**现状（改造前）**
 
 `ticketStatisticsKey` **全项目只有 `getTicketStatistics` 读写，没有任何一处删除**：
 
@@ -108,7 +134,14 @@ public TicketDataVO getTicketStatistics() {
 
 ### 2.2 墓碑机制 → `CityCodeUtil`
 
-**现状**
+> 【当前状态 · ⚠️ 部分实现：机制已就位·写路径未接入】必须分三件事看，否则很容易把「已修复」写成过头的结论：
+> - ✅ **key 规范化已修复**：`CityCodeUtil` 一次做 `trim().toLowerCase(Locale.ROOT)`，cache key 与 DB 查询使用同一个 `normalized`；`.or()` 已用 `.and(w -> ...)` 包裹。下面「顺带一个现存 bug」整段是改造前记录，**结论不再成立**，但推导保留作反面教材。
+> - ✅ **读侧机制已落地**：新增 `amap:city_code:version:{name}`（无 TTL）与两段 Lua —— `INVALIDATE_CITY_CODE`（`INCR` 版本 + `SET` 5 秒墓碑）、`CACHE_CITY_CODE_IF_VERSION_MATCH`（版本不符返回 0，否则 `SET … NX EX`）；命中墓碑不回填，版本号防止墓碑过期后旧快照回填。这比改造建议多了一层「版本租约」。
+> - ⚠️ **写路径未接线**：`CityCodeUtil.invalidate(String)` 在**生产代码 0 调用方**，只有 `RedisCacheRegressionTest` 调用；城市表改名/纠错的写操作没有触发它。所以「写城市表 → 写墓碑」这一环仍是设计建议，整个机制不构成闭环，按术语规范标注为「机制已就位·写路径未接入」，**不能描述为已彻底修复**。
+>
+> 下方「为什么必须是这里」「延迟双删 vs 墓碑」对比表仍是本节最有价值的部分，原样保留。实现细节见 [08 篇](learn/redis/08-city-code-tombstone.md)、[06 篇](learn/redis/06-null-sentinel-and-prewarm.md)。
+
+**现状（改造前）**
 
 `CityCodeUtil:35-61` 缓存高德城市编码：
 
@@ -200,7 +233,13 @@ cityCodeMapper.selectOne(new LambdaQueryWrapper<CityCode>()
 
 ### 2.3 Facebook Lease 令牌 → `MessageMemory` 的 L2 回填
 
-**这是全项目唯一一处"回填会丢数据"的地方。**
+> 【当前状态 · ✅ 已修复，且一处设计结论完全反转】破坏性 `overwrite` 已不存在：三层读取都改为 `getAll` + `MessageWindow.tail`，回填走「先取 `currentVersion` 租约 → Lua 校验版本 → 原子 `RENAME` / `RPUSH`」；`MessageMemory.save` **先落 MySQL** 再按租约追加 L2/L1，L1 租约失效时**保留**并发写入内容而不是清空。
+>
+> 最需要修正的是本文原来的直觉：**版本 key 现在被 `PERSIST` 永久保留**，只有数据 key 带 TTL（`CURRENT_HISTORY_VERSION`、`APPEND_*`、`CLEAR_HISTORY_WITH_VERSION_BUMP` 五处脚本）。原因是如果版本 key 与数据 key 一起过期归零，「旧租约复活」就会重新获得回填资格，把新数据覆盖掉。`clear()` 也不再是两条独立 `DEL`，而是一条 `INCR` 版本 + `PERSIST` + `DEL` 数据的 Lua 脚本。
+>
+> 本节「为什么另外两个机制都解不了」的论证与「Lease 令牌对应关系」表是教学核心，**原样保留**；但实现细节（脚本名、`ARGV[1]` 是数据 TTL 毫秒而非版本 key 过期秒数、写路径 `APPEND_HISTORY_IF_VERSION_MATCH` 与回填路径 `APPEND_WITH_VERSION_BUMP` 的区别）以 [09 篇](learn/redis/09-lease-token.md)、[19 篇](learn/redis/19-multi-level-cache.md) 为准。
+
+**这是全项目唯一一处"回填会丢数据"的地方（改造前）。**
 
 **现状**
 
@@ -296,7 +335,18 @@ Lua 脚本保证"版本校验 + 覆盖"的原子性。
 
 ## 三、附带缺陷（与竞态主题直接相关）
 
+> 【四态标注总览】以下四节的缺陷成因推导、代码块与时序图**全部保留**，只把结论标注更新为当前状态。术语遵循 `docs/learn/redis/README.md` 的统一约定。
+
+| 节 | 改造前缺陷 | 当前状态 | 消除了什么 / 仍留什么 |
+|---|---|---|---|
+| 3.1 | `put` + `expire` 两步非原子；`restoreChat` 去掉 TTL | ⚠️ **部分修复** | ✅ `HASH_SET_WITH_EXPIRE` Lua 把 HSET 与 EXPIRE 合并、返回 `EXPIRE` 结果；失效注释已删。❌ `ChatInfoService.restoreChat()` 仍 `persist(chatInfoKey)`，`-1` 与 3600 秒的 TTL 语义矛盾未梳理（由 `POST /chat/v2/restore` 触发） |
+| 3.2 | `finally` 无条件 `delete(lockKey)` 误删他人锁 | ✅ **已修复** | 手写锁统一由 `service/base/RedisLock.java` 管理，`unlock` 走 `RELEASE_LOCK_IF_MATCH` Lua 校验 UUID 令牌；订单状态机另用 Redisson 看门狗锁 |
+| 3.3 | `hasKey` 检查与 `delete` 之间非原子 | ⚠️ **部分修复（核心竞态已消除）** | ✅ `CANCEL` Lua 把「校验令牌 + 绑定 orderId + 5 分钟时效 + `HDEL`」合并为原子消费；`OrderConfirmation.CONSUME` 一次性消费创建权限。❌ 仍有 `hasKey` 预检、`finally` 冗余 `delete`、令牌消费与业务执行分离 |
+| 3.4 | 布隆过滤器原地 `delete()` + `tryInit()` 重建 | ❌ **仍存在（后果已变）** | 代码未改；但 `isUsernameAvailable` 已直查 DB，且 `init.sql` 有生成列唯一索引兜底，后果从「落库重名用户」变成「重建期假阴性」，双 key 切换建议依然有效 |
+
 ### 3.1 `ChatManager.lockChat` 的 put + expire 非原子
+
+> 【当前状态】`put`+`expire` 非原子这一条 ✅ 已修复：`ChatManager.lockChat` 改调 `HASH_SET_WITH_EXPIRE` Lua（一次 `HSET` + `EXPIRE`，返回 `EXPIRE` 的结果而非固定 `return 1`），`//其实这里始终为真` 注释已从代码删除。但 `restoreChat` 的 `persist` 仍在，所以**整节属于部分修复**；`POST /chat/v2/restore` 是触发 `persist` 的入口。下面代码块与 TTL 矛盾分析按「改造前对照」阅读，见 [12 篇](learn/redis/12-chat-lock-atomic.md)。
 
 `ChatManager:24-29`：
 
@@ -327,6 +377,8 @@ stringRedisTemplate.persist(chatInfoKey);      // ← 去掉 TTL，永久化
 
 ### 3.2 `TicketServiceImpl:1005` 不校验持有者就删锁
 
+> 【当前状态 · ✅ 已修复】当前没有「无条件删除」：`service/base/RedisLock.java` 的 `unlock()` 是 `void` 且吞掉释放异常，内部用 `RELEASE_LOCK_IF_MATCH` Lua「`GET` 等于自己的令牌才 `DEL`」；释放失败由固定 5 秒 TTL 兜底。订单状态机则改用 Redisson 看门狗锁（`tryLock(3, TimeUnit.SECONDS)`，持锁到 `afterCompletion`）。下面的三类事故推导仍然是最好的教材，见 [13 篇](learn/redis/13-distributed-lock.md)、[04 篇](learn/redis/04-cache-breakdown-mutex.md)。
+
 ```java
 } finally {
     stringRedisTemplate.delete(lockKey);      // ← 无条件删除
@@ -345,6 +397,10 @@ A 进入 finally → delete(lockKey) → A 删掉了 B 的锁
 或直接换项目已引入的 Redisson `RLock`（自带看门狗续期和持有者校验）。
 
 ### 3.3 `OrderSearchTool` 两阶段令牌不是原子消费
+
+> 【当前状态 · ⚠️ 部分修复】「并发双通过」这个**核心竞态已消除**：`OrderSearchTool.CANCEL` 内联 Lua 把「校验 `readyForCancel == ARGV[1]` + 校验 `now - cancelVerifiedAt <= 300000ms` + `HDEL`」合成一次原子操作，令牌绑定具体订单号；订单创建权限另由 `OrderConfirmation` 的 `CONFIRM`/`CONSUME` 两段 Lua 管理（15 分钟报价有效期、一次性消费、`resuming` 幂等重放）。下面「用 Lua 把校验 + 删除合并」的**建议已经落地**，不再是待办。
+>
+> **仍留三处**：`hasKey` 预检与原子消费之间的冗余检查、`finally` 里的无条件 `delete`、以及「令牌消费」与「业务执行」仍是两步（消费成功但业务失败时不可回滚）。这三点是 [11 篇](learn/redis/11-two-phase-confirm-token.md) 六章的重点，不要因为核心竞态已修就认为整节结论不变。
 
 `OrderSearchTool:254-256` 校验令牌存在：
 
@@ -379,9 +435,13 @@ for (String username : normalized) {     // 再逐条 add
 重建期间过滤器为空/半空，**所有查询都会穿透到 DB**。
 建议改为**双 key 切换**（重建到新 key，完成后原子改名），而非原地删除重建。
 
+> 【当前状态 · ❌ 仍存在，但后果已变】`UserUsernameBloomFilterService.rebuild()` 依旧是 `delete()` + `tryInit()` + 逐条 `add`，双 key 切换**未实现**；`mightContain` 也已退出可用性主链路（生产 0 调用方）。但 `AuthServiceImpl.isUsernameAvailable` 现在直查 DB，`sql/init.sql` 又加了「同角色、未删除账号」的生成列唯一索引 `uk_active_username_role`，注册前置还会校验用户名 —— 所以重建期的假阴性不再导致「落库两个同名用户」，只影响一次可用性判断。上面的双 key 切换建议作为**可选优化**依然成立，见 [03 篇](learn/redis/03-cache-penetration-bloom.md)。
+
 ---
 
 ## 四、演练顺序建议
+
+> 【当前状态】四步中**三步闭环，第 3 步（墓碑）为部分实现**：`CityCodeUtil.invalidate(String)` 类、Lua 与回归测试齐备，但生产代码 0 调用方；因此不能写成「均已完成」。本表是**历史实施顺序**，不再是「待办建议」。今天读它只有一个目的：按认知递进理解「为什么需要 07/08/09 篇的机制」—— 每一步都让上一步的缺陷暴露出来。配套的 `docs/01` 第四节优先级表也已同步改为「已实施」。
 
 这个顺序是**认知递进**，每一步都让上一步的缺陷暴露出来：
 
@@ -394,7 +454,7 @@ for (String username : normalized) {     // 再逐条 add
 
 > 第 1 步是后面所有步骤的前提 —— 没有写路径的删除，就构造不出竞态。
 
-**建议起手**：从第 1 步开始，改动最局部，且能立刻观察到效果。
+**历史实施记录**：当时确实从第 1 步起手（改动最局部、能立刻观察效果）。四步落地后分别对应 [07 篇「延迟双删」](learn/redis/07-delayed-double-delete.md)、[08 篇「墓碑」](learn/redis/08-city-code-tombstone.md)（注意：机制已就位但写路径未接入）、[09 篇「Lease 令牌」](learn/redis/09-lease-token.md)。学习时建议按 `docs/learn/redis/README.md` 的阅读路径 `04 → 07 → 08 → 09` 走一遍，把「否掉某个方案的理由」也一起记住。
 
 ---
 

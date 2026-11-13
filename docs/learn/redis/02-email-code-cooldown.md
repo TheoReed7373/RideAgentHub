@@ -2,7 +2,35 @@
 
 > **Redis 考点**：用两个生命周期不同的 key（验证码 TTL key + 冷却 key）表达「验证码 5 分钟内有效、同一邮箱 60 秒只能发一次」；发送失败时回滚删除，避免「邮件没发出去但冷却已生效」。
 > **来源**：`docs/01-redis-application-points.md` 一、现状盘点（「验证码 + 发送冷却」）与三、现存缺陷
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/base/EmailCodeService.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/EmailCodeService.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文、`文件:行号` 与 `redis-cli` 命令写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。下表是已确认的失效点。
+
+| # | 正文中的旧说法 | 当前代码事实（证据：`service/base/EmailCodeService.java`） |
+|---|---|---|
+| 1 | 4.4 称「同一码可消费两次 / 无限次尝试 / 本文给出修复 Lua，代码未改」，并建议复用 `util/RedisScripts.java` | ✅ 已修复：4 段**本类内联** Lua `ISSUE`/`VERIFY`/`CLEANUP`/`COMPLETE`（`:35-69`）；`VERIFY` 用 `:claim` 一次性消费、比对失败计数且**第 5 次错误即 `DEL` 验证码**（`:47-52`）。脚本**不在** `RedisScripts.java`，复用建议无效应删 |
+| 2 | 二章 key 表只有 2 个 key、三章五步「冷却检查→生成→写码→写冷却→发信」 | 实际 5 个 key：`codeKey` / `cooldownKey` / `:attempts` / `:owner` / `:claim`（`:89,111,151`）；`ISSUE` 一次 Lua 原子写完冷却与码 |
+| 3 | 冷却 key 期望占位值 `"1"`，`GET auth:email_code:cd:...` 验证命令 | 值是 `issueId`(UUID)（`:82,89-90`），`CLEANUP` 按 issueId 归属清理；旧验证期望必然失败 |
+| 4 | 4.2/六-3「并发重复发送窗口、没有 `setIfAbsent`」、4.3 两条 `redisTemplate.delete` 回滚 | `ISSUE` Lua 内 `EXISTS` + 三条 `SET` 原子闭合（`:35-42`）；事务内 reserve 写 `:claim`（`:54-56`）、`afterCompletion` 提交删除/回滚释放（`:113-123`）、邮件失败按 issueId 清 3 个 key（`:146-152`） |
+| 5 | 「`java.util.Random`、换 `SecureRandom` 是零成本改进」；并发消费验证「两个都成功 → 即缺陷」 | 已用 `SecureRandom`（`:15,34,81`）；并发消费结果确定是**一个成功、一个 400**（`SecurityRedisIntegrationTest:47-56`），旧复现步骤不再成立 |
+
+> 双 key TTL 表达「有效期」与「发送冷却」的业务语义推导**完全保留**；以下是当前实现与旧断言的差异。
+
+| 项 | 当前实现 |
+|---|---|
+| 冷却 key 的值 | **`issueId`（UUID）**，不是 `"1"`；`GET` 期望是 UUID，用于 `CLEANUP` 的归属校验（只清理本次发送的状态） |
+| 附属 key | 新增 `:attempts`（5 次错误上限）、`:owner`、`:claim`（事务内预留） |
+| 四段内联 Lua | `service/base/EmailCodeService.java` 内就地声明 `ISSUE`（签发 + 冷却）、`VERIFY`（校验 + 计数 + reserve）、`CLEANUP`（按 issueId 归属清理）、`COMPLETE`（提交后消费 / 回滚释放）。**不在 `RedisScripts.java`** |
+| 随机数 | `SecureRandom`，不再是 `java.util.Random` |
+| 事务两阶段 | 注册/重置密码在 DB 事务内 `claim/reserve`，**提交后才删除**验证码；不是「校验成功立即失效」，也不是「两条 `DELETE` 回滚」 |
+| 缺陷状态 | 「同一码可消费两次」「无限次尝试」「并发重复发送窗口」✅ **全部已修复**（`SecurityRedisIntegrationTest` 断言一个成功、一个 400，5 次错误后失效） |
+
+**验证命令修订**：`redis-cli GET` 冷却 key 期望 UUID；并发消费期望「一个成功、一个 400」。旧竞态推演保留作「改造前对照」。详见 [`../agent/03-security-and-boundaries.md`](../agent/03-security-and-boundaries.md)。
 
 ---
 

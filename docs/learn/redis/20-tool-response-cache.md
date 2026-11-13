@@ -1,8 +1,85 @@
-# 工具调用结果缓存：callId 为 key 的三级缓存
+# 工具调用结果缓存：`chat:tool:v2:{chatId}:{callId}` 两级辅助索引
 
 > **Redis 考点**：以业务唯一 ID 为 key 缓存不可变的大对象；滑动过期（读取即续期）；`set` 与 `setIfAbsent` 在幂等语义上的差别。
 > **来源**：`docs/01-redis-application-points.md` 第一节（工具调用结果缓存）、第三节第 1 条（现存缺陷）
-> **完整路径**：`src/main/java/com/fancy/taxiagent/agentbase/memory/ToolResponseMemory.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/agentbase/memory/ToolResponseMemory.java`、`MessageParser.java`、`MessageWindow.java`、`agentbase/tool/ToolRepPointerTool.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现总览】（先看这一节，再读下方改造前推导）
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇一～五、七章写于「工具结果指针化 + L1/L2/L3 三级 + 滑动过期」的改造前版本，**作为推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实（`agentbase/memory/ToolResponseMemory.java`） |
+|---|---|---|
+| 1 | 七章全部 `redis-cli` 命令基于 `tool:{callId}`，并验证「读命中续期 / 滑动过期」 | 当前 key 是就地拼的 **`chat:tool:v2:{chatId}:{callId}`**（`:39,41`），TTL **24h（86400）且读不续期**。命令应改为 `redis-cli --scan --pattern "chat:tool:v2:*"`、`GET chat:tool:v2:{chatId}:{callId}`、`TTL ...`（期望 ≤86400，读后不回满），删除全部滑动过期步骤 |
+| 2 | 一/二/三章「指针化 + 三级缓存 + `heapCache` + `DEFAULT_TOOL_CACHE_TTL`」为当前实现 | 均为改造前：历史消息中的 TOOL 响应**保存全文**（`MessageParser.java:56-74`），`ToolResponseMemory` 只是 Redis + MySQL **两级辅助索引**（save 先 MySQL 后 Redis，`:21-25`） |
+| 3 | `ToolRepPointerTool.getToolResponse(callId)` 单参反查 | 反查按 **`call_id + chat_id` 双条件**（`:32-34`），仅 chatId 不匹配不能反查 —— 这是与 `assertOwned` 并列的第二道跨会话隔离防线 |
+| 4 | 延伸阅读链接 `../README.md` | 指向不存在的 `docs/learn/README.md`；术语规范在 **`./README.md`**（`docs/learn/redis/README.md`） |
+
+### 1. 业务背景与问题定义
+
+一次工具调用（天气、路径规划、订单查询）可能返回很大的 JSON。把整段结果反复塞进模型上下文会撑爆 token，于是系统需要「按业务 ID 存一份、需要时再反查」。这里要澄清一句最容易误读的结论：**「工具结果指针化」并没有被取消** —— `agentbase/tool/ToolRepPointerTool.java` 的 `getCalling` 工具、`recordCalling`、`config/ChatProperties.java` 里「依赖历史工具结果必须先调 `getCalling` 反查」的提示词契约、三个 Agent 的 `getCalling` 分支都完整存在。真正变的是**历史消息的形状**：
+
+- 改造前：TOOL 消息只留 `call_id` 指针；
+- 当前：`agentbase/memory/MessageParser.java` 的 TOOL 分支把 `responseData()` **全文写入历史**，`ToolResponseMemory` 从「三级主缓存」退化为 **Redis + MySQL 两级的辅助反查索引**。
+
+所以正确表述是「**全文持久化 + 两级辅助索引**」二分，而不是「指针化已取消」。
+
+### 2. 架构与依赖关系
+
+```mermaid
+flowchart LR
+    A[Agent 需要历史工具结果] --> B["ToolRepPointerTool.getCalling(callId, chatId)"]
+    B --> C["chatManager.assertOwned(userId, chatId)"]
+    C --> D["ToolResponseMemory.get(callId, chatId)"]
+    D --> E["Redis: chat:tool:v2:{chatId}:{callId} (24h)"]
+    D --> F["MySQL: sys_chat_tool_repsonse<br/>orderByDesc(id) LIMIT 1"]
+    G["工具执行完成 / MessageParser TOOL 分支"] --> H["ToolResponseMemory.save(chatId, callId, data)"]
+    H --> F
+    H --> E
+```
+
+落点：`agentbase/memory/ToolResponseMemory.java`（约 44 行）、`MessageParser.java`、`MessageWindow.java`、`agentbase/tool/ToolRepPointerTool.java`、`agentbase/chatinfo/ChatManager.java`。
+
+### 3. 完整执行链与关键源码
+
+**写入**（`ToolResponseMemory.save`，顺序与旧版相反）：
+
+```java
+// 先 MySQL（持久化权威），再 Redis（快速反查）
+chatToolResponseMapper.insert(new ChatToolResponse(chatId, callId, response));
+try {
+    stringRedisTemplate.opsForValue().set(cacheKey(chatId, callId), response, TTL);  // TTL = Duration.ofHours(24)
+} catch (RuntimeException e) { log.warn("工具结果缓存写入失败，MySQL 仍可反查", e); }
+```
+
+**读取**（`ToolResponseMemory.get(callId, chatId)`）：先 Redis，命中**直接 return，固定 24h TTL 不续期**（没有滑动过期）；未命中回 MySQL 按 `orderByDesc(id) LIMIT 1` 取最新一行；读异常 catch 后降级返回 `null`。`ToolRepPointerTool.getCalling` 在调 `get` 之前会 `chatManager.assertOwned` 校验会话归属，防止用别人的 `callId` 跨会话读数据。
+
+**key 形态**：`chat:tool:v2:{chatId}:{callId}` 在 `ToolResponseMemory.cache()` 内**就地拼接**；旧常量 `RedisKeyConstants.TOOL_RESPONSE_KEY = "tool:"` 与 `toolResponseKey(callId)` 现在是 **0 调用方的死代码**，不要照着它去 `KEYS tool:*`。加 `chatId` 这一层是跨会话隔离：同一个 `callId` 在不同会话里不应互相命中。
+
+### 4. 底层原理与设计决策
+
+- **为什么先 MySQL 后 Redis**：工具结果是审计与恢复的依据，Redis 只是加速。反序写（先 Redis）会在 DB 失败时留下「缓存里有、库里没有」的幽灵结果。
+- **为什么固定 TTL 而不是滑动续期**：结果不可变且只在相近的几轮对话里被反查，读一次就把 TTL 刷回 24h 会让冷数据长期驻留；统一 24h 也便于容量估算。
+- **为什么保留 `set` 而不是 `setIfAbsent`**：这是本文第五章保留的**优质反例**。重复的 tool call 会覆盖 Redis 值，且 MySQL 每次 `insert` 新行（表上无唯一索引），靠取最新行掩盖重复 —— 语义上不是幂等。改成 `setIfAbsent` + 唯一索引是**可选优化**，当前未实现。
+- **替代方案对比**：① 只存指针（旧）→ 历史恢复时无法重建完整上下文；② 全文入历史 + 两级索引（当前）→ 上下文可控且可回放；③ 直接用对象存储/ES → 多一次网络依赖，对本项目的小结果不划算。
+
+### 5. 完整示例
+
+输入：用户问「刚才那条路线多少钱」→ 模型调 `getCalling(callId="t-9f", chatId="c-1")`。
+中间状态：`assertOwned` 通过 → Redis `GET chat:tool:v2:c-1:t-9f` 命中（TTL 约 80000s，读后**不回满 86400**）→ 返回完整 JSON。
+异常路径：Redis 未命中 → MySQL 查到 2 行（重复 save 造成）→ 取 `id` 最大的一行；若都不存在，`get` 返回 `null`，模型按提示词要求不得编造。
+
+### 6. 边界、常见问题与面试延伸
+
+| 问题 | 当前答案 |
+|---|---|
+| `MessageWindow.tail` 为什么相关 | 历史截取必须保持完整工具调用批次；它拒绝孤立的 `ToolResponseMessage`，损坏历史从下一个用户轮恢复（见 [19 篇](19-multi-level-cache.md)） |
+| 旧「三级缓存 / 滑动过期 / `DEFAULT_TOOL_CACHE_TTL` / `heapCache`」 | 均已删除；正文一/二/四/七章保留作改造前对照 |
+| 跨会话越权 | `getCalling(callId, chatId)` 双参 + `assertOwned`，单参版本已废弃 |
+| 面试追问 | 「为什么不用 `setIfAbsent`？」→ 当前实现有重复行与覆盖，第五章的推导就是答案；「Redis 挂了怎么办？」→ MySQL 仍可反查；「为什么要 chatId？」→ 隔离与归属校验 |
 
 ---
 
@@ -270,8 +347,10 @@ redis-cli DEL tool:{callId}
 
 ## 八、延伸阅读
 
-- [`19-multi-level-cache.md`](19-multi-level-cache.md) —— 会话历史的三级缓存；对照看"读时续期"与"写时续期"的两种 TTL 策略
+- [`19-multi-level-cache.md`](19-multi-level-cache.md) —— 会话历史 L1/L2/L3 的分层读取与 Lease 回填；对照「版本 key `PERSIST`」与本篇「固定 24h TTL」两种 TTL 策略（旧「三级缓存两种写法」的说法已过时）
 - [`09-lease-token.md`](09-lease-token.md) —— 回填覆盖数据的另一种解法（版本号 + 原子校验）
-- [`../01-redis-application-points.md`](../../01-redis-application-points.md) —— P2 的「接口幂等」条目与第三节第 1 条的缺陷描述
+- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— 当前 22 个主脚本 + 11 个内联脚本的速查表
+- [`README.md`](README.md) —— 术语与状态标注规范
+- [`../01-redis-application-points.md`](../../01-redis-application-points.md) —— P2 的「接口幂等」条目与第三节第 1 条的缺陷描述（已补 MySQL 重复行）
 - [`../02-cache-consistency-race.md`](../../02-cache-consistency-race.md) —— 缓存一致性问题在本项目的总体盘点
 - Redis 官方文档：[SETNX / SET NX](https://redis.io/commands/set/)、[EXPIRE 的语义](https://redis.io/commands/expire/)

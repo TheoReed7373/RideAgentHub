@@ -2,7 +2,47 @@
 
 > **Redis 考点**：Cache-Aside 下「读线程回填覆盖了写线程的删除」这一经典竞态，以及用**第二次延迟删除**兜住窗口的做法 —— 连同它「sleep 多久靠猜」的固有缺陷。
 > **来源**：`docs/02-cache-consistency-race.md` 2.1；`docs/02` 第四节演练顺序第 1–2 步
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/impl/TicketServiceImpl.java`、`src/main/java/com/fancy/taxiagent/service/base/DelayedCacheEvictor.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/impl/TicketServiceImpl.java`、`src/main/java/com/fancy/rideagenthub/service/base/DelayedCacheEvictor.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文与 `文件:行号` 写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 一章 `afterTicketMutation` 代码块是**先 `evictTicketStatistics` 再注册索引失效**的旧顺序 | 当前 `TicketServiceImpl.java:1213-1219` 是 `afterTicketMutation()` 同时注册「统计缓存延迟双删」与「工单池索引失效」，第一次删在 `afterCommit`；读代码时以 `evictTicketStatistics():1236-1250` 为准 |
+| 2 | 4.5 四个设计点（「项目当时没有开启 `@EnableScheduling`」、成功 debug 日志、`key.isBlank()` 参数校验、「全类 80 行」） | `DelayedCacheEvictor.java` 现 56 行、字段初始化守护单线程、`@PreDestroy` + `awaitTermination(5s)`，**无参数校验、无成功日志，异常只 `log.warn`**；启动类 `RideAgentHubApplication.java:8` 有 `@EnableScheduling`，与延迟双删并存而非互斥 |
+| 3 | 缺「第二次删除不保证执行」的边界 | 单线程 daemon 调度 + 无重试 + 进程重启丢任务 ⇒ 第二次删除是**尽力而为**；脏窗口最终靠统计缓存 20~30 秒 TTL 收敛，而不是靠删除一定成功。这是延迟双删与 Lease 令牌（09 篇）的能力边界差异 |
+
+### 4.6 事务回调统一模式：五篇对照（补充）
+
+| 篇 | 触发点 | 回调类型 | 回滚行为 | 失败降级 |
+|---|---|---|---|---|
+| [07](07-delayed-double-delete.md) | `TicketServiceImpl.afterTicketMutation` | `afterCommit` 第一次删 + `DelayedCacheEvictor` 500ms 第二次删 | 回滚则不失效 | 只 `log.warn`，靠短 TTL 收敛 |
+| [14](14-grab-order-lua.md) | `OrderGrabService.tryGrab` | `afterCommit` 同步状态、`afterCompletion` 调 `rollbackGrab` | 回滚删占位、恢复 `__IDLE__` | `RELEASE_LOCK_IF_MATCH` 原子 CAS |
+| [15](15-nearby-order-geo.md) | `OrderGeoPool.add` | `afterCommit` 才 `INVALIDATE` 整池 | 回滚不发布 | `isCurrent` 失败整页降级 DB |
+| [17](17-order-timeout-delay-queue.md) | `OrderDelayQueue.schedule/cancel` | `afterCommit` 入队/取消 | 回滚不入队 | 60 秒 DB 补偿扫描兜底 |
+| [23](23-ticket-pool-zset.md) | `TicketPoolIndex` 失效 | `afterCommit` 换版本 + `DEL` | 回滚不失效 | 下一次读经重建锁重建 |
+
+共同点：**Redis 副作用一律不早于 DB 提交**。事务回滚时缓存操作必须能被撤销或本身不发生，否则 DB 与缓存会出现「业务没改、缓存已改」的幽灵状态。
+
+> 500ms 双删的竞态时序推导**完整保留**；以下是当前代码与本页原描述的差异。
+
+| 项 | 当前实现 |
+|---|---|
+| 顺序 | `TicketServiceImpl.afterTicketMutation()` **先注册 `afterCommit(() -> ticketPoolIndex.syncByTicketId(...))`，再 `evictTicketStatistics()`** —— 与原文顺序相反。注释说明「统计缓存删除失败不阻止索引版本推进」，这是刻意的容错顺序 |
+| 第一次删除 | 包在 `try/catch(RuntimeException)` 里，失败只 `log.warn`；无论成败都调度 `DelayedCacheEvictor` 的 500ms 二次删除 |
+| `DelayedCacheEvictor` | 当前 56 行，字段初始化 `executor`（不是构造器建 `scheduler`）；一行类注释、无成功 debug 日志、`catch RuntimeException`、`shutdown` 带 `awaitTermination(5s)`；启动类 `RideAgentHubApplication` 已 `@EnableScheduling`，自建守护调度器与 Spring 调度器并存、互不干扰 |
+| 行号 | `getTicketStatistics` 约 `:1135-1171`、失效与回调约 `:1213-1267`，旧行号作废 |
+
+### 事务回调统一模式（07 / 14 / 15 / 17 / 23 篇的共同前置）
+
+工单统计与索引、GEO 池、延迟队列、抢单占位**统一**采用「**提交后生效、回滚不发布**」：`TransactionSynchronization.afterCommit()` / `afterCompletion()` 里才写缓存、发布索引或排期；缓存同步失败只记日志，不影响已提交的业务。理解这一点，才能解释为什么 `GeoPoolRegressionTest` / `CacheConsistencyRegressionTest` 里「回滚后索引不变」是预期行为。
+
+**验证修订**：观察提交后 500ms 内 key 被二次删除；回滚时 `ticket:pool:version` 不应递增。详见 [`23-ticket-pool-zset.md`](23-ticket-pool-zset.md)、[`15-nearby-order-geo.md`](15-nearby-order-geo.md)。
 
 ---
 

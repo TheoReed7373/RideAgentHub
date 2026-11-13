@@ -2,7 +2,33 @@
 
 > **Redis 考点**：Redisson `RBloomFilter` 前置拦截「一定不存在」的查询，避免为不存在的数据反复回源 DB（缓存穿透）；并解释「误判方向为什么是安全的」。
 > **来源**：`docs/01-redis-application-points.md` 一、现状盘点（「缓存穿透（布隆过滤器）」）与三、现存缺陷 2/3
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/base/UserUsernameBloomFilterService.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/UserUsernameBloomFilterService.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文与验证命令写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。下表是已确认的失效点。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 「不产生任何 SQL」、`mightContain` 是唯一查询调用方、`if (!mightContain(...)) return true;` 代码块、验证第 2 条「不应产生 SELECT」 | `AuthServiceImpl.isUsernameAvailable` **直查 DB**（`:258-268`），`mightContain` 生产 0 调用方 —— 布隆已退出可用性主链路，变成「只写不读」 |
+| 2 | 「`sys_user` 没有 username 唯一索引 → 会落库两个同名用户」「注册只校验邮箱、不校验用户名」 | `sql/init.sql:13-17` 有生成列 `active_username` + `uk_active_username_role` 唯一索引，注册前置校验返回 409（`AuthServiceImpl:81`）；重建期假阴性**不再**导致重名落库 |
+| 3 | 验证命令 3「重建期间查询已注册用户名 → 可能返回 true → 即缺陷」 | 直查 DB 结果恒定，无法复现；`rebuild()` 仍是 `delete()` + `tryInit()` + 逐条 `add` 的原地重建（`UserUsernameBloomFilterService.java:41-61`），**❌ 仍存在但后果已变** |
+| 4 | 缺「布隆当前定位」的原理 | 逻辑删除把生成列置 NULL 才能释放用户名；`POST /user/rebuild` 需 `ADMIN`（`UserController.java:162-167`）。真正裁决唯一性的是 DB 唯一索引，布隆不再是正确性依赖 |
+
+> 布隆过滤器的误判方向、容量/误判率推导、双 key 切换建议**全部保留**；以下事实已变。
+
+| 项 | 当前实现 |
+|---|---|
+| 主链路 | `UserUsernameBloomFilterService.mightContain` 在生产代码 **0 调用方**（已退出可用性主链路）；`AuthServiceImpl.isUsernameAvailable` **直查 DB**，注册前置还会校验用户名。旧「不产生任何 SQL」「唯一查询调用方」❌ 已过时 |
+| 仍在使用的部分 | `addUsername`（注册时加入）与 ADMIN `POST /user/rebuild` 全量重建 |
+| 唯一索引 | `sql/init.sql` 有生成列 + `uk_active_username_role`（同角色、未删除账号唯一），`sql/migrations/20261113_security_consistency.sql` 是旧库升级路径；并发注册由 DB 索引裁决 |
+| 缺陷状态 | `rebuild()` 仍是 `delete()` + `tryInit()` 原地重建 ❌ **仍存在**；但后果已从「落库两个重名用户」变为「**重建期假阴性**」，由唯一索引与直查 DB 兜底 |
+| 双 key 切换 | 仍是**可选优化**（当前未实现），原文建议保留作方案对比 |
+
+**面试追问**：「布隆过滤器还有用吗？」→ 它不再是可用性判断的必经路径，只剩注册写入与 ADMIN 重建；正确性的兜底是 DB 唯一索引。详见 [`../agent/03-security-and-boundaries.md`](../agent/03-security-and-boundaries.md)。
 
 ---
 

@@ -2,13 +2,42 @@
 
 > **Redis 考点**：从「`SET NX` 加锁 + `DEL` 解锁」这个看似两行就能写完的东西出发，逐个看清它能出的三类事故（误删他人锁、锁提前过期、无法重入），再看 Redisson 的 `RLock` 是如何用「Hash + 令牌 + 看门狗」把它们一次性补齐的。
 > **来源**：`docs/01-redis-application-points.md` P1-2；`docs/02-cache-consistency-race.md` 3.2
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/base/RedisLock.java`（72 行）、`src/main/java/com/fancy/taxiagent/util/RedisScripts.java:53-59`、`src/main/java/com/fancy/taxiagent/service/impl/RideOrderServiceImpl.java:388-409`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/RedisLock.java`（历史快照 72 行；当前 42 行）、`util/RedisScripts.java`、`service/impl/RideOrderServiceImpl.java`（`withOrderLock`）
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照 / 本篇勘误】（2026-11-13 代码反向复核）
+
+> 本篇 4.2/4.3/五/六/七章的显式租约推导写于改造前版本，**已作为历史对照保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实（`service/base/RedisLock.java` 现 42 行） |
+|---|---|---|
+| 1 | 4.3「类注释（`RedisLock.java:21-26`）把局限明写了出来，这是很诚实的做法」 | 该类现仅 `:13` 一行注释，`:21-28` 是 `tryLock`、`:31-41` 是 `unlock`。应读作「**旧版类注释曾明写**」；下方 4.3 两节的理论根基（不可重入、无续期、无等待重试）按当前 `setIfAbsent` + 固定 TTL 实现**依然成立** |
+| 2 | 4.2 第 3 点「`unlock` 把返回值 0 转换成 `false`（`RedisLock.java:70`），调用方可据此打日志」 | 当前 `unlock` 是 **`void`**（`:31-41`），执行 `RELEASE_LOCK_IF_MATCH` 且不返回值；异常只 `log.warn` 由 TTL 兜底。该「可观测性设计」属于**改造前**，当前没有等价信号 |
+| 3 | 4.2 引用的 `RedisLock.java:53/54` 行号 | 当前 `UUID` 令牌生成在 `:26`、`setIfAbsent` 在 `:27`；「`SET NX EX` 单条命令原子」的原理不变 |
+| 4 | 七-2 验证已改成看门狗正例 | 原「显式租约」反例被删除，按原文保护原则恢复在下方，与看门狗验证并列 |
+
+### 【原文恢复】改造前验证：显式租约不续期
+
+> 按 `git show HEAD:` 的验证思路恢复。它证明的不是「看门狗好」，而是「**同一种现象，两种实现会给出相反预期**」，是理解 `leaseTime` 语义的关键对照。
+
+```bash
+# 改造前实现（显式 10 秒租约）：业务未结束时观察订单锁 TTL
+redis-cli TTL order:lock:{orderId}
+# 期望：TTL ≤ 10，等待 5 秒后 TTL 应继续下降而**不会**被续回 10
+#   → 说明传了显式 leaseTime，Redisson 不启用看门狗
+# 当前实现：tryLock(3, TimeUnit.SECONDS) 不传 leaseTime，TTL 会被看门狗续回
+#   → 两组期望互斥，实机观察哪一个成立即可判断当前分支走的是哪条路径
+```
+
+**为什么值得保留**：显式租约的风险是「临界区超过 10 秒 → 锁提前释放 → 第二个请求进入」，看门狗用后台续期消除了它；代价是如果业务流永不终止且释放路径失效，锁也不会因 TTL 消失。这正是 [12 篇](12-chat-lock-atomic.md) 里 `chat:execution:{chatId}` 单轮锁必须依赖 `doFinally` 的原因。
 
 ---
 
 ## 一、业务场景
 
-项目里**两把锁并存**，这是有意为之 —— `RedisLock` 的类注释（`:16-20`）写明了分工：
+项目里**两把锁并存**，这是有意为之。旧版 `RedisLock` 有一段长类注释（`:16-20`）写明分工，**当前类只有一行注释、这段长注释已删除**；分工本身仍成立，作为历史材料保留：
 
 ```java
 本类刻意保持"手写"实现，与 Redisson 的 {@code RLock} 并存：
@@ -19,8 +48,10 @@
 
 | 用在哪 | 实现 | 临界区特征 |
 |---|---|---|
-| **订单状态机**（抢单/到达/开始行程/结束行程/取消） | Redisson `RLock` | 读-判-写跨度长，包含多次 DB 往返、外部 API 调用；需要等锁与重试 |
-| **缓存 / 索引重建**（工单统计、订单地理池、工单池索引） | 手写 `RedisLock` | 毫秒级短临界区（回表 + 写缓存）；失败可以直接降级直查 DB |
+| **订单状态机**（抢单 / 到达 / 开始行程 / 结束行程 / 支付 / 取消 / 超时处理，共 **7 处**） | Redisson `RLock`（**当前启用看门狗**，见 4.3 反转说明） | 读-判-写跨度长，包含多次 DB 往返、轨迹写入；需要等锁与重试，锁竞争直接 409 且不触碰业务 |
+| **缓存 / 索引重建**（工单统计、订单地理池、工单池索引） | 手写 `RedisLock`（固定 5s / 10s TTL） | 毫秒级短临界区（回表 + 写缓存）；失败可以直接降级直查 DB |
+
+> 【最重要的结论反转】本文 4.3、4.4.2、五章、6.3、七章写的是「订单锁用显式 10 秒租约、**刻意不用看门狗**」，那是改造前实现。当前 `RideOrderServiceImpl.withOrderLock` 调的是 **`lock.tryLock(3, TimeUnit.SECONDS)` 两参数版本（不传 leaseTime）→ 启用 Redisson 看门狗续期**，注释写明「使用看门狗续期以覆盖慢查询和轨迹写入」；`ORDER_LOCK_LEASE_SECONDS` 常量已删除。原文关于「为什么当时不用看门狗」的推导很有价值，**保留作历史对照**，但不能再当作现状。
 
 ### 1.1 为什么订单状态机需要锁
 
@@ -39,7 +70,7 @@
 
 | Key | 结构 | TTL | 谁在用 | 语义 |
 |---|---|---|---|---|
-| `order:lock:{orderId}` | String（Redisson 内部为 Hash） | 10 秒租约（`RideOrderServiceImpl.java:85`） | Redisson `RLock` | 订单状态机互斥 |
+| `order:lock:{orderId}` | **Hash**（Redisson `RLock`，不是 String） | **看门狗续期**：初始约 30 秒，业务未结束由后台任务定期续回；`ORDER_LOCK_LEASE_SECONDS` 已删除 | Redisson `RLock` | 7 个订单状态变更统一互斥 |
 | `ticket:statistics:lock:{yyyyMMdd}` | String | 5 秒（`TicketServiceImpl.java:79`） | 手写 `RedisLock` | 工单统计缓存重建 |
 | `order:geo:pool:rebuild:lock` | String | 10 秒（`OrderGeoPool.java:76`） | 手写 `RedisLock` | 待接单订单地理池重建 |
 | `ticket:pool:rebuild:lock:{statusCode}` | String | 10 秒（`TicketPoolIndex.java:61`） | 手写 `RedisLock` | 工单池 ZSet 索引重建 |
@@ -52,19 +83,19 @@ Key 前缀都收在 `RedisKeyConstants`（`ORDER_LOCK_PREFIX` 在 `:178`、`orde
 
 ## 三、代码落点
 
-| 位置 | 内容 | 状态 |
+> 原表是 `文件:行号`，当前一律按类名 + 方法名定位。
+
+| 位置（当前） | 内容 | 状态 |
 |---|---|---|
-| `RedisLock.java:49-56` | `tryLock`：`setIfAbsent(key, token, ttl)` + 校验 | — |
-| `RedisLock.java:65-71` | `unlock`：走 `RELEASE_LOCK_IF_MATCH`（`execute` 在 `:69`） | ✅ 已修复（原为无条件 `DEL`） |
-| `RedisLock.java:22-26` | 类注释里明写的两点局限：**不可重入 / 没有续期** | 现存局限（有意的取舍） |
-| `RedisScripts.java:53-59` | `RELEASE_LOCK_IF_MATCH` Lua 本体 | ✅ 已落地 |
-| `RideOrderServiceImpl.java:388-409` | `withOrderLock`：Redisson `RLock` 的加解锁模板 | — |
-| `RideOrderServiceImpl.java:75` / `:85` | `ORDER_LOCK_WAIT_SECONDS = 3L` / `ORDER_LOCK_LEASE_SECONDS = 10L` | — |
-| `RideOrderServiceImpl.java:327` / `:433` / `:464` / `:515` / `:669` | 五处 `withOrderLock` 调用（抢单 / 到达 / 开始行程 / 结束行程 / 取消订单） | — |
-| `TicketServiceImpl.java:1227-1229` / `:1237-1239` | `tryLockTicketStatistics` / `releaseTicketStatisticsLock` 两个薄封装 | ✅ 已迁移到 `RedisLock` |
-| `TicketServiceImpl.java:1090-1126` | `getTicketStatistics`：拿锁 → 双检 → 回表 → 写缓存 → 释放；失败重试 3 次后降级 | ✅ 原 3.2 缺陷已消除 |
-| `OrderGeoPool.java:206-226` | `ensureWarm`：重建锁 + 双检（`tryLock:212`、`unlock:224`） | ✅ 用 `RedisLock` |
-| `TicketPoolIndex.java:170-191` | `ensureWarm`：同上（`tryLock:177`、`unlock:189`） | ✅ 用 `RedisLock` |
+| `service/base/RedisLock.tryLock(key, ttl)` | `setIfAbsent(key, token, ttl)`；**参数非法抛 `IllegalArgumentException`**（不再是返回 `null`） | 当前实现 |
+| `RedisLock.unlock(key, token)` | **返回 `void`**，走 `RELEASE_LOCK_IF_MATCH`，吞掉释放异常；失败由固定 TTL 兜底 | 当前实现 |
+| `RedisLock` 类注释 | 只剩一行；旧长注释里「不可重入 / 没有续期」的描述已删（能力局限本身仍在） | 历史 |
+| `util/RedisScripts.RELEASE_LOCK_IF_MATCH` | Lua 本体，`GET == ARGV[1]` 才 `DEL` | ✅ 已落地 |
+| `service/impl/RideOrderServiceImpl.withOrderLock` | `lock.tryLock(3, TimeUnit.SECONDS)`（**两参数，启用看门狗**）；锁竞争/中断抛 409；持锁到 `TransactionSynchronization.afterCompletion`；`releaseOrderLock` 吞掉解锁异常 | 当前实现（结论反转） |
+| `RideOrderServiceImpl` **7 处**状态变更 | `driverAcceptOrder`、`driverArriveStart`、`startRide`、`finishRide`、`payOrder`、`cancelOrder`、`handleTimeoutOrder` 统一走 `withOrderLock`；锁竞争 409 时**不触碰** Mapper / 延迟队列 / 缓存 | 当前实现 |
+| `service/impl/TicketServiceImpl.getTicketStatistics` | 手写锁 5s + 双检 + 3×60ms 有限重试 + 降级直查 DB | 当前实现 |
+| `service/base/OrderGeoPool.search` / `TicketPoolIndex.slice` | 手写锁 10s；**`ensureWarm` 方法已删除**，改为「读 `ready` → 未命中抢重建锁 → 全量回表 → `PUBLISH_*` Lua 校验版本与锁令牌后原子发布」 | 当前实现 |
+| `service/base/OrderGrabService.syncOrderStatus` | `SYNC_ORDER_STATUS` Lua 保证状态单调推进；数值回退必须先删缓存 key | 当前实现 |
 
 **关于 `docs/02-cache-consistency-race.md` 3.2 记的那个缺陷**：原文引用的是 `TicketServiceImpl:1005` 的 `finally { stringRedisTemplate.delete(lockKey); }` —— **无条件删除，不校验持有者**。现在全项目已经**没有任何** `delete(lockKey)` 这类裸删（也没有第二处 `setIfAbsent`），所有手写锁都收口到 `RedisLock`，`TicketServiceImpl:1238` 走的是 `redisLock.unlock(lockKey, token)`。**这一条已修复。**
 
@@ -121,20 +152,20 @@ end
 
 「读回 → 比对 → 删除」三步合并在一次脚本执行里完成（原子性原理见 [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) 4.1）。
 
-Java 侧的两半：
+Java 侧的两半（**改造前**，保留作对照）：
 
 ```java
-// RedisLock.java:49-56 —— 加锁时写入唯一令牌
+// 旧版 tryLock：参数非法返回 null（与竞争失败同值）
 public String tryLock(String key, Duration ttl) {
     if (key == null || key.isBlank() || ttl == null || ttl.isNegative() || ttl.isZero()) {
         return null;
     }
-    String token = UUID.randomUUID().toString();                    // :53  ← 令牌
+    String token = UUID.randomUUID().toString();
     Boolean locked = redisTemplate.opsForValue().setIfAbsent(key, token, ttl);
-    return Boolean.TRUE.equals(locked) ? token : null;              // :55
+    return Boolean.TRUE.equals(locked) ? token : null;
 }
 
-// RedisLock.java:65-71 —— 解锁时带令牌
+// 旧版 unlock：返回 boolean，把 Lua 的 0/1 上浮给调用方
 public boolean unlock(String key, String token) {
     if (key == null || key.isBlank() || token == null) {
         return false;
@@ -143,6 +174,29 @@ public boolean unlock(String key, String token) {
     return released != null && released > 0;
 }
 ```
+
+> 【当前实现】`service/base/RedisLock.java` 现在只有 42 行、一行类注释，行为有三处变化：
+>
+> ```java
+> public String tryLock(String key, Duration ttl) {
+>     if (key == null || key.isBlank() || ttl == null || ttl.isNegative() || ttl.isZero()) {
+>         throw new IllegalArgumentException("锁参数非法");   // 不再把参数错误伪装成竞争失败
+>     }
+>     String token = UUID.randomUUID().toString();
+>     Boolean locked = stringRedisTemplate.opsForValue().setIfAbsent(key, token, ttl);
+>     return Boolean.TRUE.equals(locked) ? token : null;
+> }
+>
+> public void unlock(String key, String token) {
+>     try {
+>         stringRedisTemplate.execute(RedisScripts.RELEASE_LOCK_IF_MATCH, List.of(key), token);
+>     } catch (RuntimeException e) {
+>         log.warn("释放锁失败，等待固定 TTL 兜底: key={}", key, e);   // 吞异常，void
+>     }
+> }
+> ```
+>
+> 因此本文 6.2「用返回值 `0` 当可观测信号」、6.5「参数非法与竞争失败都返回 null」两条**都已不成立**：释放失败靠固定 TTL 兜底，参数错误在开发期直接抛异常。Lua 本体（`GET == ARGV[1]` 才 `DEL`）没有变，下面 4.1 的三类事故推导原样有效。
 
 回到 4.1 的时序，t15 时刻 A 的 `DEL` 变成了：
 
@@ -179,35 +233,67 @@ String t2 = redisLock.tryLock("k", ttl);   // 返回 null ← 自己把自己锁
 
 而 Redisson 的锁底层是一个 **Hash**：field 是 `UUID:threadId`，value 是**重入计数**。同一个线程再进一次是 `HINCRBY` 而不是新建 key，`unlock` 是一次 `HINCRBY -1`，减到 0 才真正删除。这就是可重入的实现方式 —— 加锁时"判断 key 是否存在"换成了"判断 field 是否存在"。
 
-#### 局限二：没有续期 / 看门狗（`:25`）
+#### 局限二：没有续期 / 看门狗（手写锁固有；**订单锁已反转**）
+
+> 【当前实现 · 结论反转】下面写的「项目刻意没用看门狗」是**改造前**取舍。当前 `RideOrderServiceImpl.withOrderLock` 调 `lock.tryLock(3, TimeUnit.SECONDS)` —— **两参数版本不传 leaseTime，启用 Redisson 看门狗**：只要持锁线程还活着，后台任务持续续期，慢查询与 Mongo 轨迹写入不再受固定 10 秒限制；`ORDER_LOCK_LEASE_SECONDS` 常量已删除，持锁到 `TransactionSynchronization.afterCompletion`，`releaseOrderLock` 吞掉解锁异常。
+>
+> **测试实证**：`OrderGrabIntegrationTest` 把 Redisson 的 `setLockWatchdogTimeout(1500)` 调成 1.5 秒，再让临界区 `sleep(2200)`，锁仍被当前线程持有 —— 若走旧的显式租约路径，1.5 秒后锁就易主了。这是「看门狗确实生效」最直接的断言。
+>
+> 反转理由：订单状态流转包含多次 DB 往返与轨迹写入，最坏耗时不可预估；固定租约会「锁在脚下悄悄易主」。看门狗把正确性交给「线程是否还活着」这个更可靠、且可被框架观测的信号。下方旧注释及其推导保留作「为什么当时选确定性」的历史对照 —— 看门狗依赖后台线程准时、GC 停顿下续期可能跟不上这个代价**依然存在**，只是项目在「确定性 vs 覆盖慢业务」之间改选了后者。
 
 ```java
 // 没有续期：业务耗时超过 TTL 时锁会自动过期，属于"宁可不锁也不能死锁"的取舍
 ```
 
-这个取舍本身是对的（死锁比失去互斥更糟），但它把**正确性责任转移给了 TTL 的取值**。`tryLock` 的 `@param ttl` 说明写得很重：「锁的存活时长，**需大于临界区的最坏耗时**」（`:46`）。项目里给的 TTL：
+这个取舍对**手写锁**仍然成立（死锁比失去互斥更糟），但它把正确性责任转移给了 TTL 的取值。改造前项目里给的 TTL：
 
 | 锁 | TTL | 临界区内容 | 余量 |
 |---|---|---|---|
-| 工单统计重建 | 5 秒（`TicketServiceImpl.java:79`） | 4 次 `selectCount` + 写缓存 | 小 |
-| 订单地理池重建 | 10 秒（`OrderGeoPool.java:76`） | 全量 `SELECT` 待接单订单 + 批量 `GEOADD` | 中 |
-| 工单池索引重建 | 10 秒（`TicketPoolIndex.java:61`） | 全量 `SELECT` + 批量 `ZADD` | 中 |
-| 订单状态机（Redisson） | 10 秒（`RideOrderServiceImpl.java:85`） | 数次 DB 往返 | 中 |
+| 工单统计重建 | 5 秒 | 4 次 `selectCount` + 写缓存 | 小 |
+| 订单地理池重建 | 10 秒 | 全量 `SELECT` 待接单订单 + 批量 `GEOADD` | 中 |
+| 工单池索引重建 | 10 秒 | 全量 `SELECT` 批量 `ZADD` | 中 |
+| ~~订单状态机（Redisson）~~ | ~~10 秒显式租约~~ | **当前改为看门狗续期，无固定租约** | — |
 
 这四处的共同特征是：**都是"回表 + 写缓存"，都依赖 DB 的响应时间**。一旦 DB 抖动（慢查询、锁等待、连接池耗尽）超过 TTL，锁就会静默失效 —— 4.1 的时序会完整重演（只是没有 `DEL` 那一段，因为令牌比对挡住了误删）。**互斥丢了，而且没人知道。**
 
-这是手写锁 + 固定 TTL 的**固有天花板**：TTL 就是"我赌临界区不会超过这么久"。Redisson 的看门狗（watchdog）把赌注去掉了 —— 无参 `lock()` 时租约 30 秒、每 10 秒由后台任务续期一次，只要线程活着锁就不会过期。但**项目刻意没用它**，理由写在 `ORDER_LOCK_LEASE_SECONDS` 的注释里（`:80-84`）：
+这是手写锁 + 固定 TTL 的**固有天花板**：TTL 就是"我赌临界区不会超过这么久"。Redisson 的看门狗（watchdog）把赌注去掉了 —— 无参 `lock()` 时租约 30 秒、每 10 秒由后台任务续期一次，只要线程活着锁就不会过期。**旧实现刻意没用它**，理由写在当时的 `ORDER_LOCK_LEASE_SECONDS` 注释里（`:80-84`）：
 
 > 显式给租约，而不是用 Redisson 默认的看门狗续期：看门狗的意义是"业务没结束就一直续"，但它依赖后台线程按时心跳。一旦进程长时间 GC 停顿或线程饥饿，续期失败而业务仍在跑，锁会在脚下悄悄易主 —— 失败模式难以复现也难以排查。用一个明确覆盖最坏耗时的租约，至少让"锁过期"这件事是可预期的。
 
-这段取舍很有水平：**看门狗把"锁过期"从"可预期"变成了"依赖后台线程准时"**。它换来的不是免费的可靠性，而是"故障从'锁提前没了'变成'续期没跟上'"，而后者更难复现。对于毫秒级的订单状态流转，10 秒租约的余量已经足够大，此时**确定性比自动续期更值钱**。
+这段取舍本身很有水平：**看门狗把"锁过期"从"可预期"变成了"依赖后台线程准时"**。它换来的不是免费的可靠性，而是"故障从'锁提前没了'变成'续期没跟上'"，而后者更难复现。
 
-> 一句话总结这两个局限：**手写锁把"续期"和"重入"都交给了使用者的纪律**（自己保证 TTL 够长、自己保证不嵌套），Redisson 把它们变成了框架能力，代价是多一个后台线程和一层不可见的机制。
+> 【结论反转】当前项目**改选了自动续期**：`withOrderLock` 用 `tryLock(3, TimeUnit.SECONDS)` 启用看门狗，理由是订单状态流转包含慢查询与轨迹写入，固定租约的「悄悄易主」比「续期没跟上」更常见也更危险。这段旧注释仍值得读，因为它是「同一组事实、两种合理结论」的绝佳案例 —— 面试里被问「看门狗有什么缺点」，这里的分析可以原样答；被问「你们项目为什么用看门狗」，答案则是上面的慢业务覆盖与 `afterCompletion` 解锁。
+
+> 一句话总结这两个局限：**手写锁把"续期"和"重入"都交给了使用者的纪律**（自己保证 TTL 够长、自己保证不嵌套），Redisson 把它们变成了框架能力，代价是多一个后台线程和一层不可见的机制 —— 当前订单状态机接受了这份代价。
 
 ### 4.4 Redisson `RLock`：`withOrderLock`
 
+> 【当前实现】`service/impl/RideOrderServiceImpl.withOrderLock` 有两处关键变化：
+>
+> ```java
+> RLock lock = redissonClient.getLock(RedisKeyConstants.orderLockKey(orderId));
+> boolean acquired;
+> try {
+>     acquired = lock.tryLock(ORDER_LOCK_WAIT_SECONDS, TimeUnit.SECONDS);  // 无 leaseTime → 看门狗
+> } catch (InterruptedException e) {
+>     Thread.currentThread().interrupt();
+>     throw new BusinessException(409, "系统繁忙，请稍后重试");
+> }
+> if (!acquired) throw new BusinessException(409, "订单正在处理中，请稍后重试");
+> // 有事务时持锁到提交/回滚完成，无事务时立即释放
+> TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+>     @Override public void afterCompletion(int status) { releaseOrderLock(lock); }
+> });
+> return action.get();
+> ```
+>
+> 1. **不传 `leaseTime`** → Redisson 看门狗续期，覆盖慢查询与 Mongo 轨迹写入；
+> 2. **`finally` 解锁改为 `afterCompletion`** → 事务提交/回滚完成后才放锁，避免「锁已释放、事务还没提交」让下一个请求读到旧状态；`releaseOrderLock` 吞掉解锁异常，看门狗停止后续由 TTL 兜底。
+>
+> 锁竞争 409 时根本不进入 `action`，因此**不会触碰 Mapper、延迟队列、缓存**；7 个状态变更都走这个方法，锁竞争与条件更新失败都映射为 409。下方代码块是改造前实现（`tryLock(3, 10, ...)` + `finally` 解锁），保留作对照 —— 4.4.1（锁粒度）、4.4.3（409 语义）、4.4.4（持有者判断的必要性）的分析依旧成立。
+
 ```java
-// RideOrderServiceImpl.java:388-409
+// 改造前 RideOrderServiceImpl.java:388-409
 private <T> T withOrderLock(String orderId, Supplier<T> action) {
     RLock lock = redissonClient.getLock(RedisKeyConstants.orderLockKey(orderId));      // :389
     boolean acquired;
@@ -252,22 +338,24 @@ private <T> T withOrderLock(String orderId, Supplier<T> action) {
 
 **两把锁各管一段，边界清晰**：Lua 管跨维度的快速预检（无外部依赖、毫秒级、失败即拒绝），`RLock` 管单订单状态机（跨 DB 往返、需要排队）。同一路径上 `driverAcceptOrder` 两个都用（`:327` 的 `withOrderLock` 里面套 `:330` 的 `tryGrab`），这是刻意的分层而不是重复。
 
-#### 4.4.2 `tryLock(wait, lease)` 而不是 `lock()`
+#### 4.4.2 `tryLock(wait, unit)` 而不是 `lock()`（当前实现）
 
 ```java
-acquired = lock.tryLock(3, 10, TimeUnit.SECONDS);      // :392，常量在 :75 与 :85
+acquired = lock.tryLock(3, TimeUnit.SECONDS);      // 两参数版本，启用看门狗
 ```
 
 | 参数 | 值 | 语义 |
 |---|---|---|
-| `waitTime = 3s` | `ORDER_LOCK_WAIT_SECONDS`（`:75`） | 等锁上限。注释（`:69-74`）：「状态流转是毫秒级操作，等待时间只需覆盖'恰好有另一个请求正在处理同一订单'。取小值是为了让排队失败的请求尽快拿到明确回复，而不是长时间挂起」 |
-| `leaseTime = 10s` | `ORDER_LOCK_LEASE_SECONDS`（`:85`） | 显式租约。给 10 秒意味着**看门狗不生效**（见 4.3），代价与理由见 `:80-84` |
+| `waitTime = 3s` | `ORDER_LOCK_WAIT_SECONDS` | 等锁上限。取小值是为了让排队失败的请求尽快拿到明确回复，而不是长时间挂起 |
+| ~~`leaseTime = 10s`~~ | ~~`ORDER_LOCK_LEASE_SECONDS`~~ | **常量已删除**。改造前传显式租约关闭看门狗；当前不传 `leaseTime`，由看门狗续期（见 4.3 反转说明） |
 
-三件事同时被这两个参数决定了：
+三件事由参数与生命周期共同决定：
 
-1. **等锁而不是立即失败** —— 这正是 `withOrderLock` javadoc 说的"让后到的请求排在队尾、看到前一个的结果"。Redisson 的 `tryLock(wait, lease, unit)` 内部靠 pub/sub 通知 + `waitTime` 内的重试，不是空轮询。
-2. **等不到就给出明确答复** —— 见 4.4.3。
-3. **租约明确、不看门狗** —— 见 4.4.2 上一段与 4.3 的引用。
+1. **等锁而不是立即失败** —— `tryLock(waitTime, unit)` 内部靠 pub/sub 通知 + `waitTime` 内重试，不是空轮询；让后到的请求排在队尾、看到前一个的结果。
+2. **等不到就给出明确答复** —— 见 4.4.3（409「订单正在处理中，请稍后重试」）。
+3. **锁的存活与业务线程同寿命** —— 看门狗持续续期；解锁挂在 `TransactionSynchronization.afterCompletion`，事务提交/回滚完成后才放锁。旧版「租约明确、不看门狗」的结论已废弃，但 4.3 里对看门狗代价的分析仍是有效的设计对照。
+
+> 面试延伸：`tryLock(waitTime, leaseTime, unit)` 与 `tryLock(waitTime, unit)` 只差一个参数，却决定了「是否启用看门狗」。Redisson 的规则是**只有不指定 leaseTime 时才启动看门狗**；一旦显式传了租约，就用一次性 TTL 且不会续期。排查「锁为什么提前没了」时，第一件事就是看调用的是哪个重载。
 
 #### 4.4.3 等待超时 → 409
 
@@ -320,7 +408,9 @@ attempt to unlock lock, not locked by current thread by node id: <uuid> thread-i
 
 ### 4.5 手写锁在项目里的三处用法
 
-这三处的形态完全一致，可以当成一个模板来读：
+> 【当前实现】三处调用点仍在（`getTicketStatistics` 5s、`OrderGeoPool.search` 10s、`TicketPoolIndex.slice` 10s），但 **`ensureWarm` 方法已删除**：读路径改为先用 `READ_TICKET_POOL` / `SEARCH_ORDER_GEO_POOL` Lua 校验 `ready = {version}:{count}`，未命中才抢重建锁、全量回表，再由 `PUBLISH_*` Lua 校验版本与锁令牌后原子发布。下方 `ensureWarm` 代码块是改造前模板，保留它因为「快路径 / 降级 / 双检 / 带令牌解锁」这四点依然是缓存重建锁的通用范式；差异与版本令牌见 [15 篇](15-nearby-order-geo.md)、[23 篇](23-ticket-pool-zset.md)。
+
+这三处（改造前）的形态完全一致，可以当成一个模板来读：
 
 ```java
 // OrderGeoPool.java:206-226（TicketPoolIndex.java:170-191 同构）
@@ -392,7 +482,7 @@ return queryTicketStatisticsFromDb(bizDate);
 | 手写锁**不做重入** | 在 value 里存重入计数（变成 Hash） | 一旦这么改，就与 Redisson 的 `RLock` 没有区别了 —— 与其重造，不如直接用 |
 | 加锁用 `SET NX EX` 一条命令 | `SETNX` + `EXPIRE` 两条 | 两条之间存在"锁永不过期"的窗口，与 `HSET`+`EXPIRE` 是同一个坑 |
 | 解锁校验持有者（令牌比对） | 直接 `DEL` | 见 4.1/4.2 —— 这是 `docs/02` 3.2 的原始缺陷 |
-| Redisson 订单锁用**显式租约** | 无参 `lock()`（走看门狗） | 见 4.3：看门狗依赖后台线程准时，GC 停顿下"锁悄悄易主"的失败模式难复现；10 秒租约让过期可预期 |
+| **当前 Redisson 订单锁启用看门狗**（`tryLock(3, TimeUnit.SECONDS)`） | 显式 10 秒租约（改造前） | 订单状态流转含慢查询与轨迹写入，固定租约会「锁在脚下悄悄易主」；看门狗 + `afterCompletion` 解锁把锁寿命与业务线程/事务对齐。代价见 4.3 保留的旧推导 |
 | 订单锁的 `waitTime = 3s` | 0（立即失败）或 30s（长等待） | 0 会让"恰好并发"的请求报错；30s 会让用户干等。3 秒略大于"另一个请求处理同一单"的耗时 |
 | 拿不到订单锁抛 **409** | 让它去撞 DB 乐观锁 | 409 + "订单正在处理中，请稍后重试"是可重试的语义；乐观锁的"状态已变化"是不可重试且误导的语义（`:397-401`） |
 | `finally` 里判断 `isHeldByCurrentThread` | 直接 `unlock()` | 避免 `finally` 抛异常顶掉真实结果（见 4.4.4） |
@@ -406,34 +496,33 @@ return queryTicketStatisticsFromDb(bizDate);
 
 | 原缺陷（`docs/02-cache-consistency-race.md`） | 现状 |
 |---|---|
-| 3.2 `TicketServiceImpl:1005` 不校验持有者就 `delete(lockKey)` | 已收口到 `RedisLock.unlock`（`RedisLock.java:65-71`）+ `RELEASE_LOCK_IF_MATCH`。项目里已无任何裸 `delete(lockKey)`，也无第二处 `setIfAbsent` |
+| 3.2 `TicketServiceImpl:1005` 不校验持有者就 `delete(lockKey)` | 已收口到 `RedisLock.unlock`（`void` + `RELEASE_LOCK_IF_MATCH`，吞异常）+ `OrderGrabService` 回滚路径的 `afterCompletion`。项目里已无任何裸 `delete(lockKey)` |
 
 ### 6.2 ⚠️ 手写锁的固有天花板（有意的取舍，但要清楚代价）
 
-- **不可重入**（`RedisLock.java:24`）：同一个线程对同一个 key 二次 `tryLock` 会返回 `null`。当前的三处用法都是单层调用，没有踩到；但**新增调用点时这是个隐式约束**，没有任何编译期或运行期保护。降级分支（`return false` → 直查 DB）会让这个错误静默发生。
-- **租约到期即失去互斥，且无人知晓**（`RedisLock.java:25`）：TTL 是天真的赌注（`tryLock` 的 `@param ttl` 说明见 `:46`）。DB 抖动导致临界区超时的那一刻，锁静默失效，且**没有任何监控信号** —— 虽然 `unlock` 返回 `false`（`RedisLock.java:70` 的 `released > 0`）恰好可以当这个信号，但当前**调用方全部忽略了返回值**（`TicketServiceImpl.java:1238`、`OrderGeoPool.java:224`、`TicketPoolIndex.java:189` 都没接返回值）。建议至少改成打一条 warn 日志。
+- **不可重入**：同一个线程对同一个 key 二次 `tryLock` 仍会返回 `null`。当前三处用法（`getTicketStatistics`、`OrderGeoPool.search`、`TicketPoolIndex.slice`）都是单层调用，没有踩到；但**新增调用点时这是个隐式约束**，没有任何编译期或运行期保护。降级分支会让这个错误静默发生 —— 这条结论**未变**。
+- ✅ **已修复：`unlock` 不再返回 boolean**。`RedisLock.unlock` 现在是 `void` 且吞掉释放异常，日志打 warn，失败由固定 TTL 兜底。旧版「用返回值 `0` 当可观测信号、调用方全部忽略返回值」的说法不再成立；可观测性现在靠日志，而不是返回值。
+- **租约到期即失去互斥**仍是手写锁的天花板：TTL 是「我赌临界区不会超过这么久」。订单状态机已经通过看门狗绕开了它，缓存重建锁则因为「拿不到锁就降级直查 DB」而可以接受这个风险。
 
-### 6.3 ⚠️ 订单锁的租约与看门狗之间没有中间态
+### 6.3 ✅ 已反转：订单锁启用看门狗，不再有固定 10 秒租约
 
-`ORDER_LOCK_LEASE_SECONDS = 10`（`RideOrderServiceImpl.java:85`）意味着**看门狗关闭**。这是刻意的（`:80-84`），但它把同一类风险转移了过来：订单状态流转如果因为 DB 慢查询超过 10 秒，锁会静默过期。
+`ORDER_LOCK_LEASE_SECONDS` 已删除，`withOrderLock` 用 `tryLock(3, TimeUnit.SECONDS)` 启用看门狗，持锁到 `afterCompletion`。因此旧版「DB 慢查询超过 10 秒 → 锁静默过期 → 两个请求同时推进状态」的风险**不再由固定租约承担**。
 
-好在 `withOrderLock` 里的 `isHeldByCurrentThread()` 判断（`:405`）会让这种情况"安静地结束"而不是抛异常，所以表现为：**两个请求同时推进了同一订单的状态**。此时兜底的是 DB 乐观锁（`driverAcceptOrder:341-342` 的 `eq(status, CREATED)`）—— 也就是说，"Lua/Redisson 锁 + DB 乐观锁"是双层结构，最坏情况下失守的是锁这一层，DB 那一层仍然拒绝非法写入。**这才是项目敢把租约设成固定值的前提。**
+风险并没有消失，而是换了形态：看门狗依赖后台续期线程按时心跳，长时间 GC 停顿或线程饥饿仍可能让续期跟不上（这正是 4.3 保留那段旧推导的价值）。兜底仍是双层结构 —— 锁这一层失守时，DB 条件更新（`eq(status, CREATED)` 等）与 `SYNC_ORDER_STATUS` 的单调推进仍会拒绝非法写入；`OrderLockRegressionTest` 断言锁竞争 409 时**不触碰** Mapper、延迟队列与缓存。
 
-### 6.4 ⚠️ `hasKey` 与"预检"之间的窗口
+### 6.4 ✅ 已修复：`ensureWarm` 的双检窗口
 
-三个 `ensureWarm` 的快路径（如 `OrderGeoPool.java:207-209`）用的是 `redisTemplate.hasKey(READY_KEY)`，而后到的重建动作写的是同一个 key。快路径判断为 true 之后，理论上该 key 可以被 TTL 淘汰，于是本次请求会读到一个**正在被清理的池子**。影响仅限于"这次没命中"，因为池子本身有整体 TTL 兜底（`RedisKeyConstants.java:118-125`）。这属于有界漂移，不是缺陷。
+`ensureWarm` 方法已删除。当前 `OrderGeoPool.search` / `TicketPoolIndex.slice` 用 `READ_*` Lua 一次校验 `ready = {version}:{count}`，未命中才抢重建锁、全量回表，再由 `PUBLISH_*` Lua **同时校验版本与锁令牌**后原子发布；`isCurrent` 做最终版本校验，数量/状态/版本任一不符就**整页退回 DB**。旧版「`hasKey` 预检与 TTL 淘汰之间的窗口」被版本令牌收敛掉了，且事务中不发布、回滚不发布，过期锁持有者不能发布。
 
-### 6.5 ⚠️ `RedisLock` 的 `tryLock` 不区分"参数非法"与"竞争失败"
+### 6.5 ✅ 已修复：参数非法不再伪装成竞争失败
 
-`RedisLock.java:50-52`：`key` 为空 / `ttl` 非法时返回 `null`，与"锁被他人持有"返回 `null`（`:55`）**是同一个返回值**。调用方的降级分支（`ensureWarm` 的 `return false`）会把"我传错了参数"当成"别人正在重建"处理 —— 一个本该在开发期暴露的 bug 会变成线上"这个池子怎么老是不走缓存"。
-
-修法很便宜：参数非法时抛 `IllegalArgumentException`（与项目里其它地方的入参校验风格一致，如 `RideOrderServiceImpl.java:319`），只把"竞争失败"留作 `null`。
+`RedisLock.tryLock` 现在对 `key == null/isBlank()`、`ttl == null/isNegative()/isZero()` 直接抛 `IllegalArgumentException`，只把「锁被他人持有」留作 `null`。降级分支不会再把一个开发期的参数 bug 当成「别人正在重建」。
 
 ### 6.6 其他
 
-- **`withOrderLock` 的 `Supplier<T>` 不支持检查型异常**：`action.get()` 不能抛 checked exception（`:403`），所以临界区里若要做可能抛 checked 异常的操作，必须在 lambda 里包一层。当前五处调用（`:327`、`:433`、`:464`、`:515`、`:669`）都不需要，所以没暴露问题。
-- **`startRide` / `finishRide` / `cancelOrder` 与 `driverAcceptOrder` 共用同一把订单锁**（key 都是 `order:lock:{orderId}`）：这是对的（它们竞争的是同一个订单的状态），但也意味着**一次慢的 `finishRide` 会阻塞同一订单上的 `cancelOrder` 最多 3 秒**（`waitTime`），之后对方拿到 409。语义上可接受，但要注意 `waitTime` 的设置实际上是在"给不同操作之间的相互阻塞"定预算。
-- **手写锁没有"锁被谁持有"的可观测性**：value 是随机 `UUID`（`RedisLock.java:53`），排查"谁锁住了"时无法从 Redis 直接看出是哪个实例/线程。这是刻意的（不泄漏内部标识），但如果要做锁监控，建议把 token 改成 `instanceId:threadName:uuid` 的形式 —— 对校验逻辑无影响（只比较相等），但排查价值很大。
+- **`withOrderLock` 的 `Supplier<T>` 不支持检查型异常**：`action.get()` 不能抛 checked exception，所以临界区里若要做可能抛 checked 异常的操作，必须在 lambda 里包一层。当前 **7 处**状态变更调用都不需要，所以没暴露问题。
+- **7 个状态变更共用同一把订单锁**（key 都是 `order:lock:{orderId}`）：这是对的（它们竞争的是同一个订单的状态），但也意味着一次慢的 `finishRide` 会阻塞同一订单上的 `cancelOrder` 最多 3 秒（`waitTime`），之后对方拿到 409。`waitTime` 实际上是在「给不同操作之间的相互阻塞」定预算。
+- **手写锁没有"锁被谁持有"的可观测性**：value 是随机 `UUID`，排查「谁锁住了」时无法从 Redis 直接看出是哪个实例/线程。若要监控，可把 token 改成 `instanceId:threadName:uuid`（只比较相等，对校验逻辑无影响）—— 这是**可选优化**，当前未实现。
 
 ---
 
@@ -486,12 +575,14 @@ redis-cli TYPE order:lock:{orderId}
 redis-cli HGETALL order:lock:{orderId}
 # 期望形如：<uuid>:<threadId>  →  "1"     （value = 重入次数）
 
-# 2. 看租约：Redisson 的锁 key 一定有 TTL，且约等于 leaseTime
+# 2. 看租约：当前启用看门狗（旧「期望 ≤ 10 且单调下降」已作废）
 redis-cli TTL order:lock:{orderId}
-# 期望 ≤ 10（ORDER_LOCK_LEASE_SECONDS，RideOrderServiceImpl.java:85）
-# 注意关键验证：等待 5 秒后再看，TTL 应该继续下降而**不是被续期回 10**
-#   → 说明看门狗确实关闭了（用的是显式租约，见 :80-84 的注释）
-#   如果 TTL 每次都被刷回 10 或 30，说明走了无参 lock() 的看门狗路径
+# 期望：初始值接近 Redisson 的 lockWatchdogTimeout（默认约 30）
+# 关键验证：业务未结束时等待数秒再看，TTL 应被**续回**接近初始值，而不是单调降到 0
+#   → 说明 withOrderLock 走的是 tryLock(3, TimeUnit.SECONDS) 的看门狗路径
+#   若 TTL 从某个固定值单调下降且不续回，说明误传了显式 leaseTime（旧实现）
+# 测试实证：OrderGrabIntegrationTest 把 setLockWatchdogTimeout(1500) 后
+#           让临界区 sleep 2200ms，锁仍被当前线程持有
 
 # 3. 验证等锁超时 → 409
 #    让两个请求同时调同一订单的 driverArriveStart（可以先在临界区里 sleep 5 秒）
@@ -506,13 +597,13 @@ redis-cli KEYS 'driver:lock:*'          # 期望为空 —— 司机维度由 Lu
 redis-cli DEL order:lock:999 ticket:statistics:lock:20260913
 ```
 
-> 想复现"`finally` 里抛 `IllegalMonitorStateException` 顶掉真实异常"，最省事的办法是临时把 `withOrderLock` 的 `isHeldByCurrentThread()`（`:405`）改成 `true`，然后在临界区里 `Thread.sleep(15000)`（超过 10 秒租约），再让另一次请求在同一订单上跑一遍。第二次 `finally` 就会抛解锁异常，而那条异常会盖掉真正的业务异常 —— 这就是 4.4.4 说的陷阱。
+> 旧版「`finally` 里抛 `IllegalMonitorStateException` 顶掉真实异常」的复现方式（临界区 `sleep` 超过 10 秒固定租约）在**当前实现已不适用**：锁由看门狗续期，且解锁挂在 `afterCompletion`。4.4.4 讨论的「解锁异常盖掉业务异常」仍是通用陷阱 —— 想复现它，需要在测试里手动让锁提前失效或注入解锁失败；当前 `releaseOrderLock` 会吞掉解锁异常，正是为了不让这件事发生。
 
 ---
 
 ## 八、延伸阅读
 
-- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— `RELEASE_LOCK_IF_MATCH` 在 7 个脚本中的位置，以及"为什么单线程 Lua 等于原子"
+- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— `RELEASE_LOCK_IF_MATCH` 在**当前 22 个主脚本**中的位置，以及"为什么单线程 Lua 等于原子"（旧「7 个脚本」已过时）
 - [`14-grab-order-lua.md`](14-grab-order-lua.md) —— 与订单锁同路径并存的 Lua 预检，以及"锁粒度为什么是订单而非司机"的另一半（Lua 那边才是"一人一单"的裁决者）
 - [`12-chat-lock-atomic.md`](12-chat-lock-atomic.md) —— `SET NX` + `EXPIRE` 拆开写的同一个坑在会话锁上的版本（`HSET` + `EXPIRE`）
 - [`11-two-phase-confirm-token.md`](11-two-phase-confirm-token.md) —— 「令牌比对 + 原子消费」这个模式在工具令牌上的应用

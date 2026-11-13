@@ -2,7 +2,33 @@
 
 > **Redis 考点**：给缓存 TTL 叠加随机抖动，把「同时过期」摊成一段概率分布，避免大量 key 在同一秒集体失效引发 DB 回源风暴。
 > **来源**：`docs/01-redis-application-points.md` 一、现状盘点（「缓存雪崩（随机 TTL）」）
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/impl/TicketServiceImpl.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/impl/TicketServiceImpl.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文、`文件:行号` 与 `redis-cli` 命令写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。下表是已确认的失效点。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 六-1「这些索引每次写入都会重算并续期整体 TTL、永不到期」及 `TicketPoolIndex.java:114/213`、`OrderGeoPool.java:117/252` 行号 | 两文件现约 160 行；`INDEX_TTL = 2h` **只在 PUBLISH 脚本里 `PEXPIRE`**（`RedisScripts.java:64,107`），写入侧是换版本 + `DEL`，**不续期**；版本 key 无 TTL |
+| 2 | 「grep `ThreadLocalRandom` 全项目只有两处、没有第三处」 | 实为 4 处：`TicketServiceImpl:1192`（随机 TTL）、`RideOrderServiceImpl:1386`（安全码）、`ChatRequestRunner:34`（锁 owner）、`IdGeneratorConfig:17`（节点租约） |
+| 3 | 验证「期望 10 个各不相同的值，大致散布在 21~30」 | `20 + nextInt(11)` 只有 **11 个离散值 `[20,30]`（含 20）**；10 次抽样按生日问题几乎必有重复。应改为「落在 20~30、允许重复，多次采样覆盖区间」 |
+| 4 | 二/三章旧行号 `:77/:78`、`:1146-1147`、`:292-295` | 当前常量 `TicketServiceImpl.java:87-88`、使用点 `:1191-1195`；`RedisKeyConstants.java` 对应 `:92,189,285-288` |
+| 5 | 缺「同一文件里三种 TTL 策略」的对照 | 统计缓存 **20~30 秒抖动**；池索引 **固定 2h 且仅发布时设置**；`TICKET_SEQUENCE`（`INCR ticket:no:{yyyyMMdd}`）**仅 `TTL<0` 时 `EXPIRE 172800`（48 小时）**、不因写入续期（`TicketServiceImpl.java:76-81,706-715`）。三者合起来才是本篇「TTL 不续期」的完整案例 |
+
+> TTL 抖动打散过期时刻的原理推导**保留**；两处事实需要更正。
+
+| 项 | 当前实现 |
+|---|---|
+| `ThreadLocalRandom` 命中数 | 全项目 **4 处**（不是 2 处）：`TicketServiceImpl`（随机 TTL）、`RideOrderServiceImpl`（实例 owner）、`ChatRequestRunner`（单轮锁令牌）、`IdGeneratorConfig`（雪花 workerId）。只有第 1 处与 TTL 抖动有关 |
+| 「索引每次写入续期、永不到期」 | ❌ **结论反转**：`OrderGeoPool` / `TicketPoolIndex` 的索引固定 **2 小时**过期，写入侧触发**整池失效重建**，只有 `PUBLISH_*` Lua 发布时才 `PEXPIRE` 一次；版本 key 则无 TTL |
+| 随机 TTL 常量位置 | `TicketServiceImpl` 当前 `:87-88`（定义）、`:1191-1192`（使用），旧 `:1146` 指向的是锁逻辑 |
+| 与击穿联动 | 双检/重试/降级部分不变；固定 TTL 不续期使「雪崩」风险更可控，但也意味着热点重建更频繁 |
+
+**验证修订**：观察 `ticket:pool:ready:{status}` 的值（形如 `{version}:{count}`）稳定、写入后 `ticket:pool:version` 递增，而不是 TTL 被刷新。详见 [`15-nearby-order-geo.md`](15-nearby-order-geo.md)、[`23-ticket-pool-zset.md`](23-ticket-pool-zset.md)。
 
 ---
 

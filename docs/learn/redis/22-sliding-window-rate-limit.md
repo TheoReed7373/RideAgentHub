@@ -2,7 +2,45 @@
 
 > **Redis 考点**：用 ZSet 的 score 区间实现精确的滑动窗口；为什么固定窗口（`INCR` + `EXPIRE`）在边界上会放出 2 倍阈值；为什么剔除-计数-写入必须在同一个 Lua 内。
 > **来源**：`docs/01-redis-application-points.md` P1-1（第 2 条：按 userId 滑动窗口限流）
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/base/ChatRateLimiter.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/ChatRateLimiter.java`、`interceptor/RequestRateLimitInterceptor.java`、`config/WebMvcConfig.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇 4.2 的 Lua、3.1 参数表、6.1 结论与七章部分文案写于「客户端传 now」版本，**作为推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 4.2 Lua `now = ARGV[1]` + 4 个 ARGV、3.1 表「传入 now/window/limit/UUID」、6.1「score 用客户端时钟，更严谨是 `redis.call('TIME')`」 | `SLIDING_WINDOW_RATE_LIMIT`（`RedisScripts.java:260-274`）用 `redis.replicate_commands()` + **Redis `TIME`** + **3 个 ARGV**（window / limit / member），`now` 由脚本内生成；6.1 应标 **✅ 已修复**，多实例时钟偏斜问题已消除 |
+| 2 | 七章 #2 旧文案「消息发送得太快啦」 | 当前是「消息发送过于频繁，请稍后重试。」（`ChatServiceImpl.java:222`）；`ChatRateLimiter` 的 `tryAcquire` 参数与 key `chat:ratelimit:{userId}` 仍一致 |
+| 3 | 正文、六章边界、七章验证全部只覆盖 `ChatRateLimiter` | 缺第二套限流，见下方 4.9 |
+
+### 4.9 第二套限流：`RequestRateLimitInterceptor`（补充）
+
+| 项 | `ChatRateLimiter`（对话） | `RequestRateLimitInterceptor`（入口） |
+|---|---|---|
+| key | `chat:ratelimit:{userId}` | `"request:rate:" + CredentialStamp.of(request.getRemoteAddr())`（**来源地址摘要，非明文 IP**） |
+| 阈值 | 30 次 / 60 秒（`chat.guard.*` 可配置） | **硬编码** 120 次 / 60000ms（`RequestRateLimitInterceptor.java:22`） |
+| 超限 | 发 `notify` 事件结束流 | 抛 `BusinessException(429)` |
+| Redis 异常 | `try/catch` **放行**（fail-open） | **无 try/catch**，异常继续抛出 → `GlobalExceptionHandler` 兜底 500 |
+| 其它 | `max <= 0` 放行、member=UUID | `OPTIONS` 放行且不消耗配额；只挂 `/auth/**` 与 `/order/estimate`（`WebMvcConfig.java:25`） |
+
+两套共用同一段 Lua，但**故障行为相反**：对话侧宁可少限流也不能让 Redis 故障拖垮聊天；入口侧没有降级路径，Redis 不可用会直接变成 5xx。这是「同一算法、不同可用性取舍」的典型例子。验证可补 `redis-cli --scan --pattern "request:rate:*"` 与 `ZCARD request:rate:{digest}`。
+
+---
+
+> 固定窗口双倍放行推导、ZSet + Lua 原子性论证、异常放行策略**全部保留**；「客户端时钟」这个已知坑已修复。
+
+| 项 | 当前实现 |
+|---|---|
+| 时间源 | `SLIDING_WINDOW_RATE_LIMIT` 脚本内 `redis.replicate_commands()` + `redis.call('TIME')`，**不再由客户端传 `now`**；`ARGV` 从 4 个减为 **3 个**：`window` / `limit` / 唯一 `member` ✅ 已修复（`ChatGuardRedisIntegrationTest` 覆盖） |
+| 两套限流并存 | ① 按 `userId` 30 次/60 秒（`ChatRateLimiter`，`chat:ratelimit:{userId}`）；② 入口层按 **`CredentialStamp.of(remoteAddr)` 摘要** 120 次/60 秒（`RequestRateLimitInterceptor`，`request:rate:{digest}`，挂 `/auth/**` 与 `/order/estimate`，`OPTIONS` 放行）。共用同一 Lua，**key 不是明文 IP** |
+| 调用点 | 限流**前置**在 `ChatServiceImpl.canStartChat()`；拒绝时发 `notify("消息发送过于频繁，请稍后重试。")` 并结束流（旧文案「消息发送得太快啦…」已改） |
+| 边界 | 空 prompt / null 请求**不消耗配额**，以 `error` 事件结束流；Redis 异常放行；配置 ≤0 放行 |
+
+**验证修订**：`redis-cli EVAL ... 1 chat:ratelimit:1 60000 30 "m-$i"`，去掉 `$(date +%s%3N)`。详见 [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) 4.5.6、[`../agent/03-security-and-boundaries.md`](../agent/03-security-and-boundaries.md)。
 
 ---
 

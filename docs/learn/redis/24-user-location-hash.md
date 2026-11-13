@@ -2,7 +2,30 @@
 
 > **Redis 考点**：用 Hash 代替「String 存 JSON」，实现字段级读写，并借用 listpack 紧凑编码省内存。
 > **来源**：`docs/01-redis-application-points.md` 一、现状盘点（`user:loc:{userId}`，属已实现部分）
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/impl/UserServiceImpl.java:263-283`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/impl/UserServiceImpl.java`（`saveUserLocation`，历史快照 `:263-283`；当前方法体按类名 + 方法名定位）
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文写于改造前快照，**作为推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实（`service/impl/UserServiceImpl.java`） |
+|---|---|---|
+| 1 | 6.x「只上报部分字段时三次无条件 `put` 传 null，行为取决于序列化器，需实测确认」 | 可确定的事实：`saveUserLocation`（`:263-269`）对 `user:loc:{userId}` 做 **三次独立 `opsForHash().put`**，**无 TTL、无 Lua 原子写**，因此「字段级原子更新」并不成立；读取用 `entries()`，空则 Controller 返回 404。**当前 DTO 与接口没有「部分字段更新」入口**，`saveUserLocation` 是整体写入，所以该边界在生产路径上不可达。null value 的具体序列化行为本仓库未实机验证，列为待验证项（见审计报告「未解决问题」） |
+| 2 | 仍有效的项 | key、三字段 `latitude/longitude/address`、空返回 null → 404（`UserController.java:45-47`），均与代码一致 |
+
+本页是 25 篇里**过时程度最低**的一篇：`user:loc:{userId}` Hash、三字段、无 TTL、三次无条件 `HSET`、`HGETALL` 空返回 `null`、404「用户定位数据不存在」、Redis 为唯一存储 —— 这些语义**全部未变**，原文可直接使用。只需更正定位信息：
+
+| 项 | 当前实现 |
+|---|---|
+| 路径 | `src/main/java/com/fancy/rideagenthub/service/impl/UserServiceImpl.java`（`saveUserLocation` / `getUserLocation`），旧包 `com/fancy/taxiagent/` 已废弃 |
+| 行号 | 历史快照 `:263-283` 已漂移，当前方法体按「类名 + 方法名」定位；`RedisKeyConstants` 的 key 常量、三个 Agent 的 `buildLocationString`、`UserController` 映射均仍在，只是行号变化 |
+| 归属 | `saveUserLocation` **仍在 `UserServiceImpl`，没有迁移到 `DriverLocationService`** |
+| 两套独立数据 | 用户位置 Hash（本页）与司机在线 GEO（`DriverGeoIndex`，60 秒心跳）是**两套互不迁移的数据**，不要因为都含经纬度就当成一套 |
+
+> 第五章「为永远不执行的 `GEOSEARCH` 付出成本」是**假设句**（说明「没有空间查询就没必要用 GEO」），不是当前 API 断言，**保留原论证**；只补一句：项目里真实的空间查询用的是 `GEORADIUS`（兼容 Redis 5，见 [15 篇](15-nearby-order-geo.md)）。
 
 ---
 
@@ -127,6 +150,8 @@ Hash 在这里被「拍平」成一串 `地址,经度,纬度` 文本注进提示
 | 选型 | GEO（底层 ZSet，score 是 geohash） | Hash |
 
 GEO 的编码是有代价的：geohash 把经纬度压成一个 52 位整数当 score，取回时还要解码，且只能按「成员 → 坐标」取单个点，取不到「附带的地址文本」。用户位置场景里**没有任何空间查询** —— 没人会问「我附近有哪些用户」，用 GEO 等于为一个永远不执行的 `GEOSEARCH` 付出编码/解码成本，还把 `address` 字段挤出去（GEO 存不下第三个字段，得再开一个 key 或把地址塞进 member 字符串）。
+
+> 注：这里的 `GEOSEARCH` 是**假设句中的概念名**（「永远不执行」），不是对当前 API 的断言；项目里真实的空间查询（司机附近订单）用的是 `GEORADIUS`，为兼容 Redis 5（见 [15 篇](15-nearby-order-geo.md)）。原论证保留不改。
 
 一句话：**结构要长得像查询**。订单与司机坐标被「按距离查」，所以是 GEO；用户位置被「按 userId 查」，所以是 Hash。
 

@@ -2,7 +2,46 @@
 
 > **Redis 考点**：用 `chat:info:{chatId}` Hash 的一个 `break` 字段表达「会话被挂起、等待用户确认」，把跨请求的暂停状态外置到 Redis。
 > **来源**：`docs/01-redis-application-points.md` 一、现状盘点（`chat:info:{chatId}` Hash，属已实现部分）
-> **完整路径**：`src/main/java/com/fancy/taxiagent/agents/OrderAgent.java:99-141`、`:262-305`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/agents/OrderAgent.java`（历史快照 `:99-141`、`:262-305`）、`service/base/OrderConfirmation.java`、`service/impl/ChatServiceImpl.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇 4.2/4.3/6.3/6.4/三/七章写于「单态 break、无 confirmationId、跨天可确认」的改造前版本，**作为推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 4.2「`ChatServiceImpl.chat` 全文没有 break」「服务端不在普通消息中检查 break」 | `ChatServiceImpl.java:95-99` 在**分类之前**检查 `break == yes`：等待确认期间追加普通聊天会被 `notify("请先确认或拒绝当前订单，再继续对话")` 拦截并结束流 |
+| 2 | 恢复守卫校验 `"yes"`、`HDEL` 单字段、6.4「跨天可确认」、验证 #4 期望「非法恢复请求」 | `OrderAgent.resume` 校验 **`break == "resuming"`**（`:108`）并一次 `HDEL` **三字段** `break, pendingToolCall, confirmationAccepted`（`:146`）；报价窗口 **900000ms（15 分钟）**（`OrderConfirmation.java:19,34`）；相同 `confirmationId` + 相同决定可幂等重放、不同决定返回 409（`:20-23,64`） |
+
+### 4.4 `CONFIRM` / `CONSUME` 授权脚本逐行（补充）
+
+`service/base/OrderConfirmation.java:16-39` 两段内联 Lua 就是「服务端自授权」的全部实现：
+
+1. `CONFIRM` 先校验 `HGET(quoteId) == ARGV[1]`，**旧的 `confirmationId` 因 `quoted()` 重生成 UUID 而失配**（`:41-48`）；
+2. `ARGV[2] == 'yes'` 时校验 `now - quoteCreatedAt <= 900000`，超时返回 0 → 409；时间由 Java `System.currentTimeMillis()` 传入，不是 Redis TTL；
+3. `state == 'resuming'` 时**相同决定返回 1（幂等重放）、不同决定返回 0**，避免网络重试造成重复下单；
+4. 首次确认置 `break=resuming`、`confirmationAccepted`，`yes` 再写 `confirmedQuote` / `ReadyForCreate`（均等于 quoteId）；`no` 则 `HDEL` 这两字段；
+5. `CONSUME` 要求 `quoteId == confirmedQuote == ReadyForCreate` **三者相等**，通过后 `HDEL` 两字段一次性消费；重复调用抛 409（`:74-77`）。
+
+**边界区分**：`quoted()` 给 `chat:info` 设的是 **24h key TTL**，15 分钟是脚本内用字段时间戳算出的**报价有效期**，两者不是一回事；`break` 的两态（`yes` 等待 / `resuming` 已登记）把「等用户」与「等 Agent 恢复」分开，才使得幂等重放与一次性下单能同时成立。
+
+> HITL 设计动机、悬空 tool call 补齐机制的推导**保留**；本页「单态 break」「无 confirmationId」「跨天可确认」「`Chat2Controller`」等结论已整体重写。
+
+| 项 | 当前实现 |
+|---|---|
+| `break` 两态 | `yes` = 等待用户确认；`resuming` = 确认已登记、等待 Agent 恢复。字段由 `service/base/OrderConfirmation` 的 `CONFIRM`/`CONSUME` 两段内联 Lua 统一维护：`quoteId`(=`confirmationId`)、`ReadyforConfirm`、`quoteCreatedAt`、`ReadyForCreate`、`confirmedQuote`、`confirmationAccepted`、`pendingToolCall`、`break` |
+| 挂起前置 | `OrderAgent.handleNotifyUser` 先调 `orderConfirmation.begin(chatId, toolCallId)`：要求已有有效报价，否则 **409**；取回 `confirmationId` 写入 `orderJson`，再落历史 + `HSET break yes` + `AgentEvent.comfirm` |
+| 主动检查 | `ChatServiceImpl.chat` 在分类**之前**检查 `break`：为 `yes` 时 `notify("请先确认或拒绝当前订单，再继续对话")` 并结束流，等待确认期间不能追加普通聊天 |
+| 恢复链路 | `POST /chat/v2/r/{id}` 传 `{confirmationId, confirmed, prompt}` → `ChatServiceImpl.resume` 先 `orderConfirmation.confirm(...)`（CONFIRM Lua 校验 **15 分钟**报价有效期、置 `break=resuming`、签发 `ReadyForCreate`）→ 以**固定 feedback** 调 `OrderAgent.resume` → 校验 `break=="resuming"` → `messageMemory.getPersisted` → 从 `pendingToolCall` 取 toolCallId → **先持久化 `ToolResponseMessage`** → 一次 `HDEL break, pendingToolCall, confirmationAccepted` |
+| 幂等重放 | `break == resuming` 时**相同决定**返回 1 可重放，不同决定返回 0；新报价使旧 `confirmationId` 失配失效；创建权限由 `CONSUME` 一次性消费 ✅ 已修复「可重复下单」 |
+| 时效 | `quoted()` 给 `chat:info` 设 **24h TTL**；`CONFIRM`/`CONSUME` 校验 **900000ms（15 分钟）**；超时 409 ✅ 已修复「跨天可确认」；`confirmationAccepted`/`confirmedQuote` 已结构化记录 |
+| 工具降级 | `markOrderReadyForCreate()` **只读** `isConfirmed`；`createOrder()` 落单前调 `consume()` |
+| 幽灵引用 | `Chat2Controller.java` 与 `/order/resume/{chatId}` 已在 `a8f4e33` **删除**；恢复接口只有 `POST /chat/v2/r/{id}` |
+
+**时序图修订**：根 `README.md` 的时序图已补 `CS->>OrderConfirmation: confirm(confirmationId, confirmed)` 授权环节，并把 `markOrderReadyForCreate()` 标注为「仅查询 isConfirmed」。详见 [`11-two-phase-confirm-token.md`](11-two-phase-confirm-token.md)、[`../agent/01-orchestration-and-sse.md`](../agent/01-orchestration-and-sse.md)。
 
 ---
 
@@ -49,7 +88,7 @@ Key 前缀定义在 `constant/RedisKeyConstants.java:55`（`CHAT_INFO_KEY`），
 | `agentbase/tool/OrderTool.java:386-395` | `notifyUser` | 工具本体（只做前置校验，不写 `break`） |
 | `service/impl/ChatServiceImpl.java:180-184` | `resume` | 直接转发给 `orderAgent.resume` |
 | `controller/ChatController.java:49-57` | `POST /chat/v2/r/{id}` | 恢复接口（正式） |
-| `controller/Chat2Controller.java:53-60` | `POST /order/resume/{chatId}` | 恢复接口（测试用） |
+| ~~`controller/Chat2Controller.java:53-60`~~ | ~~`POST /order/resume/{chatId}`~~ | **已删除**（`a8f4e33`）；当前恢复接口仅 `controller/ChatController.java` 的 `POST /chat/v2/r/{chatId}` |
 
 ---
 

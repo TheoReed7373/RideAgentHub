@@ -2,7 +2,39 @@
 
 > **Redis 考点**：用 GEO（底层 ZSet）维护一份「待接单订单 × 坐标」的索引，把「按时间倒序取待接单订单」换成以司机为圆心的 `GEOSEARCH`，并顺带演示「成员级失效 + 整体 TTL 兜底 + 已预热标记」这套缓存自愈组合。
 > **来源**：`docs/01-redis-application-points.md` P0-2
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/base/OrderGeoPool.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/OrderGeoPool.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇 4.3/4.4/六/七章写于「`GEOSEARCH` + `ensureWarm` 双检 + 每次写入续期」的改造前版本，**作为推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 六-8「`ORDER_GEO_POOL_KEY` 上没有 Lua 参与，全是普通命令」 | 由三支专用 Lua 驱动：`INVALIDATE_ORDER_GEO_POOL`（`SET version` + `DEL ready,pool`）、`PUBLISH_ORDER_GEO_POOL`（校验版本 + 锁令牌后 `DEL`+`GEOADD`+`PEXPIRE`）、`SEARCH_ORDER_GEO_POOL`（`GEORADIUS`）（`RedisScripts.java:48-85`） |
+| 2 | 验证命令 `GEOSEARCH ... FROMLONLAT ...`，注释「与代码里的 GEOSEARCH 等价」 | 当前是 **`GEORADIUS ... 'km' 'ASC' 'COUNT' ARGV[4] 'WITHDIST'`**（`RedisScripts.java:70-78`，为兼容本地 Redis 5）：`redis-cli GEORADIUS order:geo:pool 116.397 39.909 3 km ASC COUNT 5 WITHDIST` |
+| 3 | 「TTL 2 小时**每次写入续期**」「`INDEX_TTL` 在 add 与 rebuild 两处续期」 | `INDEX_TTL=2h` **只在 PUBLISH 脚本里 `PEXPIRE` 一次**（`:64-65`），写入侧只 `INVALIDATE`；`OrderGeoPool.java:71` 注释明确「固定 TTL 不因写入续期」 |
+| 4 | 结构表只有 3 个 key，`ready` 是布尔「已预热」，`ensureWarm`/`markReady` 仍在 | 共 **4 个 key**（新增 `order:geo:pool:version`），`ready` 值为 **`{version}:{count}`**，`ensureWarm`/`markReady` 已删除（`RedisKeyConstants.java:119-124`） |
+| 5 | 「观察日志『订单地理池已重建: 扫描=?, 入池=?』」「脏数据只浪费一次查询，不会让司机抢到已被接走的单」 | 代码无该 info 日志（仅 3 条 warn）；候选数不符或 `!isCurrent()` 是**整页降级 DB 时间排序**，不是继续用池结果（`RideOrderServiceImpl.java:1174-1177`） |
+
+### 【补充】版本令牌为什么能挡住旧快照
+
+写路径 `add()` 直接转 `remove() → invalidate()`：`INCR` 版本 + `DEL ready, pool`，且**只在事务 `afterCommit` 执行**（回滚不发布）。并发重建时，旧线程拿到的 `version` 已失配，`PUBLISH_ORDER_GEO_POOL` 会拒绝写入；读侧 `isCurrent()` 在回表后再校验一次版本，任何不一致就整页降级。于是「慢重建覆盖快重建」「读到半池数据」两类竞态都被版本令牌挡住，而不需要给共享结构加分布式锁。`:version` 刻意**无 TTL**，避免版本过期后旧快照重新「看起来合法」—— 这与 [09 篇](09-lease-token.md) 的版本 key `PERSIST` 是同一套思路。
+
+> GEO 与 ZSet 底层关系、按距离排序的业务价值、降级策略取舍**全部保留**；实现已从「3 个 key + 成员级增量」换成「4 个 key + 整池失效重建」。
+
+| 项 | 当前实现 |
+|---|---|
+| 命令 | `SEARCH_ORDER_GEO_POOL` Lua 内 **`GEORADIUS … km ASC COUNT 200 WITHDIST`**（兼容 Redis 5），**不是 `GEOSEARCH` / `opsForGeo().search(...)`** |
+| key | 4 个：池、`:ready`、`:rebuild:lock`、**`:version`**（无 TTL） |
+| 写路径 | `add/remove` 在事务提交后走 `INVALIDATE_ORDER_GEO_POOL`（换版本 + DEL ready/pool）**整池失效**，不再单成员 `ZREM`/`GEOADD` 增量 |
+| 读路径 | 抢重建锁 → 全量回表 → `PUBLISH_ORDER_GEO_POOL` **同时校验版本与锁令牌**后原子发布（DEL、GEOADD、ZCARD、PEXPIRE、写 `ready={version}:{count}`）；`isCurrent` 二次校验，数量/状态/版本不符则**整页降级 DB** |
+| TTL | 固定 **2 小时**，写入不续期，仅发布时 `PEXPIRE` 一次 |
+| 边界 | 回表二次校验不一致整页降级、分页 offset 溢出保护、**事务中不发布 / 回滚不发布 / 过期锁持有者不能发布**；没有 info 级重建日志（仅 3 条 warn） |
+
+为什么改用整池重建：单成员摘除依赖每条写路径都记得删除，漏一条就留下「已接单但仍在附近列表」的脏成员；整池失效把正确性收敛到一个版本号上，代价是变更后首次查询要全量回表。`GeoPoolRedisIntegrationTest` / `GeoPoolRegressionTest` 覆盖降级与事务边界。详见 [`06-null-sentinel-and-prewarm.md`](06-null-sentinel-and-prewarm.md)、[`10-lua-scripts-overview.md`](10-lua-scripts-overview.md)。
 
 ---
 

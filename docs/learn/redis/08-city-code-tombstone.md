@@ -2,7 +2,42 @@
 
 > **Redis 考点**：用短 TTL 的**墓碑标记**（tombstone）替代延迟双删的「第二次删除」，让读线程通过**读取到的状态**判断「此刻能不能回填」，而不是靠一个猜出来的 sleep 时长。
 > **来源**：`docs/02-cache-consistency-race.md` 2.2；`docs/02` 第四节演练顺序第 3 步
-> **完整路径**：`src/main/java/com/fancy/taxiagent/agentbase/amap/util/citycode/CityCodeUtil.java`（全类 122 行）
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/agentbase/amap/util/citycode/CityCodeUtil.java`（历史快照全类 122 行，当前已扩展）
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇 4.x 的实现拆解与七章验证命令多为改造前纯 Redis 命令版本，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 延伸阅读称「墓碑是纯 Redis 命令实现，没有使用 Lua」 | 墓碑由两段 Lua 实现：`INVALIDATE_CITY_CODE`（`RedisScripts.java:150-154`，`INCR` 版本 + `SET key __TOMBSTONE__ EX`）、`CACHE_CITY_CODE_IF_VERSION_MATCH`（`:157-166`，校验版本后 `SET NX EX`）。调用点在 `CityCodeUtil.java:84-90,111-113` |
+| 2 | 六章称「全项目没有任何一处调用 `invalidate`（grep 只命中定义本身）」 | 口径应为：**生产代码 0 调用方**，仅 `RedisCacheRegressionTest.java:208,215` 两处；属「机制已就位·写路径未接入」。生产只调 `getCityCode`（`GeoRegeoTool.java:50`） |
+| 3 | 4.5(a)「`normalized` 只做了 `trim()`」、6.3-1 把「大小写隐式约定」列为现行残留隐患 | ✅ 已修复：读路径与两个 key 构造方法都已 `trim().toLowerCase(Locale.ROOT)`（`CityCodeUtil.java:64`、`RedisKeyConstants.java:233,237`） |
+| 4 | 七章 `KEYS "amap:city_code:*"` 断言「只应出现一个」 | 会多出 `amap:city_code:version:<normalized>`；断言应排除 `:version:`，并补 `GET amap:city_code:version:<normalized>` 观察递增。手工 `SET` 墓碑**不会 `INCR` 版本**，与 `invalidate()` 不等价，只能模拟墓碑读路径 |
+
+### 4.1.1 当前两段 Lua 的参数契约（补充）
+
+| 脚本 | KEYS | ARGV | 返回 | 作用 |
+|---|---|---|---|---|
+| `INVALIDATE_CITY_CODE` | 2（版本 key、数据 key） | 2（墓碑值、墓碑 TTL 秒=5） | 新版本号 | 版本 +1 并写 5 秒墓碑，让在途回填因版本失配失败 |
+| `CACHE_CITY_CODE_IF_VERSION_MATCH` | 2（版本 key、数据 key） | 3（期望版本、城市编码、缓存 TTL 秒=604800） | `1` 回填成功 / `0` 放弃 | 只有版本仍匹配才 `SET NX EX` 回填 7 天 |
+
+二章结构表还应补一行 `amap:city_code:version:<normalized>`（String，**无 TTL**，单调递增）。这就是「用状态标记替代猜时间」的实现：`INCR` 让所有旧读线程的回填在写入前就失配，而不是靠等待一个拍出来的延迟。
+
+> 「延迟双删 vs 墓碑」对比表、`.and()` 包裹理由与「用状态替代猜时间」的推导**全部保留**；本页 4.5 / 6.3 的「残留隐患」「纯 Redis 命令无 Lua」「单 key」结论已过时。
+
+| 项 | 当前实现 | 状态 |
+|---|---|---|
+| key 规范化 | `CityCodeUtil` 一次 `cityName.trim().toLowerCase(Locale.ROOT)`，cache key 与 DB 查询用同一个 `normalized`；`.or()` 已用 `.and(w -> ...)` 包裹 | ✅ 已修复（旧「大小写隐患」删除，保留作对照） |
+| 两段 Lua | `INVALIDATE_CITY_CODE`（`INCR` 版本 + `SET` 5 秒墓碑，返回新版本号）、`CACHE_CITY_CODE_IF_VERSION_MATCH`（版本不符返回 0，否则 `SET … NX EX`） | 当前实现，均在 `util/RedisScripts.java` |
+| 版本 key | 新增 `amap:city_code:version:{normalized}`（**无 TTL**），防止墓碑过期后旧快照回填 | 当前实现 |
+| 读路径 | 命中墓碑 → 走 DB 且**不回填**；正常回填先取版本租约再经 Lua 校验 | 当前实现 |
+| **写路径** | `CityCodeUtil.invalidate(String)` 在**生产代码 0 调用方**，仅 `RedisCacheRegressionTest` 调用；城市表改名/纠错没有触发它 | ⚠️ **部分实现：机制已就位·写路径未接入**，禁止写成闭环方案 |
+
+**验证修订**：不要再断言「`KEYS` 只应出现一个」（会多出 `:version:`）；改为触发 `invalidate()` 后 `GET` 版本 key 递增、5 秒墓碑期内读不回填。`RedisCacheRegressionTest` 覆盖这些断言。
 
 ---
 

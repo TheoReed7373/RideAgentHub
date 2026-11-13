@@ -2,7 +2,46 @@
 
 > **Redis 考点**：当失效粒度是**成员**、而 `EXPIRE` 只能作用于**整个 key** 时，如何把「过期判定」下沉到成员级 —— 用一个独立的 Hash 存每个成员的存活期，再用一次 Lua 把「判定 + 清理」合并成原子步骤。
 > **来源**：`docs/01-redis-application-points.md` P0-2（「司机上报位置时顺带维护在线状态」的落地）
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/base/DriverGeoIndex.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/DriverGeoIndex.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇 4.5/五/六/七章写于「两次普通命令写入 + `UNAVAILABLE` 降级 DB」的改造前版本，**作为推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 4.5/五/六「`UNAVAILABLE` 时调用方应降级到 DB / 按 DB 时间排序」「`goOnline` 两次写入不原子」「`refreshIfExist` 两步不原子」「`position()` 不做在线判定」 | `UNAVAILABLE` 直接抛 **503**（`DriverLocationServiceImpl.java:53-58`）；三支脚本各一次 `EVAL` 原子完成（`RedisScripts.java:10-45`）；`position()` 走 `location()`，一次读取返回 `Location(status, point)` 并内含 60 秒心跳判定（`DriverGeoIndex.java:73-100`） |
+| 2 | 七-3 手工 `EXPIRE driver:geo:online 60` 后期望「另一个司机心跳 → TTL 又回到 60」 | `UPDATE_DRIVER_LOCATION` 只 `GEOADD` + `HSET`，**刻意不给共享 key 设 TTL**（成员级存活由 `ONLINE_TTL=60s` 与 Hash 心跳判定）。手工设置的 TTL 会单调下降，甚至删掉整个在线池；该验证期望不成立 |
+| 3 | 延伸阅读「`CHECK_DRIVER_ONLINE` 是唯一『读 + 惰性清理』型脚本」 | 该脚本已删除，现在是 `READ_DRIVER_LOCATION`（`RedisScripts.java:34-45`） |
+| 4 | 仍有效的项 | `driver:geo:online`(GEO) + `driver:online:beat`(Hash)、`ONLINE_TTL=60s`、`UPDATE/READ` 用 Redis `TIME`、两 key 均无整体 TTL，与代码一致 |
+
+### 【补充】三支脚本与统一时间源
+
+| 脚本 | 作用 | 边界 |
+|---|---|---|
+| `UPDATE_DRIVER_LOCATION` | 一次 `EVAL` 内 `GEOADD` + `HSET(beat, now)` | `refresh` 分支会处理 `now < beat` 的脏心跳；`ZSCORE` 缺失时清理孤儿坐标 |
+| `READ_DRIVER_LOCATION` | 一次读取返回坐标，或按 60 秒阈值惰性清理 | 读路径也做清理，避免「只写不读」的过期成员长期占位 |
+| `SLIDING_WINDOW_RATE_LIMIT` | 限流共用 | 与本篇无关，但同样依赖 Redis `TIME`（见 [22 篇](22-sliding-window-rate-limit.md)） |
+
+**为什么用 Redis `TIME` 而不是应用时钟**：多实例部署时各 JVM 系统时钟可能偏斜数秒，用本地 `System.currentTimeMillis()` 判定「心跳是否超时」会让同一司机在 A 实例算在线、在 B 实例算离线。把时间源统一到 Redis 服务端，判定结果与写入顺序一致，这是共享 GEO 池能跨实例正确工作的前提。
+
+> 「共享 GEO key 不能设 key 级 TTL，成员级失效必须下沉到脚本」的推导**完全保留**；`CHECK_DRIVER_ONLINE` 已删除，改由三支脚本承担。
+
+| 脚本（`util/RedisScripts.java:10-45`） | 职责 |
+|---|---|
+| `UPDATE_DRIVER_LOCATION` | 用 Redis `TIME` 记心跳；`refresh` 分支先校验心跳与 `ZSCORE`，**只刷新仍在线的司机**，再 `GEOADD` + `HSET` |
+| `REMOVE_DRIVER_LOCATION` | `HDEL` + `ZREM` 一次完成主动下线 |
+| `READ_DRIVER_LOCATION` | `TIME` 判定 60 秒；有效返回 `GEOPOS` 坐标，无效则顺手 `HDEL`/`ZREM` 清掉孤儿成员并返回空 `List` |
+
+- **时间源统一到 Redis `TIME`**：不再由应用传 `ARGV[2]=now`，消除多实例时钟偏斜；`ONLINE_TTL = 60s` 不变。
+- `DriverGeoIndex.location(driverId)` **一次读取**返回 `Location(status, point)`；旧「两次写入、两步 refresh、先 status 后 position」已合并。
+- `UNAVAILABLE`（脚本返回 null / 连接异常）现在由 `DriverLocationServiceImpl` 抛 **503**，不再降级到 DB 或静默判离线；非法纬度、脏心跳、孤儿坐标都不残留。
+- 第五章里 `GEOSEARCH` 出现在**选型对比语境**（「一次 GEOSEARCH 覆盖全体司机」），不是当前 API 断言，**保留原论证**并加注：落地时改用 `GEORADIUS` 兼容 Redis 5。
+
+**验证修订**：用 `HGET`/`GEOPOS` 观察，不再手工传 `now`；`GeoPoolRedisIntegrationTest` 覆盖孤儿与脏心跳清理。详见 [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) 4.5.7。
 
 ---
 
@@ -75,6 +114,8 @@ public static final String DRIVER_ONLINE_BEAT_KEY = "driver:online:beat";
 
 ## 三、代码落点
 
+> 【当前状态】下表的方法名与行号是**改造前快照**；`CHECK_DRIVER_ONLINE` 已删除。当前按 `DriverGeoIndex` 的 `updateLocation` / `removeLocation` / `location(driverId)` 三个方法定位，对应 `util/RedisScripts.java` 的 `UPDATE_DRIVER_LOCATION`(:10) / `REMOVE_DRIVER_LOCATION`(:27) / `READ_DRIVER_LOCATION`(:34)。下方代码块中的 `RedisScripts.CHECK_DRIVER_ONLINE` 与「应用传当前毫秒」均为改造前实现，保留作对照；当前时间源是 Redis `TIME`，`location()` 一次读取返回 `Location(status, point)`。
+
 | 位置 | 方法 | 职责 |
 |---|---|---|
 | `DriverGeoIndex.java:74-90` | `goOnline` | 写心跳 Hash + 写 GEO 位置（上线与心跳共用） |
@@ -82,7 +123,7 @@ public static final String DRIVER_ONLINE_BEAT_KEY = "driver:online:beat";
 | `DriverGeoIndex.java:128-149` | `status` | 判定在线状态，顺带清理过期成员（走 Lua） |
 | `DriverGeoIndex.java:163-168` | `refreshIfExist` | 仅当已在线时刷新位置 |
 | `DriverGeoIndex.java:176-195` | `position` | 读单个司机坐标 |
-| `RedisScripts.java:210-225` | `CHECK_DRIVER_ONLINE` | 判定 + 清理的原子脚本 |
+| ~~`RedisScripts.java:210-225`~~ | ~~`CHECK_DRIVER_ONLINE`~~ | **已删除**；当前为 `UPDATE_DRIVER_LOCATION` / `REMOVE_DRIVER_LOCATION` / `READ_DRIVER_LOCATION` 三支脚本（`:10-45`） |
 
 调用方：
 

@@ -2,7 +2,42 @@
 
 > **Redis 考点**：用 ZSet 的 `score = 到期时间戳` 做延迟队列，用 `ZRANGEBYSCORE` 扫到期任务，再用 `ZREM` 的**返回值**做多实例认领 —— 不需要分布式锁，也不需要额外的调度表。
 > **来源**：`docs/01-redis-application-points.md` P0-3
-> **完整路径**：`src/main/java/com/fancy/taxiagent/service/base/OrderDelayQueue.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/OrderDelayQueue.java`、`src/main/java/com/fancy/rideagenthub/service/base/OrderTimeoutJob.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照】
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇三/四/五/七章的部分结论写于改造前版本，**作为推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 【对照】称「`ride-order.timeout.*` 的 `disabled` 同时关闭轮询与补偿」 | 属性名是 **`enabled`**（默认 `true`），`enabled=false` 才同时关闭两个 `@Scheduled`（`RideOrderTimeoutProperties.java:24`、`OrderTimeoutJob.java:57,81`、`application.yaml:92`）；代码里不存在 `disabled` |
+| 2 | 考点/五章/七-6「用 `ZREM` 返回值做多实例认领」「两次 ZREM 只有一次返回 1」 | `CLAIM_DUE_ORDERS` 在**同一段 Lua** 内 `ZRANGEBYSCORE ... LIMIT 0 ARGV[2]` 后逐个 `ZREM`，**忽略 ZREM 返回值**（`RedisScripts.java:127-133`）；原子性来自 Lua 单次执行，类注释里「靠返回值判归属」是代码残留描述 |
+| 3 | 「单条处理失败不重试」 | 失败按 `pollIntervalMs` **重新入队**（`OrderTimeoutJob.java:110-118`），另有 60 秒 DB 补偿扫描兜底 |
+| 4 | `CLAIM_DUE_ORDERS` 的时间源 | **不用 Redis `TIME`**：`now` 由 Java `System.currentTimeMillis()` 作 `ARGV[1]` 传入（`OrderDelayQueue.java:86-88`）；全项目用 Redis `TIME` 的是限流与司机定位脚本 |
+
+### 【补充】双调度与 DB 补偿（正文未展开）
+
+| 调度器 | 周期 | 职责 | 失败行为 |
+|---|---|---|---|
+| 主轮询 `pollTimeoutOrders` | `poll-interval-ms` 默认 **5000ms** | `claimDue(now, batchSize)` 原子领得到期 ZSet 成员并驱动状态机 | 单条失败按 `pollIntervalMs` 重新入队 |
+| DB 补偿 `recoverOverdueOrders` | `@Scheduled(fixedDelay = 60000L)` **硬编码 60 秒** | 按三类锚点扫 DB（`update_time` 快照、`LIMIT batchSize=100`、**排除未到 `scheduledTime` 的预约单**）补齐 Redis 遗漏 | 扫到的漏单重新入队 |
+
+两者由 `enabled` 一并开关，`@PostConstruct validate()` 校验配置。入队/取消都走 `afterCommit`（`OrderDelayQueue.java:51-72`），事务回滚不会留下幽灵定时任务；`delay:order:timeout` 这个 ZSet **刻意不设整体过期**，避免队列 key 过期后漏单彻底丢失 —— 这正是「Redis 做加速器、DB 做权威源」的分工。
+
+> ZSet 延迟队列原理、`fixedDelay` 理由、三场景业务映射**全部保留**；本页六章「无 DB 兜底扫描 / 失败不重试」结论已完全反转。
+
+| 项 | 当前实现 |
+|---|---|
+| 领取 | `CLAIM_DUE_ORDERS` Lua 一次完成 `ZRANGEBYSCORE 0..now LIMIT 0 batch` + 逐条 `ZREM`，并**防改期误删**（旧「N 次 `ZREM` 返回值认领」已废弃）。注意 `OrderDelayQueue` 类注释仍自称「用 `ZREM` 返回值判定归属」，属**源码注释残留**，以 Lua 为准 |
+| 排期 / 取消 | 走 `afterCommit`（`Math.addExact` 防溢出），失败 `log.warn` 交补偿；不再裸 `ZADD`/`ZREM` |
+| DB 补偿 | `OrderTimeoutJob.recoverOverdueOrders()` **每分钟**扫 DB 三类锚点、`LIMIT batchSize`；`processOrders` 失败按 `pollIntervalMs` **重新入队** ✅ 已修复 |
+| 条件更新 | 带 `update_time` 快照比较且**保留 `real_price`**；预约单改期不会误取消 |
+| 配置 | `ride-order.timeout.*` 的 `disabled` 同时关闭轮询与补偿；`@PostConstruct validate()` 让非法配置**启动即失败** |
+
+**验证修订**：并发调用 `claimDue` 应返回无交集；`OrderTimeoutRegressionTest` 覆盖补偿、改期与配置校验。详见 [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md)、[`07-delayed-double-delete.md`](07-delayed-double-delete.md) 的事务回调统一模式。
 
 ---
 
@@ -243,7 +278,7 @@ public void pollTimeoutOrders() {
 | 单批上限 | `properties.getBatchSize()`，默认 100 | `OrderTimeoutJob.java:54`、`application.yaml:95` |
 | 总开关 | `ride-order.timeout.enabled` | `OrderTimeoutJob.java:48-50`、`application.yaml:90` |
 
-`@EnableScheduling` 在 `TaxiAgentApplication.java:8`。`fixedDelay` 的选择理由见注释：超时处理可能涉及 DB 更新，用 `fixedRate` 会在慢轮次时把后续轮次挤成背靠背，反而放大压力。
+`@EnableScheduling` 在 `RideAgentHubApplication.java`（启动类）。`fixedDelay` 的选择理由见注释：超时处理可能涉及 DB 更新，用 `fixedRate` 会在慢轮次时把后续轮次挤成背靠背，反而放大压力。
 
 本类刻意保持「薄」（`:14-23`）：只做认领、转发、吞异常。**超时判定依赖对订单状态与时间戳的重读，那段逻辑属于状态机**，放在 `RideOrderService.handleTimeoutOrder` 里才能与其它状态流转共用同一套口径。
 

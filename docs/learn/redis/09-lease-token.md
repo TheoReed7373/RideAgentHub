@@ -2,7 +2,32 @@
 
 > **Redis 考点**：缓存的 L2 回填使用 `clear + 全量 append` 这一**破坏性覆盖**时，「删除」和「状态标记」都无从下手 —— 唯一的解法是给回填加一道**版本租约**（Lease），用 Lua 保证「版本校验 + 替换」的原子性。
 > **来源**：`docs/02-cache-consistency-race.md` 2.3；`docs/02` 第四节演练顺序第 4 步；Facebook *Scaling Memcache at Facebook*（NSDI '13）第 3.2 节 "Leases"
-> **完整路径**：`src/main/java/com/fancy/taxiagent/agentbase/memory/RedisMemory.java`、`src/main/java/com/fancy/taxiagent/agentbase/memory/MessageMemory.java`、`src/main/java/com/fancy/taxiagent/agentbase/memory/HeapMemory.java`、`src/main/java/com/fancy/taxiagent/util/RedisScripts.java`、`src/main/java/com/fancy/taxiagent/constant/RedisKeyConstants.java`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/agentbase/memory/RedisMemory.java`、`MessageMemory.java`、`HeapMemory.java`，`src/main/java/com/fancy/rideagenthub/util/RedisScripts.java`、`constant/RedisKeyConstants.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现对照 / 本篇勘误】（2026-11-13 代码反向复核）
+
+> 本篇二～八章正文、`文件:行号` 与 `redis-cli` 命令写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实（`util/RedisScripts.java`） |
+|---|---|---|
+| 1 | 「五段 Lua 里的 `PERSIST versionKey`（共 6 处调用）」 | 6 处 `PERSIST`（`:177,184,191,200,223,232`）中 **5 处作用于版本 key，`:191` 作用于数据 key**（`APPEND_WITH_VERSION_BUMP` 的 `ARGV[1] <= 0` 分支） |
+| 2 | 【当前实现】块把五段脚本概括为 `INCR KEYS[1]; PERSIST KEYS[1]`、注「KEYS[1]=版本 key」 | `OVERWRITE_IF_VERSION_MATCH` 的版本 key 是 **`KEYS[3]`**、`CLEAR_HISTORY_WITH_VERSION_BUMP` 是 **`KEYS[2]`**；`CURRENT_HISTORY_VERSION` 只在分支内 `INCR`，不能一概而论 |
+| 3 | 六-5「`fillHeapWithLease` 的 `clear` 分支」 | ✅ 结论已反转：L1 租约失效时**保留并发写入内容**（`MessageMemory.java:196-198`），不再清空 |
+| 4 | 一章「写路径同时写三层」与 `memory.get(...,1)` | 当前写序 **L3(MySQL) → L2(Redis) → L1(Heap)**（`MessageMemory.java:100-104`），消息窗口 `get(...,100)`（`ChatServiceImpl.java:101`） |
+| 5 | 「三层现已统一用 `getAll`，不再有 `getLastN`」 | `RedisMemory.java:47`、`MysqlMemory.java:27` 仍保留 `getLastN`，只是读路径不再调用 |
+| 6 | `CURRENT_HISTORY_VERSION` 描述「清暂存」 | `DEL KEYS[2]` 清的是 `chat:history:{chatId}` **数据 key**（`:171,175`）；`APPEND_HISTORY_IF_VERSION_MATCH` 还要求 `EXISTS KEYS[2] == 1`，缓存缺失时即使版本匹配也不追加 |
+| 7 | 「版本 key 与数据 key 同 TTL」的验证期望 | ✅ 已反转为 `PERSIST`（`TTL = -1`）。当前应验证 `TTL chat:history:version:{chatId}` → `-1`，`DEL` 版本 key 后 `CURRENT_HISTORY_VERSION` 重置为 0 |
+
+### 【原文恢复】4.8「`clear` 两条 DEL 非原子」被删的推导（改造前快照）
+
+> 按 `git show HEAD:` 恢复。当前 `clear` 已由 `CLEAR_HISTORY_WITH_VERSION_BUMP`（`RedisScripts.java:230-235`）单段 Lua 原子化，**缺陷已修复**，但推导仍是理解「为什么需要 Lua」的最好例子。
+
+**`clear(chatId)` 的两条 `DEL` 不是原子的**：极端情况下（`DEL` 数据 key 成功、`DEL` 版本 key 失败），会出现「数据已空、版本号仍是旧值」的状态。此时一个手持旧租约的读线程校验会**通过**，把旧快照回填进去 —— 方向上不会丢并发新增的数据（因为数据已经被 `clear` 了），但会把已清空的会话「复活」成旧内容。窗口极小，且 `clearChat` 只在用户主动清空会话时调用。属于已知残留，若要彻底消除需用 Lua 把两条 `DEL` 合并 —— 这正是当前实现采用的做法。
+
+**验证命令补充**（七-3「执行清空历史后」）：`GET chat:history:version:{chatId}`（版本号递增且无 TTL）+ `EXISTS chat:history:{chatId}`（应为 0）。
 
 ---
 
@@ -56,7 +81,7 @@ if (!mysqlLastN.isEmpty()) {
 | Key | 结构 | TTL | 语义 |
 |---|---|---|---|
 | `chat:history:{chatId}` | List（JSON 字符串） | 聚焦 24 小时 / 非聚焦 30 分钟 | 消息队列，`RPUSH` 追加、`LRANGE` 读取 |
-| `chat:history:version:{chatId}` | String（整数） | **与数据 key 相同** | Lease 版本号，`INCR` 递增 |
+| `chat:history:version:{chatId}` | String（整数） | **`-1`（`PERSIST` 永久保留）** —— 改造前写的是「与数据 key 相同」，这个结论**已反转**，见 4.8 | Lease 版本号，`INCR` 递增、永不归零 |
 | `chat:history:staging:{chatId}:{token}` | List（JSON 字符串） | 1 分钟（`STAGING_TTL`） | 回填暂存区，`token` 为 UUID |
 
 前缀常量定义在 `RedisKeyConstants.java:63-73`：
@@ -72,8 +97,8 @@ public static final String CHAT_HISTORY_STAGING_PREFIX = "chat:history:staging:"
 三个 key 的组合关系：
 
 ```
-chat:history:{chatId}            ← 数据（List）
-chat:history:version:{chatId}    ← 版本号（租约）。同生命周期，见 4.7
+chat:history:{chatId}            ← 数据（List）。带 TTL
+chat:history:version:{chatId}    ← 版本号（租约）。PERSIST 永久保留，见 4.8
 chat:history:staging:{chatId}:{uuid}
                                  ← 临时落地区。写完立刻被 Lua 消费（RENAME 或 DEL），
                                     1 分钟 TTL 只是崩溃兜底
@@ -87,56 +112,61 @@ TTL 常量：
 | `NON_FOCUS_CHAT_TTL` | `MessageMemory.java:19` | 30 分钟 |
 | `STAGING_TTL` | `RedisMemory.java:34` | 1 分钟 |
 
+> 【当前实现补充】上面两个 TTL 只作用于**数据 key**；版本 key 由 `CURRENT_HISTORY_VERSION`、`APPEND_WITH_VERSION_BUMP`、`APPEND_HISTORY_IF_VERSION_MATCH`、`OVERWRITE_IF_VERSION_MATCH`、`CLEAR_HISTORY_WITH_VERSION_BUMP` 五段 Lua 里的 `redis.call('PERSIST', versionKey)` 永久保留（共 6 处调用）。`RedisMemory.expire()` 现在只给数据 key 设 `PEXPIRE`（毫秒），`clear()` 也不再删版本 key，而是 `INCR` 版本 + 删数据。这是全篇最需要注意的一处反转：原文 4.8 的「同生命周期」推导是**改造前**的设计，保留它正是为了讲清「为什么后来改成永久保留」。
+
 ---
 
-## 三、代码落点
+## 三、代码落点（按「类名 + 方法名」定位）
 
-### L2：`RedisMemory.java`（217 行）
+> 原表里的 `文件:行号` 与「全类 217 行 / 211 行」都是改造前快照，已整体漂移，不再作为依据。当前一律按下表的方法名检索；脚本清单见 [10 篇](10-lua-scripts-overview.md) 3.1。
 
-| 位置 | 方法 | 职责 |
+### L2：`agentbase/memory/RedisMemory.java`
+
+| 方法 | 职责 | 当前调用的脚本 |
 |---|---|---|
-| `RedisMemory.java:44-57` | `getLastN` | `LLEN` + `LRANGE` 读最近 N 条 |
-| `RedisMemory.java:59-64` | `getAll` | `LRANGE 0 -1` 读全部 |
-| `RedisMemory.java:71-85` | `currentVersion` | **取租约**：`GET chat:history:version:{chatId}`，缺失按 0 |
-| `RedisMemory.java:95-114` | `append` | **追加 + 版本递增**（走 `APPEND_WITH_VERSION_BUMP`） |
-| `RedisMemory.java:128-167` | `overwriteIfLeaseValid` | **持租约回填**（暂存 key + `OVERWRITE_IF_VERSION_MATCH`） |
-| `RedisMemory.java:169-177` | `expire` | 数据 key 与版本 key **同生命周期**（`:174-176` 注释） |
-| `RedisMemory.java:179-185` | `clear` | 同时删数据 key 与版本 key |
+| `currentVersion(chatId)` | **取租约**：走 `CURRENT_HISTORY_VERSION` Lua；Java 侧读不到结果会抛 `IllegalStateException`（保守失败），不再「解析失败按 0」 | `CURRENT_HISTORY_VERSION` |
+| `appendIfVersionMatch(chatId, msgs, ttlMillis, version)` | **写路径**：版本不符就 `DEL` 数据（让在途租约失效），否则 `RPUSH` + `PEXPIRE` 数据；版本 key `PERSIST` | `APPEND_HISTORY_IF_VERSION_MATCH` |
+| `append(chatId, msgs, ttlMillis)` | **回填 / 测试路径**：`INCR` 版本 + `PERSIST` + `RPUSH` + `PEXPIRE`（或 `PERSIST`）数据 | `APPEND_WITH_VERSION_BUMP` |
+| `overwriteIfLeaseValid(...)` | 持租约回填：`SessionCallback`/`MULTI` 写暂存 → 执行 `OVERWRITE_IF_VERSION_MATCH`（**2 个 ARGV**，成功时 `INCR` 版本 + `PERSIST` + `RENAME`） | `OVERWRITE_IF_VERSION_MATCH` |
+| `expire(chatId, Duration)` | **只给数据 key** 设 TTL；版本 key 不触碰 | — |
+| `clear(chatId)` | **只删数据、递增版本**：`INCR` + `PERSIST` + `DEL` 数据，一条 Lua 原子完成 | `CLEAR_HISTORY_WITH_VERSION_BUMP` |
+| `getAll(chatId)` | `LRANGE 0 -1` 读全量；三层现已统一用 `getAll`，不再有 `getLastN` 的「最近 N 条」语义 | — |
 
-### Lua 脚本：`RedisScripts.java`
+### Lua 脚本：`util/RedisScripts.java`（当前 5 段）
 
-| 位置 | 脚本 | 职责 |
-|---|---|---|
-| `RedisScripts.java:75-84` | `APPEND_WITH_VERSION_BUMP` | `INCR` 版本 → `EXPIRE` → 逐条 `RPUSH`，原子 |
-| `RedisScripts.java:103-118` | `OVERWRITE_IF_VERSION_MATCH` | 校验版本 → `DEL` 数据 → `RENAME` 暂存，原子 |
+| 脚本 | 职责 |
+|---|---|
+| `CURRENT_HISTORY_VERSION`(:169) | 取租约；处理 `EXISTS`/`PTTL` 分支、清暂存、**`PERSIST` 版本 key** |
+| `APPEND_HISTORY_IF_VERSION_MATCH`(:197) | 写路径；版本不符 `DEL` 数据，否则追加 + 数据 `PEXPIRE` |
+| `APPEND_WITH_VERSION_BUMP`(:182) | 回填路径；`INCR` + **`PERSIST`** + `RPUSH` |
+| `OVERWRITE_IF_VERSION_MATCH`(:213) | 暂存 → `RENAME`；成功时 `INCR` 版本并 `PERSIST` |
+| `CLEAR_HISTORY_WITH_VERSION_BUMP`(:230) | `INCR` + `PERSIST` + `DEL` 数据 |
 
-### 读路径：`MessageMemory.java`（211 行）
+### 读 / 写路径：`agentbase/memory/MessageMemory.java`
 
-| 位置 | 方法 | 职责 |
-|---|---|---|
-| `MessageMemory.java:39-77` | `get` | 主读路径（L1 → L2 → L3 + 双层回填） |
-| `MessageMemory.java:57-60` | —— | **在耗时读取之前捕获两个租约** |
-| `MessageMemory.java:62-66` | —— | L2 命中：持租约回填 L1 |
-| `MessageMemory.java:68-74` | —— | L2 miss：查 L3，持租约回填 L2 与 L1 |
-| `MessageMemory.java:106-145` | `getUserMessage` | 第二条读路径（走 `getAll` 而非 `getLastN`） |
-| `MessageMemory.java:82-101` | `save` | 写路径：三层写入，L2 走带版本递增的 `append` |
-| `MessageMemory.java:161-165` | `fillRedisWithLease` | L2 回填 + 成功时续 TTL |
-| `MessageMemory.java:179-183` | `fillHeapWithLease` | L1 回填；租约失效则**清空 L1** |
+| 方法 | 职责 |
+|---|---|
+| `get(userId, chatId, lastN)` | 归属守卫 `chatManager.isNewOwnedChat()`（新会话直接返回空）；三层都 `getAll` 后由 `MessageWindow.tail` 截出完整工具调用批次；持 `heapLease`/`redisLease` 回填 |
+| `save(userId, chatId, msgs)` | `assertOwned` → `switchFocusChatIfNeeded` → **先 `mysqlMemory.append`（L3）** → 再按租约追加 L2/L1；若 L2/L1 抛异常则 `heapMemory.clear()` 后上抛 |
+| `getPersisted` / `getUserMessage` | 供 Agent 恢复与分类缓存使用；`ChatServiceImpl` 现在用 `memory.get(userId, id, 100)` 而非 `get(..., 1)` |
+| `fillRedisWithLease` / `fillHeapWithLease` | 逐级回填；**L1 租约失效时保留并发写入内容**（见 4.7 的反转） |
+| `clearChat` | `retireHistory` + MySQL 清理 + `try { redisMemory.clear() } finally { heapMemory.clear() }` |
 
-### L1：`HeapMemory.java`
+### L1：`agentbase/memory/HeapMemory.java`
 
-| 位置 | 方法 | 职责 |
-|---|---|---|
-| `HeapMemory.java:28-29` | `record Entry` | 缓存条目 = 消息列表 + 版本号 |
-| `HeapMemory.java:47-53` | `currentVersion` | 取 L1 租约 |
-| `HeapMemory.java:58-75` | `append` | 在 `ConcurrentHashMap.compute` 内追加 + 版本 +1 |
-| `HeapMemory.java:86-100` | `overwriteIfVersionMatch` | 在 `compute` 内做「校验 + 替换」，对同一 `chatId` 原子 |
+`record Entry(List<Message> messages, long version)`；`currentVersion` / `append` / `overwriteIfVersionMatch` 都在 `ConcurrentHashMap.compute` 内完成「校验 + 替换/追加」，对同一 `chatId` 原子。当前 `overwriteIfVersionMatch` 在租约失效时 `return existing`（**保留**，不再清空）—— 理由见 4.7。
+
+### 新增的相关类
+
+`agentbase/memory/MessageWindow.java`（`tail` 保证工具调用批次完整、拒绝孤立 `ToolResponseMessage`）、`service/base/ChatRequestRunner.java`（单轮执行锁）、`service/base/ChatInfoService.java`（`assertOwned` 404/410）。
 
 ---
 
 ## 四、实现拆解
 
 ### 4.1 竞态形态：这不是脏读，是数据丢失
+
+> 【当前实现对照】下方时序是**改造前**代码（`getLastN` + `overwrite = clear + append`，写顺序 L1→L2→L3）。当前 `MessageMemory.save` 改为 `assertOwned` 归属守卫 → `switchFocusChatIfNeeded` → **先 `mysqlMemory.append`** → 再按租约追加 L2/L1；三层读取都是 `getAll` + `MessageWindow.tail`，`ChatServiceImpl` 用 `memory.get(userId, id, 100)` 而不是 `get(..., 1)`。破坏性 `overwrite` 已不存在，但「回填本身是破坏性覆盖」这一竞态模型仍是理解 Lease 的最佳入口，所以整段时序保留。
 
 ```
 时间 →
@@ -183,13 +213,29 @@ MessageMemory.get:52  L1 miss
 
 | Facebook Memcache Lease | 本项目实现 | 位置 |
 |---|---|---|
-| 读 miss 时返回 lease token（而非空值） | `MessageMemory.get` 在任何耗时读取**之前**取 `chat:history:version:{chatId}` | `MessageMemory.java:57-60` |
-| 只有持有效 lease 才能回填 | `overwriteIfLeaseValid(chatId, msgs, leaseVersion)` | `RedisMemory.java:128-167` |
-| 写路径使 lease 失效 | `save` 时走 `APPEND_WITH_VERSION_BUMP`：`INCR` 版本 + `RPUSH` 消息，同一次原子操作 | `RedisMemory.java:95-114`、`RedisScripts.java:75-84` |
-| 过期 lease 的回填被拒绝 | 版本不匹配 → 脚本 `DEL` 掉暂存数据并返回 0 → 回填放弃 | `RedisScripts.java:111-114` |
-| lease 有 TTL，过期后自动回收 | 版本 key 与数据 key **同 TTL**（`expire` 同时续期两者） | `RedisMemory.java:169-177` |
+| 读 miss 时返回 lease token（而非空值） | `MessageMemory.get` 在任何耗时读取**之前**取 `chat:history:version:{chatId}`（`RedisMemory.currentVersion` → `CURRENT_HISTORY_VERSION` Lua） | `MessageMemory.get` / `RedisMemory.currentVersion` |
+| 只有持有效 lease 才能回填 | `overwriteIfLeaseValid(chatId, msgs, leaseVersion)` / `appendIfVersionMatch(...)` | `RedisMemory` |
+| 写路径使 lease 失效 | **当前写路径**是 `MessageMemory.save` → `RedisMemory.appendIfVersionMatch` → `APPEND_HISTORY_IF_VERSION_MATCH`：版本不符先 `DEL` 数据，否则 `RPUSH` + `PEXPIRE`；`APPEND_WITH_VERSION_BUMP` 主要在回填/测试路径 | `RedisScripts:182-227` |
+| 过期 lease 的回填被拒绝 | 版本不匹配 → 脚本 `DEL` 掉暂存数据并返回 0 → 回填放弃 | `OVERWRITE_IF_VERSION_MATCH` |
+| ~~lease 有 TTL，过期后自动回收~~ | **这一条已反转**：版本 key 由 `PERSIST` 永久保留、无 TTL；只有数据 key 有 24h/30min 生命周期。旧实现「`expire` 同时续期两者」正是 4.8 要纠正的设计 | 五段历史脚本中的 6 处 `PERSIST` |
 
-读路径的完整实现（`MessageMemory.java:57-74`）：
+> 【当前读路径】三层现在都读**全量**（`getAll`），再交给 `MessageWindow.tail` 截取末尾的完整工具调用批次 —— 因为 Spring AI 的 `ToolResponseMessage` 不能与它的 `AssistantMessage`（含 tool call）被拆开，否则模型会看到「孤立的工具结果」。伪代码：
+>
+> ```java
+> if (chatManager.isNewOwnedChat(userId, chatId)) return List.of();   // 归属守卫
+> long heapLease  = heapMemory.currentVersion(chatId);
+> long redisLease = redisMemory.currentVersion(chatId);                // 取租约
+> List<Message> heapAll = heapMemory.getAll(chatId);
+> if (!heapAll.isEmpty())  return MessageWindow.tail(heapAll, lastN);
+> List<Message> redisAll = redisMemory.getAll(chatId);
+> if (!redisAll.isEmpty()) { fillHeapWithLease(...); return tail(redisAll, lastN); }
+> List<Message> mysqlAll = mysqlMemory.getAll(chatId);                  // 权威源
+> if (!mysqlAll.isEmpty()) { if (fillRedisWithLease(...)) fillHeapWithLease(...); return tail(mysqlAll, lastN); }
+> ```
+>
+> 「取租约必须在耗时读取之前」这一原则完全没变；变的是读的形状（全量 + 窗口）、归属守卫、以及写顺序（先 MySQL 再 L2/L1）。
+
+下面是**改造前** `MessageMemory.java:57-74` 的读路径代码，保留作对照（注意 `getLastN` 已不存在）：
 
 ```java
 // 取租约：必须在任何"耗时读取"之前捕获版本号。
@@ -231,6 +277,12 @@ T1  :71        overwriteIfLeaseValid(chatId, S, 5)
 代价是「下次读 L2 仍然 miss，会再查一次 MySQL」—— 一次多余的 DB 查询。相比「永久丢失一条消息」，这个代价可以忽略。
 
 ### 4.4 为什么回填要绕一次暂存 key
+
+> 【当前实现】「暂存 key + `RENAME` O(1)」这套思路完全保留，下方推导仍然是最值得读的部分。两处细节变化：
+> - 写暂存不再靠「`rightPushAll` + `expire` 两条独立命令」：Java 侧用 `SessionCallback` / `MULTI` 把「写暂存 + 执行回填脚本」收进一次 Redis 交互，减少中间态暴露；
+> - `OVERWRITE_IF_VERSION_MATCH` 现在有 **2 个 ARGV**（租约版本号 + 数据 TTL 毫秒），且成功分支会 `INCR` 版本并 `PERSIST` 版本 key —— **回填成功后主动让所有在途租约失效**，否则「刚回填完又被另一个旧快照覆盖」。
+>
+> `STAGING_TTL = 1min` 的崩溃兜底、三个出口（`-1` 暂存不存在 / `0` 租约失效 / `1` 成功）都不变；下方代码块与「只传一个版本号」是改造前版本。
 
 `RedisMemory.java:137-149`：
 
@@ -283,6 +335,14 @@ EVAL  → 只传三个 key 名 + 一个版本号（极小）
 `RedisMemory.java:157-165` 的 `catch` 分支还会尽力手工删一次暂存 key（「TTL 是兜底」）。
 
 ### 4.5 为什么版本递增必须与数据追加在同一次原子操作内
+
+> 【当前实现】「`INCR` 必须在 `RPUSH` 之前、且必须在同一次 EVAL 内」这个结论**完全不变**，下方时序推导原样保留。变化在于脚本被拆成两条、参数语义不同：
+>
+> - **写路径**：`MessageMemory.save` → `RedisMemory.appendIfVersionMatch` → `APPEND_HISTORY_IF_VERSION_MATCH`。版本不符时脚本会 `DEL` 数据 key（让在途租约必然失效），否则 `RPUSH` + `PEXPIRE` 数据。
+> - **回填 / 测试路径**：`RedisMemory.append` → `APPEND_WITH_VERSION_BUMP`（下方 Lua 的当前版本）。
+> - **`ARGV[1]` 现在是「数据 key 的 TTL 毫秒」**，不是旧文档说的「版本 key 过期秒数」：`> 0` 时 `PEXPIRE` 数据 key，`<= 0` 时 `PERSIST` 数据 key；**版本 key 一律 `PERSIST`**，永远不 `EXPIRE`。
+>
+> 所以下方代码块里 `redis.call('EXPIRE', KEYS[1], ARGV[1])`（给版本 key 设过期）是改造前写法，今天已经不存在；把它与当前实现对照，正好能看懂 4.8 为什么要反转结论。
 
 `RedisScripts.java:62-66` 的注释：
 
@@ -358,7 +418,19 @@ heapCache.compute(chatId, (key, existing) -> {
 
 **L1 与 L2 分居两个进程内/外的存储，不可能用同一个原子操作覆盖**，所以它们是两份独立的租约（`heapLease` 与 `redisLease`，`MessageMemory.java:59-60`），各自校验、各自可能失效。
 
-### 4.7 L1 租约失效时，为什么要清空而不是保留
+### 4.7 L1 租约失效时：结论反转为「保留」（改造前是「清空」）
+
+> 【当前实现 · 结论反转】`HeapMemory.overwriteIfVersionMatch` 在租约失效时 **`return existing`（保留）**，`MessageMemory.fillHeapWithLease` 也不再调 `heapMemory.clear(chatId)`。下方原文给出的「清空」推导在**旧写顺序**下是对的，但前提已经被改掉：
+>
+> | | 改造前 | 当前 |
+> |---|---|---|
+> | 写顺序 | 先写 L1/L2，再落 MySQL | **先落 MySQL(L3)，再按租约追加 L2/L1** |
+> | L1 的内容 | 可能只有并发追加的那几条（`[11]`），是残缺快照 | `append` 追加到已有列表尾部，包含并发写入的最新消息，不是残缺快照 |
+> | 清空后果 | 无害：下次从权威 L2 重新加载 | **会丢掉刚写入 L1 的新消息** |
+>
+> 因此当前选择「保留并发写入内容」，让 L1 要么是完整上下文、要么包含最新追加；后续由 `MessageWindow.tail` 与 L2/MySQL 校正。这也说明一个通用道理：**缓存一致性结论依赖于写顺序，写顺序一改，原来的正确结论可能整个反过来**。见 [19 篇](19-multi-level-cache.md) 的读写顺序对照。
+
+以下为改造前的原文（保留推导，标题中的「清空」已不适用于当前代码）：
 
 `MessageMemory.java:179-183`：
 
@@ -378,9 +450,44 @@ private void fillHeapWithLease(String chatId, List<Message> messages, long lease
 
 清空 L1 后，下一次读会 miss L1 → 走 L2（`[1..11]`，权威）→ 持新租约正确回填 L1。**代价是一次 L2 读取，换来的是「L1 要么完整、要么为空」这个不变式。**
 
-### 4.8 版本 key 与数据 key 必须同生命周期
+### 4.8 版本 key 必须永久保留（`PERSIST`），而不是与数据同生命周期 —— 结论完全反转
 
-`RedisMemory.java:169-177`：
+> 本节原来的结论「版本 key 与数据 key 必须同 TTL」是**改造前**的设计。当前代码已在五段历史脚本的 **6 处**调用 `redis.call('PERSIST', KEYS[1])`，让版本 key 永不归零。下面先讲当前实现与反转原因，再把原推导完整保留作「为什么当初会那样想」的对照。
+
+**当前实现**（`util/RedisScripts.java`：`CURRENT_HISTORY_VERSION`、`APPEND_WITH_VERSION_BUMP`、`APPEND_HISTORY_IF_VERSION_MATCH`、`OVERWRITE_IF_VERSION_MATCH`、`CLEAR_HISTORY_WITH_VERSION_BUMP`）：
+
+```lua
+-- 五段脚本的共同动作（KEYS[1] = chat:history:version:{chatId}）
+redis.call('INCR', KEYS[1])
+redis.call('PERSIST', KEYS[1])          -- 版本 key 去掉 TTL，永不归零
+```
+
+- `RedisMemory.expire(chatId, duration)` **只给数据 key** `PEXPIRE`（24h / 30min），不再碰版本 key；
+- `RedisMemory.clear(chatId)` 走 `CLEAR_HISTORY_WITH_VERSION_BUMP`：`INCR` 版本 + `PERSIST` + `DEL` 数据 —— **只删数据、递增版本**，不再是两条 `DEL`；
+- `redis-cli TTL chat:history:version:{chatId}` 恒为 **`-1`**；数据 key 的 PTTL ≤ 86400000。
+
+**为什么必须反转**：旧方案让两个 key 同生共死，但「同生命周期」并不能保证版本号单调 —— 因为 `clear()` 会**同时删掉两个 key**，把版本归零：
+
+```
+T1  捕获 redisLease = 1（会话刚创建，版本号 1），开始耗时读 MySQL
+T2  clearChat() → 旧实现 DEL 数据 key + DEL 版本 key → 版本归零
+T3  save → INCR 新建版本 key → 值又变成 1
+T1  overwriteIfLeaseValid(S, 1)
+    → current(1) == 1 → 校验【通过】！
+    → 已清空会话被旧快照"复活"
+```
+
+数据 key 与版本 key **一起 TTL 到期**时也一样：`INCR` 从 1 重新开始，而某个在途租约恰好可能就是 1。原推导只分析了「版本 key 先过期」和「归零后从 1 开始不会撞上 0 租约」，漏掉的正是「在途租约 = 1」这一支。只要版本 key 永不过期、且 `clear` 改为**递增而非删除**，版本号对同一 `chatId` 就是全局单调递增的，任何旧租约都不可能重新匹配。
+
+**边界与代价（面试常问）**：版本 key 无 TTL 意味着它不会随会话数据一起被回收，Redis 中该前缀的 key 数随历史 `chatId` 单调增长。这是用少量内存换「租约时钟绝不倒转」的取舍。可选优化是定期扫描「长期无数据且无写入」的版本 key 并清理，但清理本身必须与在途租约协调，否则又会把版本号重置到小值 —— 这正是当前代码**不做自动清理**的原因。不要把这个方向写成已实现能力。
+
+**「版本号是租约的时钟」—— 时钟可以停，但不能倒转。** 这句话依然成立，只是实现从「两个 key 同生共死」改成了「版本 key 永不死」。
+
+---
+
+**改造前原文（保留推导，作动机对照）**
+
+`RedisMemory.java:169-177` 当时同时给两个 key 设过期：
 
 ```java
 public void expire(String chatId, Duration duration) {
@@ -404,7 +511,7 @@ T1  overwriteIfLeaseValid(S, 5)
     → current(1) != 5 → 拒绝
 ```
 
-这个方向是安全的（拒绝回填）。危险的是反方向 —— **如果版本号「归零」后恰好等于某个在途租约的值**：
+这个方向是安全的（拒绝回填）。当时担心的是反方向 —— **如果版本号「归零」后恰好等于某个在途租约的值**：
 
 ```
 T1  捕获 redisLease = 0（版本 key 不存在时 currentVersion 返回 0）
@@ -415,9 +522,9 @@ T2  save → INCR 新建版本 key → 值 = 1
 T1  overwriteIfLeaseValid(S, 0) → current(1) != 0 → 拒绝 ✓
 ```
 
-`currentVersion`（`RedisMemory.java:76-78`）把「key 不存在」映射成 `0`，而 `INCR` 从 1 开始，所以「归零后重建」不会与 `0` 租约撞上。真正的风险是**版本号被重置到一个小值后与在途租约重叠** —— 只要 key 的生命周期严格一致（要么都在、要么都被删），版本号就是**单调递增**的，租约校验才有意义。
+`currentVersion` 当时把「key 不存在」映射成 `0`（现在改由 `CURRENT_HISTORY_VERSION` Lua 处理，Java 侧读不到结果抛 `IllegalStateException`，属于**保守失败**），而 `INCR` 从 1 开始，所以「归零后重建」不会与 `0` 租约撞上。真正的风险是**版本号被重置到一个小值后与在途租约重叠** —— 旧方案认为「只要两个 key 生命周期严格一致，版本号就单调递增」，这个前提被 `clear()` 同时删两个 key 打破了。
 
-`clear`（`:179-185`）遵守同一个原则，同时删两个 key：
+`clear` 当时同样删两个 key：
 
 ```java
 public void clear(String chatId) {
@@ -429,7 +536,7 @@ public void clear(String chatId) {
 }
 ```
 
-**「版本号是租约的时钟」—— 时钟可以停，但不能倒转。** 两个 key 生命周期不一致，本质上就是让时钟倒转。
+两条 `DEL` 还带来第二个问题：它们**不是原子的**（六-3 的旧缺陷），极端情况下会留下「数据已空、版本仍旧」。当前 `CLEAR_HISTORY_WITH_VERSION_BUMP` 用一条 Lua 同时解决原子性与版本归零。
 
 ---
 
@@ -441,10 +548,10 @@ public void clear(String chatId) {
 | **版本号** 而非**时间戳** | 用 `System.currentTimeMillis()` 当 lease | 多实例时钟不同步；同一毫秒内的两次写入无法区分。`INCR` 由 Redis 单点产生，全局单调 |
 | 暂存 key + `RENAME` | 消息列表作为 `ARGV` 传入 Lua | 消息量不可控（`getUserMessage` 走 `getAll`）。`RENAME` 是 O(1)，不搬数据。见 4.4 |
 | `INCR` 与 `RPUSH` 同脚本 | 两条独立命令 | 否则存在「数据已追加、版本未递增」的窗口。见 4.5 |
-| 版本 key 与数据 key 同 TTL | 版本 key 单独设一个较长 TTL | 生命周期不一致 = 版本号可能倒转。见 4.8 |
+| **版本 key `PERSIST` 永久保留**（当前实现） | 与数据 key 同 TTL（改造前）；单独设更长 TTL | 同 TTL 会被 `clear()` 同时删除或一起过期而归零，旧租约可能撞上重置后的小版本号「复活」；永久保留后版本号全局单调。见 4.8 |
 | L1 也引入版本号 | 只修 L2 | L1 会短路整条回源链路。见 4.6 |
-| L1 租约失效时**清空** | 保留现状 | 保留的是残缺上下文，会被当成完整上下文用。见 4.7 |
-| `currentVersion` 解析失败按 `0` 处理（`RedisMemory.java:81-84`） | 抛异常 | 版本号是「尽力而为的时钟」，格式异常时应退化为「保守拒绝」而不是让整条读路径挂掉。按 0 处理会让回填被拒（除非真的没有写入） |
+| L1 租约失效时**保留并发写入内容**（当前实现） | 清空（改造前） | 写顺序已改为「先 MySQL，再按租约追加 L2/L1」，L1 里是包含最新追加的列表而非残缺快照，清空反而丢消息。见 4.7 |
+| `currentVersion` 读不到结果时**抛 `IllegalStateException`**（保守失败） | 解析失败按 `0` 处理（改造前） | 版本号是正确性依赖，读不到时不应「猜一个 0」继续回填；`CURRENT_HISTORY_VERSION` Lua 统一处理 `EXISTS`/`PTTL` 分支，Java 侧对空结果保守失败。见 4.8 |
 
 ### 更轻的替代方案：按消息数增量补齐尾部
 
@@ -473,7 +580,7 @@ public void clear(String chatId) {
 
 2. **回填被拒时读线程仍然返回 MySQL 快照**（`MessageMemory.java:71-73`）。这是刻意的：MySQL 是权威源，即使回填失败，本次读的结果也应该是正确的。被拒的只是「把这份快照**写进缓存**」这个动作。
 
-3. **`clear(chatId)` 的两条 `DEL` 不是原子的**（`RedisMemory.java:183-184`）。极端情况下（`DEL` 数据 key 成功、`DEL` 版本 key 失败），会出现「数据已空、版本号仍是旧值」的状态。此时一个手持旧租约的读线程校验会**通过**，把旧快照回填进去 —— 方向上不会丢并发新增的数据（因为数据已经被 `clear` 了），但会把已清空的会话“复活”成旧内容。窗口极小，且 `clearChat` 只在用户主动清空会话时调用。属于已知残留，若要彻底消除需用 Lua 把两条 `DEL` 合并。
+3. ✅ **已修复：`clear(chatId)` 不再是两条 `DEL`**。当前走 `CLEAR_HISTORY_WITH_VERSION_BUMP` 一条 Lua：`INCR` 版本 + `PERSIST` 版本 key + `DEL` 数据 key，原子完成。既消除了「数据已空、版本仍旧，旧快照把会话复活」的窗口，也避免了版本号归零（旧的六-3 与 4.8 是同一个根因）。回归测试 `RedisCacheRegressionTest` 覆盖清空后版本仍递增、数据为空。
 
 4. **`getUserMessage` 走 `getAll`（`LRANGE 0 -1`）**（`MessageMemory.java:122`、`:127`），读取整个会话的全部消息。配合 `getAll` 的无界性，这个方法的成本随对话长度线性增长。Lease 解决了正确性问题，没有解决这个读取成本问题。
 
@@ -496,9 +603,11 @@ redis-cli GET chat:history:version:{chatId}     # 例如 "5"
 # 调一次对话接口（会触发 save）
 redis-cli GET chat:history:version:{chatId}     # 期望 "6"
 
-# 3. 数据与版本同生命周期
-redis-cli TTL chat:history:{chatId}             # 例如 86390
-redis-cli TTL chat:history:version:{chatId}     # 期望与上面基本相同（差不超过 1 秒）
+# 3. 版本 key 永久保留（当前实现；旧「同生命周期」期望已作废）
+redis-cli TTL  chat:history:{chatId}            # 例如 86390（数据 key 有 TTL）
+redis-cli TTL  chat:history:version:{chatId}    # 期望 -1 —— PERSIST，不是与上面接近
+redis-cli PTTL chat:history:{chatId}            # 期望 ≤ 86400000（24h）/ ≤ 1800000（非聚焦 30min）
+# 执行清空历史后：版本 key 仍存在且值继续递增，数据 key 被删除
 
 # 4. 手工构造"租约失效"：把版本号改掉，模拟并发 save
 redis-cli SET chat:history:version:{chatId} 9999
@@ -516,7 +625,7 @@ redis-cli TTL chat:history:staging:{chatId}:xxxxx       # 若存在，期望 <= 
 redis-cli LLEN chat:history:{chatId}
 ```
 
-> 说明：本项目的两个测试（`TaxiAgentApplicationTests`、`MongoDbTest`）都是 `@SpringBootTest` 集成测试，需要 MySQL / Redis / MongoDB / ES 全套环境。上面第 6 条的并发验证需要手工构造。
+> 说明：本项目的两个测试（`RideAgentHubApplicationTests`、`MongoDbTest`）都是 `@SpringBootTest` 集成测试，需要 MySQL / Redis / MongoDB / ES 全套环境。上面第 6 条的并发验证需要手工构造。
 
 ---
 
@@ -526,8 +635,10 @@ redis-cli LLEN chat:history:{chatId}
 - [`08-city-code-tombstone.md`](08-city-code-tombstone.md) —— 为什么「状态标记」在这里也无从下手（写路径没有可标记的动作）
 - [`06-null-sentinel-and-prewarm.md`](06-null-sentinel-and-prewarm.md) —— 状态编码的另一种形态；`__NULL__` 与本篇的版本号都是「把状态放进 value」
 - [`19-multi-level-cache.md`](19-multi-level-cache.md) —— L1/L2/L3 的整体设计与逐级回填策略；本篇只展开其中的竞态部分
-- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— `APPEND_WITH_VERSION_BUMP` 与 `OVERWRITE_IF_VERSION_MATCH` 在全部 7 个脚本中的位置
-- [`12-chat-lock-atomic.md`](12-chat-lock-atomic.md) —— 同一个 `chat:info` 结构上的 `HSET + EXPIRE` 原子化，与 `APPEND_WITH_VERSION_BUMP` 是同一类问题
+- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— 五段历史 Lua 在**当前 22 个主脚本**中的位置，以及 11 个内联脚本的清单（旧「7 个脚本」已过时）
+- [`12-chat-lock-atomic.md`](12-chat-lock-atomic.md) —— 同一个 `chat:info` 结构上的 `HSET + EXPIRE` 原子化；版本 key 的 `PERSIST` 与会话 key 的 `persist` 是两件不同的事，不要混淆
+- [`23-ticket-pool-zset.md`](23-ticket-pool-zset.md) —— `ticket:pool:version` 同样无 TTL，是「版本令牌永久保留」这一模式的第二处落地
+- [`README.md`](README.md) —— 术语与状态标注规范、跨文档引用枢纽
 - [`13-distributed-lock.md`](13-distributed-lock.md) —— `RELEASE_LOCK_IF_MATCH`：另一处「校验 + 动作」的原子合并
 - Facebook *Scaling Memcache at Facebook*（NSDI '13），第 3.2 节 "Leases" —— Lease 令牌的原始论文
 - [`../../02-cache-consistency-race.md`](../../02-cache-consistency-race.md) —— 2.3 节的原始盘点（行号已漂移，以代码为准）

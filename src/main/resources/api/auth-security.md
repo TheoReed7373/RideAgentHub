@@ -1,6 +1,6 @@
 # 认证接口变更
 
-接口路径保持 /auth/email-code、/auth/register、/auth/login/password、/auth/login/email-code、/auth/password/reset、/auth/logout、/auth/account。
+接口路径保持 /auth/email-code、/auth/register、/auth/login/password、/auth/login/email-code、/auth/password/reset、/auth/logout、/auth/account（`@DeleteMapping`，**DELETE** 方法）。此外还有 `GET /auth/username/available`（用户名可用性检查，无需登录，仅受来源地址限流）、`GET /user/current`（读取当前用户）与 `POST /user/current/update`（资料修改，含改绑邮箱；**不存在 `POST /user/current`**）、`POST /user/current/password/reset`、`POST /user/admin/{support/page,create,delete,disable,activate,page,update}`（7 个管理员账户管理端点）、`POST /user/rebuild`（布隆过滤器重建）。`/user/admin/**` 与 `/user/rebuild` 都要求 `ADMIN` 权限，经 `AuthTokenInterceptor → UserTokenContext → PermissionAspect → @RequirePermission` 鉴权链；上述 `/auth/**` 与 `/order/estimate` 是入口层来源地址限流的作用路径，`OPTIONS` 预检请求放行（不消耗配额）。
 
 邮箱验证码使用安全随机数。发送冷却、失败次数和消费均由 Redis 原子操作处理：同一码最多成功一次，5 次错误后失效，邮箱大小写与首尾空白统一处理。注册和重置密码在数据库事务中预留验证码，提交后消费，回滚后释放预留；邮件发送失败仅清理本次发送所属状态。
 

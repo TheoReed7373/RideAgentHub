@@ -2,7 +2,84 @@
 
 > **Redis 考点**：多级缓存的读路径编排与逐级回填；本地缓存与分布式缓存的分工；用版本号（Lease）保证回填不覆盖更新的数据。
 > **来源**：`docs/01-redis-application-points.md` 第一节（现状盘点，多级缓存 L1/L2/L3）
-> **完整路径**：`src/main/java/com/fancy/taxiagent/agentbase/memory/`
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/agentbase/memory/`、`src/main/java/com/fancy/rideagenthub/service/base/ChatRequestRunner.java`、`src/main/java/com/fancy/rideagenthub/agents/AgentStreams.java`
+> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
+
+---
+
+## 【当前实现总览】（先看这一节，再读下方改造前推导）
+
+> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文与七章 `redis-cli` 命令写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
+
+| # | 正文中的旧说法 | 当前代码事实 |
+|---|---|---|
+| 1 | 结构表 / 4.5「版本 key 与数据 key 同寿命、严格同步」、验证 #3 `TTL chat:history:version ≈ 数据 key`、#4 `DEL` 版本 key 后「回填时 INCR 到 1」 | 版本 key 经 `PERSIST` **无 TTL**（`TTL = -1`，`RedisScripts.java:177,184,200,223,232`）；`DEL` 版本 key 后 `CURRENT_HISTORY_VERSION` **重置为 0**。旧 TTL 期望全部失效 |
+| 2 | 3.1/4.4/4.6/6.1/6.2 写序「L1 → L2 → L3」「缓存超前于 DB」「L1 租约失效清空」「Redis 故障 SSE 永不结束」 | 当前写序 **L3(MySQL) → L2 → L1**（`MessageMemory.java:100-108`）；L1 租约失效**保留并发写入内容**（`:196-198`）；异常由 `AgentStreams.guard` 发 `error` 并结束 sink。**仍成立的只有**「L2 读取不降级 MySQL」这一条 |
+| 3 | "`MessageWindow.tail` 损坏历史从下一个用户轮重新开始 / 拒绝孤立工具结果" | `tail` 遇损坏历史**直接抛 `IllegalStateException`**（`MessageWindow.java:40-42`），会让 `MessageMemory.get/getPersisted` 失败；「从下一条 UserMessage 重建」是 `MessageParser.unparseHistory:17-35` 的行为。两者错误语义相反，不能混写 |
+| 4 | 缺写路径的三道正确性机制 | 见下方补充 |
+
+### 【补充】写路径为什么不会写幽灵消息
+
+`getPersisted` 直查 MySQL 供 HITL 恢复（`MessageMemory.java:171-175`），不经过可能被污染的 L1/L2；`MysqlMemory.append` 用 `FOR UPDATE` 行锁并校验 410 墓碑（`:66-70`），防止往已停用的会话追加；`APPEND_HISTORY_IF_VERSION_MATCH` 在版本不符时直接 `DEL` 数据 key（`RedisScripts.java:197-210`），让旧租约的回填不仅失败、还会清掉可能被覆盖的缓存。三者合起来解释了一个容易只记结果的问题：**为什么 L3 先写、L2/L1 后写仍然安全** —— 因为权威源始终可回查，缓存层只是可丢弃的加速副本。
+
+---
+
+### 1. 业务背景与模块关系
+
+每轮对话都要把上下文交给 LLM，但「完整历史」放在 MySQL、「近期热数据」放 Redis 与堆内能显著降低延迟。难点是**逐级回填可能覆盖并发写入的新消息**（Lease 令牌，见 [09 篇](09-lease-token.md)），以及**多实例各存一份 L1** 带来的不一致。当前分层：`HeapMemory`(L1) → `RedisMemory`(L2) → `MysqlMemory`(L3)，由 `agentbase/memory/MessageMemory.java` 统一编排；`ToolResponseMemory` 是**独立的 Redis + MySQL 两级辅助索引**，不属于这条链（见 [20 篇](20-tool-response-cache.md)）。
+
+### 2. 完整读写链路（与原文 4.1/4.2 的顺序相反）
+
+**读** `MessageMemory.get(userId, chatId, lastN)`：
+
+```java
+if (chatManager.isNewOwnedChat(userId, chatId)) return List.of();   // 归属守卫：新会话不回源
+long heapLease  = heapMemory.currentVersion(chatId);
+long redisLease = redisMemory.currentVersion(chatId);                // 先取租约，再耗时读取
+List<Message> heapAll = heapMemory.getAll(chatId);
+if (!heapAll.isEmpty())  return MessageWindow.tail(heapAll, lastN);
+List<Message> redisAll = redisMemory.getAll(chatId);
+if (!redisAll.isEmpty()) { fillHeapWithLease(...); return tail(redisAll, lastN); }
+List<Message> mysqlAll = mysqlMemory.getAll(chatId);                  // 权威源
+if (!mysqlAll.isEmpty()) { if (fillRedisWithLease(...)) fillHeapWithLease(...); return tail(mysqlAll, lastN); }
+```
+
+三层都改成 **`getAll` + `MessageWindow.tail`**（不再 `getLastN`），因为工具调用批次不能被从中间截断；`ChatServiceImpl` 现在用 `memory.get(userId, id, 100)` 而不是 `get(..., 1)`。
+
+**写** `MessageMemory.save(userId, chatId, msgs)`：`assertOwned` → `switchFocusChatIfNeeded` → **先 `mysqlMemory.append`（L3）** → `redisMemory.appendIfVersionMatch`（L2）→ `heapMemory.appendIfVersionMatch`（L1）；L2/L1 抛异常时 `heapMemory.clear(chatId)` 后上抛。这与原文「L1→L2→L3 同步写入」正好相反，也是 4.7 节「L1 租约失效要清空」结论反转为「保留」的根因。
+
+### 3. 版本 key 的生命周期（原文 3.2 / 6.7 结论反转）
+
+| 项 | 改造前（原文） | 当前 |
+|---|---|---|
+| 版本 key | 与数据 key 同 TTL | **`PERSIST` 永久保留（TTL `-1`）**，5 段 Lua 共 6 处 |
+| `clear` | 两条 `DEL` 删数据 + 删版本 | `CLEAR_HISTORY_WITH_VERSION_BUMP`：`INCR` 版本 + `PERSIST` + `DEL` 数据，原子 |
+| L1 租约失效 | **清空** | **保留**并发写入内容（`HeapMemory.overwriteIfVersionMatch` 返回 `existing`） |
+| 工具结果缓存 | 三级 | Redis + MySQL 两级 |
+
+为什么反转：版本 key 若随数据过期/清空归零，`INCR` 会从 1 重新开始，某个在途租约恰好等于 1 时校验会通过，把旧快照「复活」。详见 [09 篇](09-lease-token.md) 4.8。
+
+### 4. SSE 异常出口与 3 分钟超时（原文 6.1 的核心结论仍成立）
+
+原文指出「L2 读取没有 `try/catch`、Redis 故障时不降级 MySQL，`CompletableFuture.runAsync` 的异常会被静默丢弃、SSE 永不结束」—— **前半句至今成立**：L2 异常不会自动回退到 L3，这是当前已知的可用性边界。**后半句已被修复**：`ChatController` 委托 `service/base/ChatRequestRunner.run`，`agents/AgentStreams.guard` 捕获异常后 `sink.tryEmitError` 并结束流，用 `takeUntilOther(Mono.delay(Duration.ofMinutes(3)))` 给模型调用设 3 分钟超时，完成回调失败也会结束 sink；单轮执行锁在 `doFinally` 释放，客户端断开不提前放锁。线程池由 `config/AsyncWorkConfig` 的 `chatExecutor`（8/32/64）与 `ragExecutor`（4/8/32）隔离。
+
+### 5. 归属守卫、消息窗口与损坏历史
+
+- `isNewOwnedChat` / `assertOwned`：非本人会话 404、停用会话 410，由 `ChatInfoService` + `GlobalExceptionHandler` 映射（状态码 400–599 内直接透传）。
+- `MessageWindow.tail` 保证完整的「`AssistantMessage`(含 tool call) + `ToolResponseMessage`」批次不被拆开，**拒绝孤立的工具结果**；遇到损坏历史会从下一个用户轮重新开始，避免把半个批次喂给模型（`SecurityRepairRegressionTest` 有对应断言）。
+- `ESMemory` 仍是空占位类、`MemoryAdvisor` 仍返回 `null`（0 调用方），属于 📐 设计中的骨架，不要当作第四层记忆。
+
+### 6. 边界与面试延伸
+
+| 问题 | 当前答案 |
+|---|---|
+| 多实例 L1 不一致怎么办 | 每实例一份，靠版本租约保护回填；不追求强一致，只保证「不覆盖更新的数据」 |
+| Redis 全挂会怎样 | L2 读取异常上抛，不自动降级 MySQL；SSE 由 `guard` 发 error 并结束，不会永久挂起 |
+| 为什么 `getAll` 而不是 `getLastN` | 工具调用批次的完整性；`MessageWindow.tail` 在截取后保证配对 |
+| 为什么先写 MySQL | 持久化权威优先，避免「缓存里有、库里没有」的幽灵消息 |
+| 原文哪些已过时 | `getLastN`、L1→L2→L3 写顺序、L1 清空、版本 key 同寿命、`clear` 两 key 一起删、`ToolResponseMemory` 三级缓存、八章「对照三级缓存两种写法」 |
+
+详见 [`../agent/01-orchestration-and-sse.md`](../agent/01-orchestration-and-sse.md)、[`../agent/03-security-and-boundaries.md`](../agent/03-security-and-boundaries.md)。
 
 ---
 
@@ -356,7 +433,7 @@ redis-cli TTL chat:history:staging:{chatId}:{uuid}
 ## 八、延伸阅读
 
 - [`09-lease-token.md`](09-lease-token.md) —— Lease 令牌机制完整推演：为什么"放弃回填"优于"覆盖"，版本号为什么必须在耗时读取之前取
-- [`20-tool-response-cache.md`](20-tool-response-cache.md) —— 同一目录下另一套 L1/L2/L3，可以对照看"三级缓存"的两种写法
+- [`20-tool-response-cache.md`](20-tool-response-cache.md) —— 工具结果的 **Redis + MySQL 两级辅助索引**（旧「同一目录另一套 L1/L2/L3」已过时）；可对照「版本 key `PERSIST`」与「固定 24h TTL」两种生命周期策略
 - [`06-null-sentinel-and-prewarm.md`](06-null-sentinel-and-prewarm.md) —— 空值哨兵与预热，缓存穿透的另一面
 - [`../02-cache-consistency-race.md`](../../02-cache-consistency-race.md) —— 2.3 节专门分析本文这套 L2 回填的竞态
 - [`../01-redis-application-points.md`](../../01-redis-application-points.md) —— 现状盘点表中的「多级缓存 L1/L2/L3」条目
