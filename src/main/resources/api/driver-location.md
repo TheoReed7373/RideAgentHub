@@ -1,5 +1,7 @@
 # 司机位置与附近订单
 
+> 文中 `Result<T>` 仅表示 data 的类型；源码 Result 非泛型，字段为 code、message、data、total。分页记录和总数位于 data.records / data.total，外层 total 通常为 0。
+
 以下接口均需登录司机账号（`DRIVER`），司机 ID 从登录态获取。
 
 ## 上线与位置心跳
@@ -13,7 +15,7 @@
 ```
 
 经度范围 `[-180, 180]`，纬度范围 `[-85.05112878, 85.05112878]`，两个字段均必填。
-建议上线后每 20 秒上报一次；距最后心跳满 60 秒即视为离线。
+建议上线后每 20 秒上报一次（20 秒是**客户端建议值**，服务端没有该常量）；服务端只按 `ONLINE_TTL = 60s` 判定：距最后心跳满 60 秒即视为离线。心跳判定使用 Redis `TIME` 作为统一时间源，避免多实例应用时钟偏斜。
 返回 `Result<Boolean>`，`data=true` 表示写入成功，`false` 表示缓存写入失败，应重试。
 
 ## 主动下线
@@ -30,17 +32,17 @@
 返回 `Result<DriverLocationVO>`：
 
 ```json
-{"code":200,"message":"success","data":{"online":true,"lng":120.0,"lat":30.0},"total":0}
+{"code":200,"message":"success","data":{"online":true,"lng":"120.0","lat":"30.0"},"total":0}
 ```
 
-以项目统一 `Result` 封装为准；离线时 `online=false`，坐标为空。
+`Config.jacksonCustomizer` 将 BigDecimal（含此处经纬度与订单 distanceKm）序列化为字符串，具体小数位按实际值。以项目统一 `Result` 封装为准；离线时 `online=false`，坐标为空。
 位置服务不可用时返回业务错误码 `503`，不会误报离线。
 
 ## 司机附近工单池
 
 `GET /order/driver/pool/page?page=1&size=10`
 
-页码和页大小必须为正整数。返回 `Result<PageResult<RideOrderVO>>`。
+HTTP 查询参数 page 和 size 均必填，且必须为正整数（服务方法直接调用时 null 才使用 1/10 默认值）。返回 `Result<PageResult<RideOrderVO>>`。
 
 - 在线司机以当前位置查询三公里内待接单订单，按距离升序返回，最多取最近 200 个候选。
 - `total` 是本次候选中有效订单数，最大 200，不代表全城订单总数。

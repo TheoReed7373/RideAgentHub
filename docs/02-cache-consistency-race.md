@@ -1,405 +1,149 @@
-# 缓存一致性竞态盘点：延迟双删 / 墓碑 / Lease
+# 缓存一致性：延迟双删 / 墓碑 / Lease 令牌的竞态与落地
 
-> 目标：定位 TaxiAgent 中"DB 更新导致缓存脏数据"的真实竞态点，
-> 并为延迟双删、墓碑机制、Facebook Lease 令牌三种解法找到最合适的落点。
-> 代码引用格式为 `文件:行号`，基于 `main` 分支 `8d5d574`。
+> 目标：盘点 RideAgentHub 中「DB 更新导致缓存脏数据」的真实竞态点，讲清延迟双删、墓碑机制、Facebook Lease 令牌三种解法各自解决什么、边界在哪，以及它们在本项目中的当前落地状态。
+> 代码定位格式为「类名 + 方法名」，路径基准 `src/main/java/com/fancy/rideagenthub/`（下称 `<base>/`）。
+> 深入拆解见 [07](learn/redis/07-delayed-double-delete.md) / [08](learn/redis/08-city-code-tombstone.md) / [09](learn/redis/09-lease-token.md) 三篇笔记。
 
 ---
 
-## 一、排查结论总览
+## 一、竞态盘点总览
 
-先把**不存在竞态**的缓存划掉，避免过度设计。
+先把**不存在竞态**的缓存划掉，避免过度设计：
 
-| 缓存 | 数据可变？ | 有失效路径？ | 回填语义 | 结论 |
+| 缓存 | 数据可变？ | 回填 / 写入语义 | 结论 |
+|---|---|---|---|
+| `TokenServiceImpl` | — | — | **安全**：Redis 本身是数据源，无 DB 双写；写入走 `SAVE` Lua 原子发布 |
+| `EmailCodeService` | — | — | **安全**：同上，四段 Lua 维护全部状态 |
+| `ToolResponseMemory` | 否（按 `(callId, chatId)` 不可变） | `set` 覆盖 | **安全**：工具结果不修改；MySQL 侧每次 `insert` 新行、取 `orderByDesc(id) LIMIT 1`，重复调用会累积重复行，属已知的存储冗余，不是缓存竞态 |
+| `HeapMemory`（L1） | 是 | 租约校验覆盖 | **受保护**：由 `MessageMemory` 统一调度，租约失效时保留并发写入内容 |
+| `ESMemory` / `MemoryAdvisor` | — | — | 空占位类，无业务调用方（设计中，不参与盘点） |
+| `UserUsernameBloomFilterService` | 只增 | `rebuild` 全量 | 非双写竞态，是**重建期假阴性**（见 3.4） |
+| `CityCodeUtil` | 是 | 版本校验回填 | **已防护**：读侧版本 + 墓碑两段 Lua；写路径未接线（见 2.2） |
+| 工单统计缓存 | 高频 | 双删 + 随机 TTL | **已防护**：统一失效 + 提交后立即删除 + 500ms 二次删除（见 2.1） |
+| `ChatManager` / `ChatInfoService` | 双写 | `HASH_SET_WITH_EXPIRE` Lua | 原子化已防护；`restoreChat` 的 `persist` 是有意的语义（见 3.1） |
+| 聊天历史 L2/L3 | 双写 | 版本租约回填 | **已防护**：Lease 令牌（见 2.3） |
+
+三个需要一致性防护的缓存，正好对应三种解法的适用边界：
+
+- **2.1 延迟双删** —— 「删除被并发回填覆盖」，用**第二次删除**兜住
+- **2.2 墓碑机制** —— 「TTL 太长，时间窗口猜不准」，用**状态标记**替代猜时间
+- **2.3 Lease 令牌** —— 「回填本身就是破坏性覆盖」，只有**版本校验**能解
+
+---
+
+## 二、三处真竞态与三解法
+
+### 2.1 延迟双删 → 工单统计缓存
+
+**竞态模型**。工单统计（`getTicketStatistics`）缓存 20~30 秒，写工单的方法有 10 个（`submitTicket`、状态流转、分配、关闭等），每个都调用 `afterTicketMutation` 统一收尾。危险序列是：
+
+```
+写线程：DB 提交 → 删除缓存
+读线程：        ← 在删除之前已把旧 DB 快照查走
+读线程：此刻才把旧快照 set 回缓存     ← 删除被回填覆盖，脏数据存活一个 TTL
+```
+
+单次删除兜不住「读线程在删除前已经查走旧快照、在删除后才写回」的窗口 —— 旧快照回填的时机不可预测。
+
+**当前实现**（`TicketServiceImpl.evictTicketStatistics` + `service/base/DelayedCacheEvictor`）：
+
+1. **提交后失效**：删除动作挂在 `afterCommit`，事务回滚时根本不触发；若在事务内删除，并发读会拿到「尚未提交的 DB 快照」并回填，制造出比目标竞态更早、更容易触发的脏窗口。
+2. **第一次删除**：立即 `delete`，包在 `try/catch(RuntimeException)` 里，失败只 `log.warn` —— 数据库已提交，缓存故障交给第二次删除兜。
+3. **第二次删除**：`DelayedCacheEvictor`（自建单线程守护调度器）在 500ms 后再删一次，兜住「并发读基于旧快照回填」的窗口。延迟取值需覆盖「读线程查 DB + 回填」的耗时（统计查询 4 次 `selectCount`，实测几十毫秒，取 500ms 留足余量）；延迟过长只是多几次未命中，不会造成脏数据。
+4. **保守失效**：不区分本次写入是否真的影响 4 个统计项，一律失效。B 端仪表盘多几次重建的代价远低于漏失效。
+
+`afterTicketMutation` 的顺序是刻意安排的：**先注册索引同步**（`ticketPoolIndex.syncByTicketId` 挂 `afterCommit`），**再调 `evictTicketStatistics`** —— 统计缓存的独立故障不能阻止索引版本推进。
+
+**边界**：延迟双删降低的是概率，不是消除竞态 —— 若回填发生在第二次删除之后（读线程卡顿超过 500ms），仍会留下脏数据，直到随机 TTL 到期自愈。它适合「短 TTL + 低价值数据」的缓存；对 7 天 TTL 的数据请看墓碑。
+
+### 2.2 墓碑机制 → 城市编码缓存
+
+**竞态模型**。城市编码缓存 TTL 7 天（`CityCodeUtil.CACHE_TTL_DAYS`）。直接 `DEL` 失效是危险的：
+
+```
+写线程：城市数据变更，DEL key
+读线程：此刻 key 不存在 → 查 DB（拿到的是旧快照，写尚未可见）→ set 旧值 + 7 天 TTL
+```
+
+延迟双删在此救不了：无法预测该读线程何时回填，「sleep 多久」无从取值。**把『猜时间』换成『看状态』**——写线程不删 key，而是写入一个短 TTL 的墓碑（`__TOMBSTONE__`，5 秒），读线程见到墓碑就知道「此刻别回填」。
+
+**当前实现**（`CityCodeUtil` + `RedisScripts` 两段 Lua + 版本 key）：
+
+- 读路径 `getCityCode`：先读版本 key `amap:city_code:version:{name}` 与数据 key；命中墓碑 → 查 DB 但**不回填**（回填会把墓碑覆盖成 7 天 TTL 的正常条目，使竞态窗口重新打开）；缓存 miss → 查 DB 后走 `CACHE_CITY_CODE_IF_VERSION_MATCH`（版本匹配才 `SET NX EX` 回填，不覆盖任何已有值）。
+- 失效路径 `invalidate`：`INVALIDATE_CITY_CODE` Lua 原子完成「`INCR` 版本号 + 写 5 秒墓碑」。版本号的作用是兜住墓碑到期后的迟到回填：墓碑只有 5 秒，若读线程恰在墓碑过期后才尝试回填，版本号已经递增，`CACHE_CITY_CODE_IF_VERSION_MATCH` 的版本比对会拒绝它。
+- key 规范化：`trim().toLowerCase(Locale.ROOT)` 在 cache key 与 DB 查询前统一执行，两者永远使用同一个值（MySQL 8 默认 `NO PAD` 排序规则下 `北京 ` 与 `北京` 结果不同，共用一个 key 会造成缓存污染）。
+
+**边界（重要）**：`invalidate()` 目前**没有生产调用方**——机制、Lua、回归测试齐备，但城市表的写路径（`bus_citycode.sql` 导入、运维改数）尚未接入失效调用。这是「机制已就位、写路径未接线」的部分实现状态：读路径的版本校验与哨兵防穿透是生效的；写侧主动失效需要在使用城市表写入的地方补 `invalidate` 调用。
+
+### 2.3 Lease 令牌 → 聊天历史回填
+
+**竞态模型**。聊天历史 L2 是 Redis List，回填的语义是「用 MySQL 快照**整体替换**缓存」。当「回填」与「并发追加」撞上：
+
+```
+T1 读线程：L1/L2 miss → 查 MySQL 得快照 S = [消息 1..10]
+T2 写线程：save → 追加消息 11（L3、L2、L1）
+T1：用 S 整体替换 L2 → L2 变回 [1..10]，消息 11 从缓存里消失
+```
+
+这是缓存中的消息遗漏，MySQL 记录仍存在。L2 看起来完整且非空，命中期间不会回源 MySQL；缓存失效或过期后才有机会重建，若旧列表又进入无 TTL 的 L1，陈旧状态还可能持续更久。
+
+为什么另外两个解法在此失效：
+
+| 机制 | 需要的前提 | 本场景 |
+|---|---|---|
+| 延迟双删 | 写路径存在「删除」动作 | ❌ `save` 是 `RPUSH` 追加，没有删除可谈第二次 |
+| 墓碑 | 存在可标记的「失效」动作 | ❌ 问题出在读路径的破坏性回填，写线程没做错任何事 |
+
+**当前实现**（`agentbase/memory/` 三层 + `RedisScripts` 五段历史脚本）：
+
+1. **取租约必须在任何耗时读取之前**：`MessageMemory.get` 先捕获 `redisLease`（`CURRENT_HISTORY_VERSION` Lua 读版本号），再去查 L2 / MySQL。若查完才取版本号，「查 MySQL」这段窗口就没有被租约覆盖。
+2. **写路径使所有在途租约失效**：`save` 先落 MySQL，再走 `APPEND_HISTORY_IF_VERSION_MATCH`——版本不符时 `DEL` 数据（让在途租约必然失效），版本相符且数据 key 已存在时 `RPUSH` + `PEXPIRE`，缓存缺失时不新建只含增量的残缺历史；版本递增与数据追加在同一次 Lua 内完成，不存在「消息可见但版本未变」的中间态。
+3. **回填持租约**：数据先写入暂存 key（`MULTI` 原子 `RPUSH` + 1 分钟 TTL），再由 `OVERWRITE_IF_VERSION_MATCH` Lua 原子完成「校验版本 + `RENAME` 暂存为数据 key」。租约失效 → 脚本 `DEL` 暂存 → 回填放弃（**被拒绝是正确行为**，代价只是一次多余的 MySQL 查询）。回填数据走暂存 key 而非 `ARGV`，是因为消息量不可控，而 `RENAME` 是 O(1) 的元数据操作。
+4. **版本 key 永久保留**：五段脚本都会 `PERSIST` 版本 key。若版本 key 与数据同生命周期（一起 TTL 或被 `clear` 同时删除），版本号会归零重新计数，某个在途租约恰好等于重置后的小值时会「复活」。版本号是租约的时钟——**可以停，不能倒转**。
+5. **L1 也要租约**：`HeapMemory` 每条目带版本号，`overwriteIfVersionMatch` 在 `ConcurrentHashMap.compute` 内原子校验；租约失效时保留并发写入内容（写顺序是先 MySQL 再追加 L2/L1，回填拒绝保留当前条目；写追加版本失配则失效为只保留版本的空列表，跨实例 L1 陈旧仍是独立边界）。
+
+**边界**：回填被拒时无 single-flight，N 个并发 miss 会产生 N 次 MySQL 查询（性能问题而非正确性问题）；`getAll`（`LRANGE 0 -1`）的读取成本随对话长度线性增长。
+
+---
+
+## 三、附带缺陷与现状
+
+### 3.1 `restoreChat` 的 `persist`（有意为之，但语义需留意）
+
+`ChatInfoService.restoreChat` 在恢复会话时对 `chat:info` 执行 `persist`，使该 key 永不过期。这是「恢复的会话不应在用户还在用时被 TTL 收掉」的取舍，代价是被恢复会话的 key 生命周期与用户是否活跃脱钩。与 `HASH_SET_WITH_EXPIRE`（`lockChat` 写 60 分钟 TTL）叠加后，`chat:info` 的 TTL 语义是「普通 HSET 不主动设 TTL、报价 24 小时、锁定或恢复检查 60 分钟、POST 恢复后永久」——三种状态并存，是 [12 篇](learn/redis/12-chat-lock-atomic.md) 讨论 TTL 语义矛盾的来源。
+
+### 3.2 手写锁的释放失败
+
+`RedisLock.unlock` 捕获 `RuntimeException` 只记 warn：**不覆盖临界区的返回值或异常**，剩余锁由固定 TTL（5~10 秒）兜底释放。这是「锁释放失败不应把业务结果一起拖垮」的取舍，代价是 TTL 窗口内其他实例无法重建。
+
+### 3.3 令牌消费与业务执行分离
+
+取消令牌（`OrderSearchTool.CANCEL`）与创建权限（`OrderConfirmation.CONSUME`）的**消费**已由 Lua 原子化（校验 + 时效 + `HDEL` 一步完成），但「令牌消费」与「业务执行」（真正调 Service 取消订单 / 创建订单）仍是两段：极端时序下可能出现令牌已消费、业务执行失败，用户需要重新走一次确认。属于已知的残留窗口。
+
+### 3.4 布隆重建期假阴性
+
+`UserUsernameBloomFilterService.rebuild` 先 `delete` 再 `tryInit` + 全量回灌，重建窗口内「一定不存在」的判定会出现假阴性（已注册的用户名被误报可用）。后果已被数据库生成列唯一索引（`uk_active_username_role`）兜底：并发注册重名会被 DB 拒绝（`DuplicateKeyException` → 409），当前 `mightContain` 无生产调用方，可用性检查直查 DB，因此重建不会改变该接口结果；若未来接入才需处理此缺失窗口。若要消除，可用双 key 切换重建。
+
+### 3.5 工具结果 MySQL 重复行
+
+`ToolResponseMemory.save` 每次调用都 `mapper.insert` 新行，读取按 `orderByDesc(id) LIMIT 1` 取最新。同一 `(callId, chatId)` 重复保存会累积冗余行。数据库回源取最大 id 的行；Redis 命中不核对数据库版本，同一调用若保存不同内容，缓存仍可能陈旧，因此只有相同内容不可变的前提下才只是存储冗余。
+
+---
+
+## 四、三解法适用边界总结
+
+| | 前提条件 | 解决的窗口 | 残留风险 | 本项目落点 |
 |---|---|---|---|---|
-| `TokenServiceImpl` | — | — | — | ✅ **安全**：Redis 本身是数据源，无 DB 双写 |
-| `EmailCodeService` | — | — | — | ✅ **安全**：同上，验证码只存在于 Redis |
-| `ToolResponseMemory:28-72` | 否 | — | `set` 覆盖 | ✅ **安全**：tool 结果按 `callId` 不可变 |
-| `HeapMemory` | 是 | — | `overwrite` | ➖ L1 进程内，由 `MessageMemory` 统一调度 |
-| `ESMemory` | — | — | — | ➖ 空实现（规划中） |
-| `UserUsernameBloomFilterService:41-61` | 只增 | 仅 `rebuild` 全量 | — | ⚠️ 非双写竞态，是**重建期穿透**（见 3.3） |
-| `CityCodeUtil` | 是 | **无** | 全量 `set` | ⚠️ **真竞态**，TTL 7 天 → 见 2.2 |
-| `TicketServiceImpl` 统计缓存 | 高频 | **无** | `set` 覆盖 | ⚠️ **真竞态** → 见 2.1 |
-| `ChatManager` / `ChatInfoService` | 是 | 双写 | — | ⚠️ **真竞态**，DB+Redis 双写非原子 → 见 3.1 |
-| `RedisMemory` / `MessageMemory` | 是 | 双写 L2/L3 | **`clear` + 全量 `append`** | ⚠️⚠️ **真竞态且会丢数据** → 见 2.3 |
-
-三个真竞态点的差异，正好对应三种解法的适用边界：
-
-- **2.1 延迟双删** —— "删除被回填覆盖"，用**第二次删除**兜住
-- **2.2 墓碑机制** —— "TTL 太长，时间窗口猜不准"，用**状态标记**替代猜时间
-- **2.3 Lease 令牌** —— "回填本身就是破坏性覆盖"，只有**版本校验**能解
-
----
-
-## 二、三处真竞态
-
-### 2.1 延迟双删 → `TicketServiceImpl` 工单统计缓存
-
-**现状**
-
-`ticketStatisticsKey` **全项目只有 `getTicketStatistics` 读写，没有任何一处删除**：
-
-```
-RedisKeyConstants.java:165   — ticketStatisticsKey 定义
-RedisKeyConstants.java:173   — ticketStatisticsLockKey 定义
-TicketServiceImpl.java:985   — 读
-TicketServiceImpl.java:1002  — 写
-TicketServiceImpl.java:1035  — 写（cached 方法内）
-```
-
-所有写工单的方法**没有一个碰缓存**：
-
-| 方法 | 行号 | 操作 |
-|---|---|---|
-| `submitTicket` | 121 | insert |
-| `cancelTicket` | 163 | update status |
-| `confirmAndRate` | 208 | update status |
-| `assignTicket` | 347 | update handler + status |
-| `reassignTicket` | 389 | update handler + status |
-| `processTicket` | 445 / 459 / 473 | update status（四个分支） |
-| `sendMessage` | 525 | update status |
-| `escalateTicket` | 843 | update priority |
-| `escalateTicketByAdmin` | 887 | update priority |
-| `appendUserMessage` | 933 | update time |
-| `updateTicketTime` | 621 | update time（辅助方法，被多处调用） |
-
-**竞态形态**
-
-改造加上"写时删缓存"之后，竞态才会暴露：
-
-```
-T1  getTicketStatistics:985   读缓存 miss
-T1  :993                      tryLockTicketStatistics 拿锁成功
-T1  :1001                     queryTicketStatisticsFromDb  // 4 次 selectCount，几十 ms
-T2  submitTicket:121          insert 工单
-T2  (改造后)                   delete cache                  // ← 第一次删除
-T1  :1002                     cacheTicketStatistics(cacheKey, fresh)  // ← 写回"不含新工单"的旧统计
-```
-
-**关键点：`TicketServiceImpl:993-1006` 那个互斥锁防不住这个竞态**，因为写方（T2）不走锁。
-第一次删除被 T1 的回填覆盖了 —— 这正是延迟双删存在的唯一理由：**回填之后再删一次**。
-
-**改造方向**
-
-```java
-// 写方法统一加失效（建议用注解 + AOP，避免 10+ 处散落）
-@CacheEvict(key = "ticket:statistics")   // 或自定义注解
-public void submitTicket(...) { ... }
-
-// 延迟双删
-public TicketDataVO getTicketStatistics() {
-    // ... 现有逻辑
-    cacheTicketStatistics(cacheKey, fresh);
-    scheduleDelayedEvict(cacheKey, 500);   // ← 延迟第二次删除
-    return fresh;
-}
-```
-
-**工程诚实说明**
-
-这个 key 的 TTL 只有 **20 + 0-10 秒抖动**（`TicketServiceImpl:65-66`、`1039-1040`），
-所以脏数据窗口**本来就有界**。严格按工程标准，**加个删除就够，延迟双删是过度设计**。
-
-> 它的价值在这里是**教学**：演示"为什么加了删除还会有脏数据"。
-> 也正因为 TTL 短，"延迟双删的 sleep 该睡多久"这个致命缺陷在这里不够刺眼 ——
-> 这一点正好指向 2.2。
-
----
-
-### 2.2 墓碑机制 → `CityCodeUtil`
-
-**现状**
-
-`CityCodeUtil:35-61` 缓存高德城市编码：
-
-```java
-private static final String NULL_SENTINEL = "__NULL__";   // :20
-private static final long CACHE_TTL_DAYS = 7;             // :21
-
-public String getCityCode(String cityName) {
-    String key = RedisKeyConstants.amapCityCodeKey(cityName);   // :40
-    String cached = redisTemplate.opsForValue().get(key);
-    if (cached != null) {
-        return NULL_SENTINEL.equals(cached) ? null : cached;    // :43
-    }
-
-    CityCode cityCode = cityCodeMapper.selectOne(...);          // :46-51
-    String code = cityCode == null ? null : cityCode.getCityCode();
-    redisTemplate.opsForValue().set(key,                        // :54-59
-            code == null ? NULL_SENTINEL : code,
-            CACHE_TTL_DAYS, TimeUnit.DAYS);
-    return code;
-}
-```
-
-**为什么必须是这里**
-
-1. **TTL 是 7 天**。同样的读写竞态，脏数据存活 7 天。
-   延迟双删的"sleep N 毫秒"在这里**彻底失效** —— 不可能 sleep 7 天，也不可能覆盖所有并发窗口。
-   它暴露了延迟双删的本质缺陷：**靠猜时间**。
-
-2. **它已经有一个墓碑的近亲**：`NULL_SENTINEL = "__NULL__"`（`:20`）。
-   空值哨兵（防穿透）和墓碑是同一套思路 —— **把状态编码进 value，而不是靠时间猜**。
-   墓碑只是把 `"__NULL__"` 换成 `"__TOMBSTONE__"` + 5 秒短 TTL。
-
-3. **现在没有任何失效路径**。城市表改名/纠错后缓存 7 天不动。
-
-**改造方向**
-
-```
-写城市表 → SET amap:city_code:{name} "__TOMBSTONE__" EX 5    // 短 TTL 墓碑
-
-读 → 读到 "__TOMBSTONE__"
-   → 视为"此刻有写入正在进行，缓存不可用"
-   → 走 DB 查询
-   → 不回填（或延迟回填）
-```
-
-把延迟双删那个"第二次删除"的**不确定时间**，换成一个**确定的状态标记**：
-读线程看到墓碑就知道"别回填"。
-
-**关键区别**（值得在文档/演示中强调）：
-
-| | 延迟双删 | 墓碑机制 |
-|---|---|---|
-| 拦截依据 | 时间（sleep N ms） | 状态（读到墓碑） |
-| 窗口是否确定 | ❌ 靠猜，高并发下无论睡多久都有窗口 | ✅ 确定，写到墓碑清除为止 |
-| 额外开销 | 一次延迟删除 | 一次墓碑写入 + 墓碑自身 TTL 管理 |
-| 适用 | 短 TTL、低并发 | 长 TTL、写不频繁但要求强一致 |
-
-> **注意**：墓碑要求写路径**必须写入墓碑**，否则退化成普通删除。
-> 所以它的前提是写路径可控（本项目城市表是低频运维操作，完全可控）。
-
-**顺带一个现存 bug**
-
-`CityCodeUtil:40` 的 cache key 走 `RedisKeyConstants:131`：
-
-```java
-return AMAP_CITY_CODE_PREFIX + cityName.trim().toLowerCase();
-```
-
-但 `CityCodeUtil:46-51` 的 DB 查询用的是**原始 `cityName`**（未 trim、大小写敏感）：
-
-```java
-cityCodeMapper.selectOne(new LambdaQueryWrapper<CityCode>()
-        .eq(CityCode::getName, cityName)
-        .or()
-        .eq(CityCode::getSimpleName, cityName))
-```
-
-后果：
-- `"成都 "` 和 `"成都"` 是两个不同 cache key，却查同一条 DB 记录 → **key 分裂，命中率虚低**
-- 由于 DB 查询大小写敏感而 cache key 不敏感，`"Beijing"` 和 `"beijing"` 会共用 cache key 但 DB 结果可能不同 → **缓存污染**
-
-建议：DB 查询也用规范化后的值，或在应用层统一规范化入参。
-
-> 另注：上面那个 `.or()` 没有用 `.and(w -> ...)` 包裹。这里因为外层没有其他条件所以恰好正确，
-> 但一旦后续在外层追加条件（例如加个 `is_deleted = 0`），SQL 语义就会出错。属于隐患。
-
----
-
-### 2.3 Facebook Lease 令牌 → `MessageMemory` 的 L2 回填
-
-**这是全项目唯一一处"回填会丢数据"的地方。**
-
-**现状**
-
-`MessageMemory.get:57-69`：
-
-```java
-List<Message> redisLastN = redisMemory.getLastN(chatId, lastN);
-if (!redisLastN.isEmpty()) {
-    heapMemory.overwrite(chatId, redisLastN);
-    return redisLastN;
-}
-
-List<Message> mysqlLastN = mysqlMemory.getLastN(chatId, lastN);
-if (!mysqlLastN.isEmpty()) {
-    redisMemory.overwrite(chatId, mysqlLastN);       // ← 破坏性回填
-    redisMemory.expire(chatId, FOCUS_CHAT_TTL);
-    heapMemory.overwrite(chatId, mysqlLastN);
-    return mysqlLastN;
-}
-```
-
-`MessageMemory.getUserMessage:110-127` 同构（走 `redisMemory.getAll` + `overwrite`）。
-
-而 `RedisMemory:94-100`：
-
-```java
-public void overwrite(String chatId, List<Message> messages) {
-    if (chatId == null) return;
-    clear(chatId);          // ← 先全量清空
-    append(chatId, messages);
-}
-```
-
-**竞态形态（数据丢失，非脏读）**
-
-```
-T1  MessageMemory.get:63      读 L2 miss
-T1  :63                       mysqlMemory.getLastN 拿到快照 S（消息 1..10）
-T2  MessageMemory.save:91     redisMemory.append 追加消息 11
-T2  :93                       mysqlMemory.append 追加消息 11
-T1  :65                       redisMemory.overwrite(chatId, S)   // clear + append
-                              → 消息 11 被整段抹掉
-```
-
-**触发频率**：`ChatServiceImpl.chat:73` 每轮对话都调用 `memory.get(...)`，
-`MessageMemory.save` 也在每轮发生 —— **这个竞态是每轮对话都可能撞上的**。
-
-**为什么另外两个机制都解不了**
-
-- **延迟双删**不行 —— 这里没有"删除被回填覆盖"，而是**回填本身就是破坏性覆盖**。
-  再删一次只会把刚补好的数据又抹掉。
-- **墓碑**不行 —— 没有"删除"这个动作可以标记。问题出在**读**路径，不是写路径。
-
-**Lease 令牌的对应关系**
-
-| Facebook Lease | 本项目 |
-|---|---|
-| 读 miss 时返回 lease token（而非空值） | `MessageMemory.get` miss 时取 `chat:version:{chatId}` |
-| 只有持有效 lease 才能回填 | `overwrite` 改为 `overwriteIfVersionMatch(chatId, msgs, expectedVersion)` |
-| 写路径使 lease 失效 | `MessageMemory.save` 时 `INCR chat:version:{chatId}` |
-| 过期 lease 的回填被拒绝 | T1 持有的旧版本号不匹配 → 回填被拒 |
-
-**改造方向**
-
-```java
-// 读路径
-long version = getVersion(chatId);
-List<Message> mysqlLastN = mysqlMemory.getLastN(chatId, lastN);
-if (!mysqlLastN.isEmpty()) {
-    redisMemory.overwriteIfVersionMatch(chatId, mysqlLastN, version);  // Lua 原子校验
-}
-
-// 写路径
-redisMemory.append(chatId, newMessages);
-incrementVersion(chatId);          // INCR chat:version:{chatId}
-```
-
-Lua 脚本保证"版本校验 + 覆盖"的原子性。
-
-**更轻的替代方案（建议在文档中对比）**
-
-不做版本号，直接把 `overwrite` 换成**按消息数增量补齐尾部**：
-
-```java
-// 若 Redis 中已有 n 条，MySQL 快照有 m 条（m > n），只 append 第 n+1..m 条
-// 若 m <= n，说明 Redis 更新，直接返回
-```
-
-这样连版本号都不需要。**但 Lease 的版本令牌更通用** —— 增量补齐只适用于"只追加不修改"的数据形态，
-换一个会被修改的缓存就没法用了。作为教学，Lease 更能体现原理。
-
----
-
-## 三、附带缺陷（与竞态主题直接相关）
-
-### 3.1 `ChatManager.lockChat` 的 put + expire 非原子
-
-`ChatManager:24-29`：
-
-```java
-public void lockChat(String chatId){
-    chatInfoService.lockChat(chatId);                                    // DB 更新
-    String chatInfoKey = RedisKeyConstants.chatInfoKey(chatId);
-    stringRedisTemplate.opsForHash().put(chatInfoKey, "locked", "true"); // Redis 写入
-    stringRedisTemplate.expire(chatInfoKey, expireLock);                 // 独立命令
-}
-```
-
-问题：
-- `put` 成功而 `expire` 失败（或进程崩溃）→ **key 永久留存**
-- 这是典型的 **Cache-Aside 双写**，方向"先 DB 后缓存"符合常规，但**两步都不是原子的**
-
-更麻烦的是 TTL 语义自相矛盾 —— `ChatInfoService:82-85` 的 `restoreChat` 主动去掉了 TTL：
-
-```java
-unlockChat(chatId);
-stringRedisTemplate.opsForHash().put(chatInfoKey, "locked", "false");
-stringRedisTemplate.persist(chatInfoKey);      // ← 去掉 TTL，永久化
-```
-
-`ChatManager:41` 的注释 `//其实这里始终为真` 也说明这块设计没想透。
-
-**改造**：用 Lua 把 `put` + `expire` 合并成一次原子操作；重新梳理 `locked` 的 TTL 语义。
-
-### 3.2 `TicketServiceImpl:1005` 不校验持有者就删锁
-
-```java
-} finally {
-    stringRedisTemplate.delete(lockKey);      // ← 无条件删除
-}
-```
-
-经典分布式锁 bug：
-
-```
-A 拿到锁（TTL 5s） → A 的业务执行超过 5s → 锁自动过期
-B 拿到锁
-A 进入 finally → delete(lockKey) → A 删掉了 B 的锁
-```
-
-**改造**：value 存唯一标识（如 `UUID` + 线程 ID），`finally` 里用 Lua 校验后再删；
-或直接换项目已引入的 Redisson `RLock`（自带看门狗续期和持有者校验）。
-
-### 3.3 `OrderSearchTool` 两阶段令牌不是原子消费
-
-`OrderSearchTool:254-256` 校验令牌存在：
-
-```java
-if(!stringRedisTemplate.opsForHash().hasKey(chatInfoKey, REDIS_READY_FOR_CANCEL)){
-    return "先使用verifyCancelConditions()检查取消订单条件";
-}
-```
-
-`:293-295` 消费令牌：
-
-```java
-} finally {
-    // 一次性令牌：不管成功失败都清理，避免误用
-    stringRedisTemplate.opsForHash().delete(chatInfoKey, REDIS_READY_FOR_CANCEL);
-}
-```
-
-`hasKey` 检查与 `delete` 之间**没有原子性**，理论上并发请求可能双双通过校验。
-用 Lua 把"校验 + 删除"合并即可。
-
-### 3.4 `UserUsernameBloomFilterService.rebuild:41-59` 重建期穿透
-
-```java
-bloomFilter.delete();                    // 先删
-bloomFilter.tryInit(EXPECTED_INSERTIONS, FALSE_PROBABILITY);
-for (String username : normalized) {     // 再逐条 add
-    bloomFilter.add(username);
-}
-```
-
-重建期间过滤器为空/半空，**所有查询都会穿透到 DB**。
-建议改为**双 key 切换**（重建到新 key，完成后原子改名），而非原地删除重建。
-
----
-
-## 四、演练顺序建议
-
-这个顺序是**认知递进**，每一步都让上一步的缺陷暴露出来：
-
-| 步骤 | 内容 | 暴露出的问题 |
-|---|---|---|
-| 1 | 给 `TicketServiceImpl` 的 10+ 个写方法加缓存失效 | "加了删除怎么还有脏数据？" |
-| 2 | 上延迟双删 | "sleep 到底该睡多久？TTL 短还能糊弄，TTL 长怎么办？" |
-| 3 | 在 `CityCodeUtil`（TTL 7 天）用墓碑替换第二次删除 | "把猜时间换成看状态" |
-| 4 | 在 `MessageMemory` 上 Lease 令牌 | "回填本身是破坏性的，前两个都解不了" |
-
-> 第 1 步是后面所有步骤的前提 —— 没有写路径的删除，就构造不出竞态。
-
-**建议起手**：从第 1 步开始，改动最局部，且能立刻观察到效果。
+| **延迟双删** | 写路径存在删除动作 | 「删除被并发回填覆盖」 | 回填晚于第二次删除 → 脏到 TTL 到期；进程崩溃丢掉第二次删除 | 工单统计（20~30s TTL + 500ms 双删） |
+| **墓碑** | 存在可标记的失效动作 | 「失效后旧快照回填」+ 长 TTL 窗口 | 墓碑 TTL 内读请求全部穿透 DB；写路径必须接线失效调用 | 城市编码（5s 墓碑 + 版本 key；写路径未接线） |
+| **Lease 令牌** | 回填是破坏性覆盖 | 「回填抹掉并发写入」 | 回填被拒无 single-flight；版本 key 不回收 | 聊天历史三层记忆 |
+
+选型口诀：**先看写路径有没有删除（双删），再看有没有失效动作可标记（墓碑），最后看回填本身是不是破坏性的（Lease）**。三个机制层层递进，任何把低层机制硬套到高层问题的尝试都会得到荒谬结果——给追加型写路径加「删除」会让缓存每轮失效，给读路径问题写墓碑只会让缓存永远为空。
 
 ---
 
 ## 五、参考资料
 
-- Facebook Memcache Lease 原始论文：*Scaling Memcache at Facebook*（NSDI '13），第 3.2 节 "Leases"
-- 缓存一致性模式：Cache-Aside / Write-Through / Write-Behind 的权衡
-- Redis 官方文档：`SET ... NX`、`GEO*` 命令族、`ZADD`/`ZRANGEBYSCORE` 延时队列模式
+- Facebook, *Scaling Memcache at Facebook*（NSDI '13），第 3.2 节 "Leases" —— Lease 令牌的原始论文
+- Redis 官方文档：[DEL](https://redis.io/commands/del/)、[SET with options](https://redis.io/commands/set/)、[EVAL script](https://redis.io/commands/eval/)
+- 本仓库对应笔记：[07 延迟双删](learn/redis/07-delayed-double-delete.md)、[08 墓碑机制](learn/redis/08-city-code-tombstone.md)、[09 Lease 令牌](learn/redis/09-lease-token.md)
