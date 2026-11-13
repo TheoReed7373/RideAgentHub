@@ -43,10 +43,10 @@ LLM 工具调用的危险形态：**模型可以直接调用「执行类」工�
 | `OrderSearchTool.verifyCancelConditions` | 校验订单状态（未取消 / 未在行程中 / 未结算）、接单时长；免费或计费路径都写入 `readyForCancel` + `cancelVerifiedAt` |
 | `OrderSearchTool.cancelOrder` | `hasKey` 预检 → `CANCEL` Lua 原子消费 → 调 `rideOrderService.cancelOrder` → `finally` 清理 |
 | `OrderConfirmation.quoted` | 报价时写 `quoteId` + `quoteCreatedAt`，`chat:info` 续 24 小时 TTL |
-| `OrderConfirmation.begin` | 无有效报价抛 409；写 `break=yes` + `pendingToolCall`，返回 quoteId 作为 confirmationId |
-| `OrderConfirmation.confirm` | `CONFIRM` Lua：校验 15 分钟时效 → `break` 推进到 `resuming` → 签发 `ReadyForCreate` |
+| `OrderConfirmation.begin` | 仅检查 quoteId 和 ReadyforConfirm 字段存在，否则抛 409；不检查报价年龄或标记值是否为 true；通过后写 break=yes / pendingToolCall 并返回 quoteId |
+| `OrderConfirmation.confirm` | CONFIRM 校验编号和状态，只有接受检查 15 分钟时效；推进 break=resuming，接受签发 ReadyForCreate，拒绝删除权限 |
 | `OrderConfirmation.consume` | `CONSUME` Lua：校验时效与三方一致（`confirmedQuote` = `ReadyForCreate` = `quoteId`）→ `HDEL` 一次性消费 |
-| `OrderTool.markOrderReadyForCreate` | **只读**查询 `isConfirmed`（不签发权限） |
+| `OrderTool.markOrderReadyForCreate` | 只读查询 isConfirmed（三个报价字段一致），不签发权限，也不检查年龄；最终时效由 consume 校验 |
 | `OrderTool.createOrder` | 落单前调 `consume()`，无权限或已消费抛 BusinessException(409)；在 Agent 工具循环中的对外表现以事件/工具结果为准 |
 
 ---
@@ -80,7 +80,7 @@ CONSUME Lua → 校验 15 分钟时效 + confirmedQuote == ReadyForCreate == quo
 
 1. **多了一道人**：`confirm` 事件把 confirmationId 交给前端，用户点击「确认 / 拒绝」后回传——令牌的签发条件包含「用户的显式决定」，不只是「预检通过」；
 2. **时效 15 分钟**（报价有效期）：`CONFIRM` 仅在 accepted=true 时校验 `quoteCreatedAt`，拒绝不检查年龄；`CONSUME` 始终检查，超时返回 409；
-3. **幂等重放**：`break` 已是 `resuming` 且 `confirmationAccepted` 相同的决定 → `CONFIRM` 直接返回 1（用户重复点击不报错）；不同决定 → 0 → 409。恢复链路因此可以安全重试。
+3. **幂等重放**：`break` 已是 `resuming` 且 `confirmationAccepted` 相同的决定 → `CONFIRM` 直接返回 1；但接受的时效校验先于此分支，且 HTTP 层可能先被执行锁拒绝。不同决定或状态已清理 → 0 → 409。幂等仅限这个 Lua 状态窗口，不覆盖整个恢复请求。
 
 ### 4.3 `createOrder` 的权限模型
 
@@ -91,7 +91,7 @@ CONSUME Lua → 校验 15 分钟时效 + confirmedQuote == ReadyForCreate == quo
 
 ### 4.4 `cancelOrder` 的残留防御
 
-`cancelOrder` 在 `CANCEL` Lua 之外仍有：`hasKey` 预检（对用户返回更友好的引导文案）、`finally` 里的冗余 `delete`（业务执行异常时兜底清理）。Lua 已保证原子性，这两处是**防御性冗余**——无害，但阅读时要认识到真正的门禁在 Lua。
+`cancelOrder` 在 `CANCEL` Lua 之外仍有：`hasKey` 预检（对用户返回更友好的引导文案）、`finally` 里的冗余 `delete`（业务执行异常时兜底清理）。真正的原子消费在 Lua 内。finally 是无条件删除 readyForCancel；在正常 /c、/r 单轮锁路径下同会话工具不会并发，但若其他调用路径并发签发新令牌，旧调用的 finally 可能删除新值，不能称为所有场景下无害。
 
 ---
 
@@ -112,7 +112,7 @@ CONSUME Lua → 校验 15 分钟时效 + confirmedQuote == ReadyForCreate == quo
 
 1. **令牌消费与业务执行分离**：`CANCEL` / `CONSUME` 消费成功后，真正的业务调用（`cancelOrder` / `createOrder`）仍可能失败——此时令牌已删，用户需重新走预检 / 确认。已知残留窗口，代价是「多一次交互」而非数据错误。
 2. **令牌无独立 TTL**：字段挂在 `chat:info` 上，寿命受该 key 的 TTL 支配（`quoted` 后 24 小时；会话锁定或恢复检查时改为 60 分钟，POST 恢复还会 persist）。语义时效靠脚本内的「签发时间比对」（5 / 15 分钟），不靠 Redis TTL——**时效与 key 寿命解耦**是有意的（key 过期回收令牌属兜底而非主判定）。
-3. **取消令牌的 `hasKey` 预检 + `finally` 冗余删除**（4.4）：防御性冗余，主门禁在 Lua。
+3. **取消令牌的 `hasKey` 预检 + `finally` 冗余删除**（4.4）：主门禁在 Lua；finally 不校验新值归属，正常同会话串行执行是其前提。
 4. **槽位字段（`saveNewOrderParam`）不是令牌**：它是状态积累（参数逐步补齐），`isNewOrderReady` 只校验齐全性，没有消费语义——「参数齐了」不会被用掉。
 
 ---

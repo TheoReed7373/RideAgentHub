@@ -97,7 +97,11 @@ Redis 是**易失**的任务载体（故障、重启、上线前都丢任务）�
 
 `fixedDelay`（而非 `fixedRate`）：本轮处理完再计时，避免慢轮次把后续轮次挤成背靠背执行。
 
-### 4.5 开关与启动校验
+### 4.5 时间源与补偿边界
+
+排期与领取使用应用实例的 System.currentTimeMillis，不是 Redis TIME；BusinessTime.now 固定 Asia/Shanghai 用于实际超时状态流转，但 recoverOverdueOrders 的筛选线使用 LocalDateTime.now（JVM 默认时区）。默认时区不一致会影响补偿候选何时被扫描；多实例部署应对齐时区与系统时钟，不能承诺现有全链路时间源已统一。
+
+### 4.6 开关与启动校验
 
 `ride-order.timeout.enabled=false` 同时关闭轮询与补偿；`@PostConstruct` 的 `validate()` 让非法配置（超时为非正数等）**启动即失败**——兜底机制配错了不能等到线上超时才发现。
 

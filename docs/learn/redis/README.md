@@ -179,7 +179,7 @@
 
 调用点：`RideOrderServiceImpl.calculatePrice()` 被估价、创建订单、结束行程复用；`OrderTool.getEstPrice()` 与 `OrderSearchTool.calcEstPriceByOrderToolRule()` 也复用同一规则。**这样设计的理由**：价格是资金相关字段，如果让 LLM 从对话里自行填写，提示词注入就能改价；服务端重算使客户端与模型传的价格都只是"展示值"。
 
-时区与安全序列化同样是「一致性」的一部分：`util/BusinessTime.java` 固定 `ZoneId.of("Asia/Shanghai")` 生成业务时间；`TicketPoolIndex` 的 score 时间部分用 `toInstant(ZoneOffset.UTC)`，避免多实例时区/夏令时导致排序漂移；`config/Config.java` 的 `jacksonCustomizer()` 把 `BigDecimal` 与超过 `2^53-1`（`9007199254740991`）的 `Long` 序列化成字符串，防止雪花 ID 在 JavaScript 里丢精度。
+时区与安全序列化同样是「一致性」的一部分。当前仍有混用：OrderTimeoutJob 补偿筛选、Agent 系统提示词时间使用 LocalDateTime.now；工单编号日期、统计日期使用 LocalDate.now，均取 JVM 默认时区。它们未统一经过 BusinessTime，多实例应对齐默认时区。`util/BusinessTime.java` 固定 `ZoneId.of("Asia/Shanghai")` 生成业务时间；`TicketPoolIndex` 的 score 时间部分用 `toInstant(ZoneOffset.UTC)`，避免多实例时区/夏令时导致排序漂移；`config/Config.java` 的 `jacksonCustomizer()` 把 `BigDecimal` 与超过 `2^53-1`（`9007199254740991`）的 `Long` 序列化成字符串，防止雪花 ID 在 JavaScript 里丢精度。
 
 ---
 

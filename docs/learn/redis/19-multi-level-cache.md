@@ -13,7 +13,7 @@ AI 对话的上下文读取频率极高（每轮对话至少读一次），且**
 | 层 | 实现 | 介质 | 生命周期 | 角色 |
 |---|---|---|---|---|
 | L1 | `HeapMemory` | JVM 堆（`ConcurrentHashMap`） | 进程存活期 | 当前聚焦会话的热数据 |
-| L2 | `RedisMemory` | Redis List | 聚焦会话 24h / 非聚焦 30min | 短中期缓存 |
+| L2 | `RedisMemory` | Redis List | 保存/完整回填 24h；切换时旧会话改 30min，后续回填可再改 24h | 短中期缓存 |
 | L3 | `MysqlMemory` | MySQL 表 | 永久 | **权威源** |
 
 核心矛盾：**读回填（miss 时逐层补数据）与写追加（每轮对话保存新消息）并发**。回填如果直接覆盖，会把并发写入的新消息抹掉（完整竞态推导见 [09 篇](09-lease-token.md)）——本篇聚焦三层结构本身。
@@ -24,12 +24,12 @@ AI 对话的上下文读取频率极高（每轮对话至少读一次），且**
 
 | Key | 结构 | TTL | 语义 |
 |---|---|---|---|
-| `chat:history:{chatId}` | List（JSON 字符串） | 聚焦 24h / 非聚焦 30min | L2 消息列表 |
+| `chat:history:{chatId}` | List（JSON 字符串） | 保存/回填 24h；切换时旧会话改 30min | L2 消息列表 |
 | `chat:history:version:{chatId}` | String（整数） | 无（`PERSIST`） | L2 版本租约 |
 | `chat:history:staging:{chatId}:{uuid}` | List | 1 分钟 | 回填暂存 |
 | （L1 无 Redis 结构） | `ConcurrentHashMap` + 版本号 | — | 每条目 `record Entry(List<Message>, long version)` |
 
-TTL 常量：`FOCUS_CHAT_TTL = 24h`、`NON_FOCUS_CHAT_TTL = 30min`（`MessageMemory`）——**聚焦会话才值得 24 小时的热缓存**；用户切到别的会话后，旧会话的 L2 降为 30 分钟（`switchFocusChatIfNeeded`）。
+TTL 常量：`FOCUS_CHAT_TTL = 24h`、`NON_FOCUS_CHAT_TTL = 30min`（MessageMemory）。switchFocusChatIfNeeded 在保存时给旧会话设 30 分钟；但 RedisMemory.overwriteIfLeaseValid 的 HISTORY_TTL 固定为 24 小时，不查询聚焦状态，因此旧会话重新完整回填后也会设 24 小时，不能将其概括为永久固定的「聚焦 24h / 非聚焦 30min」。
 
 ---
 
@@ -88,7 +88,7 @@ heapMemory.appendIfVersionMatch(chatId, msgs, heapVersion)                ← �
 `fillRedisWithLease` / `fillHeapWithLease` 的租约语义（细节见 [09 篇](09-lease-token.md)）：
 
 - L2 回填失败 → **仍然返回 MySQL 数据**（`get` 的返回不依赖回填成功——权威源数据是对的，被拒的只是「写进缓存」这个动作）；
-- L1 租约失效时**保留并发写入内容**（不清空）：写顺序已保证 L1 里的列表包含最新消息，清空反而丢数据。
+- overwriteIfVersionMatch 的回填租约失效时保留当前条目，避免旧快照覆盖较新状态；这不保证该条目包含所有实例的最新消息。写追加的 appendIfVersionMatch 失配则会清空消息列表并递增版本。
 
 ### 4.4 切换会话：L1 与 L2 的寿命策略
 
@@ -133,7 +133,7 @@ ToolResponseMessage 的 responses 消除 pending；
 ## 六、边界与已知问题
 
 1. **`getAll` 的成本随对话长度线性增长**（L3 的全表行读取、L2 的 `LRANGE 0 -1`）——Lease 解决正确性，没有解决读取成本。超长对话需要分页或截断策略（当前未实现）。
-2. **L1 与 L2 内容可能短暂不一致**（L2 回填成功、L1 被拒的组合）——下次 L1 miss 自愈；读取结果以当次返回的层为准。
+2. **L1 与 L2 内容可能不一致**（L2 回填成功、L1 被拒的组合）——本实例 L1 被清理或失效为 miss 后才回源，不保证下一次读取即自愈；读取结果取决于当次命中的层。
 3. **回填无 single-flight**：N 个并发 miss 产生 N 次回源 + 回填尝试（只有租约仍有效的那次成功）。
 4. **版本 key 不回收**（[09 篇](09-lease-token.md) 的通用代价）：每个 chatId 留一个永久版本 key。
 5. **多实例各存一份 L1**：堆内缓存无跨实例一致性——L1 版本只在当前进程内变化，实例 B 的写入不会使实例 A 的 L1 自动失效；单轮执行锁只防并发执行，不刷新旧 L1。持续命中时可能长期陈旧，需等本实例清理、切换会话或重启后才回源，当前没有跨实例主动失效机制。

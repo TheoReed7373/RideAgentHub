@@ -156,7 +156,7 @@ flowchart LR
 
 1. `ChatController` 接收对话请求，返回流式 `Flux<AgentEvent>`
 2. `ChatServiceImpl` 根据历史对话和本轮输入做分类
-3. 分类结果写入 Redis 的 chat metadata
+3. 通过分类失败/DANGER 检查后初始化新会话；非 ORDER 粘滞分支将分类写入 Redis metadata
 4. 请求被分发到 4 个专用 Agent 之一
 5. Agent 执行工具循环，并把回复、工具状态、确认事件持续推回前端
 
@@ -212,14 +212,14 @@ sequenceDiagram
     Tool->>Redis: quoted()：quoteId + 报价时间戳 + 24h TTL
     OA->>OC: begin(chatId, toolCallId) → confirmationId
     OC->>Redis: HSET break=yes, pendingToolCall
-    OA-->>User: AgentEvent.confirm(orderJson 含 confirmationId)
+    OA-->>User: AgentEvent.comfirm(orderJson 字符串，含 confirmationId)
     Note over OC,Redis: break=yes 等待确认；报价 15 分钟有效
 
     User->>API: POST /chat/v2/r/{chatId} {confirmationId, confirmed}
     API->>RR: run(resume=true)
     RR->>CS: resume(confirmationId, confirmed, prompt)
     CS->>OC: confirm(confirmationId, confirmed)
-    OC->>Redis: CONFIRM Lua：校验 15 分钟 → break=resuming → 签发 ReadyForCreate
+    OC->>Redis: CONFIRM：校验编号/状态；接受需≤15分钟并签发权限，拒绝清除权限
     CS->>OA: resume(固定 feedback + 可选补充说明)
     OA->>Redis: getPersisted + 先持久化 ToolResponseMessage
     OA->>Tool: markOrderReadyForCreate()（仅查询 isConfirmed）
@@ -236,7 +236,7 @@ sequenceDiagram
 - **槽位不是只存在 Prompt 里**，而是显式写入 Redis
 - **算价与路径规划分离**，起终点未变时可以只重新算价；价格由服务端 `RidePricing` 重算，模型不能自报价格
 - **订单创建前必须确认**，由 `confirm` 事件把服务端签发的 `confirmationId` 交给前端原样回传；前端不能从用户文字推断 `confirmed`
-- **恢复不是补一句话继续聊**，而是 `ChatServiceImpl.resume` 先调 `OrderConfirmation.confirm()`（校验 15 分钟有效期、置 `break=resuming`、签发 `ReadyForCreate`），再调 `orderAgent.resume(sink, id, userId, feedback + chatParam.getPrompt())` 接回工具链 —— 固定 feedback 后**原样拼接用户 `prompt`**（空则自动填「确认/拒绝」），注入面靠服务端确认状态机兜底，而非靠「不转发原话」；相同决定可幂等重放，不同决定返回 409
+- **恢复不是补一句话继续聊**，而是 `ChatServiceImpl.resume` 先调 `OrderConfirmation.confirm()`（编号/状态校验，接受额外检查 15 分钟并签发权限，拒绝清除权限，置 break=resuming），再调 `orderAgent.resume(sink, id, userId, feedback + chatParam.getPrompt())` 接回工具链 —— 固定 feedback 后**原样拼接用户 `prompt`**（空则自动填「确认/拒绝」），注入面靠服务端确认状态机兜底，而非靠「不转发原话」；仅 break=resuming 且状态未清理时同决定可重放；接受仍检查报价年龄，不同决定或已清理状态被拒；后台异常以流事件/终态表达
 - **`markOrderReadyForCreate()` 只做只读查询**，创建权限由 `createOrder()` 落单前调 `consume()` 一次性消费，模型无法自授权限或重复下单
 - **订单创建后先 `lockChat` 再写 `OrderId`**（接收方是 `ChatManager`，不是 `ChatServiceImpl`），引导用户开启新会话处理后续需求
 - 完整调用链与 SSE 生命周期见 [`docs/learn/agent/01-orchestration-and-sse.md`](docs/learn/agent/01-orchestration-and-sse.md)，确认状态机见 [`docs/learn/redis/25-agent-hitl-state.md`](docs/learn/redis/25-agent-hitl-state.md)
@@ -255,7 +255,7 @@ RAG 部分不是单一路径检索，而是：
 2. Elasticsearch 执行向量检索（`knn`，窗口 100）
 3. Elasticsearch 同时执行 BM25 文本检索（窗口 100）
 4. 后端用 RRF（`K=60`）做结果融合
-5. 再按 `groupId` 去重，取 Top5
+5. 再按 groupId 去重，先取最多 5 个候选，随后核对数据库；剔除后不补位
 6. **`authoritative()` 权威库核对**：用 ES 文档 id 反查 MySQL 映射，校验 `question` 与 `groupId` 完全一致，并用当前 `QaInfo.answer` 覆盖 ES 里的旧答案；已删除、已改问题或同步失败留下的文档直接丢弃
 
 管理接口写入只落 MySQL 与持久同步任务表（`addQA` 等 `@Transactional` 方法内 `syncJobs.enqueue(groupId)`），索引由 `QaIndexSynchronizer` 每 5 秒扫描（失败 30 秒后重试）异步重建，因此「接口成功 ≠ 立刻可检索」；检索超时只做逻辑 `cancel(true)`。完整推导见 [`docs/learn/agent/02-rag-consistency-and-budget.md`](docs/learn/agent/02-rag-consistency-and-budget.md)。
@@ -271,7 +271,7 @@ RAG 部分不是单一路径检索，而是：
 | `message` | Agent 的文本输出（`AgentEvent.message`） |
 | `tool_start` | 某个工具开始执行（`AgentEvent.tool`）；来源为 `agentbase/tool/ToolNotifySupport.java` 的 `Consumer<String>` 回调：全项目 39 处通知调用点 / 14 个类，真正注入 `AgentEvent.tool` 回调的有 6 处（Daily/Order/Support 各 2），回调异常被隔离，不影响主流 |
 | `notify` | 路由提示、状态提示或系统通知（限流拒绝、等待确认提示也走这里） |
-| `confirm` | 订单待确认摘要（`AgentEvent.comfirm`，注意源码中的拼写），携带 `confirmationId`，前端应进入确认交互并原样回传 |
+| `confirm` | 订单待确认摘要；工厂方法为 AgentEvent.comfirm。payload 是订单摘要的 JSON 字符串，前端需再次解析取得 confirmationId 并原样回传 |
 | `error` | 执行错误；`AgentStreams.guard` 统一把异常转成 error 事件并结束流（`AgentStreams.subscribe` 的 3 分钟是单次模型流上限，每轮工具循环重置） |
 
 这意味着前端可以把它渲染成一种 **“可见工具执行过程 + 最终回复”** 的体验，而不是纯黑盒对话。
@@ -286,7 +286,7 @@ RAG 部分不是单一路径检索，而是：
 - `RedisMemory`：短中期缓存（L2）
 - `MysqlMemory`：长期持久化消息（L3）
 
-读取顺序是 `Heap -> Redis -> MySQL`，三层都取全量再由 `MessageWindow.tail` 截出完整的工具调用批次；回填时先取版本租约，再用 Lua 校验版本后写回，版本 key 通过 `PERSIST` 永久保留（避免数据过期/清空后旧租约复活）。写入顺序与读取相反：**先落 MySQL，再按租约追加 Redis(L2) 与 Heap(L1)**，并对会话做归属守卫 `isNewOwnedChat` / `assertOwned`（会话不存在 404、**非本人 `ForbiddenException` → 403**、停用会话 410）。详见 [19 篇](docs/learn/redis/19-multi-level-cache.md) 与 [09 篇](docs/learn/redis/09-lease-token.md)。
+读取顺序是 `Heap -> Redis -> MySQL`，三层都取全量再由 `MessageWindow.tail` 截出完整的工具调用批次；回填时先取版本租约，再用 Lua 校验版本后写回，版本 key 通过 `PERSIST` 永久保留（避免数据过期/清空后旧租约复活）。写入顺序与读取相反：**先落 MySQL，再按租约追加 Redis(L2) 与 Heap(L1)**，并对会话做归属守卫 `isNewOwnedChat` / `assertOwned`（读取允许新会话返回空；要求已有会话时不存在为 404，非本人为 403，historyDeleted=true 为 410；locked=true 本身不等于清空）。详见 [19 篇](docs/learn/redis/19-multi-level-cache.md) 与 [09 篇](docs/learn/redis/09-lease-token.md)。
 
 此外，工具结果还会单独进入 `ToolResponseMemory`（Redis 24h + MySQL 两级），需要时再反查；历史窗口内仍包含完整工具结果，不能保证长结果不占上下文；历史消息里的 TOOL 响应本身保存全文，`getCalling(callId)`（chatId 由服务端上下文提供） 提供按 `(callId, chatId)` 的辅助反查（[20 篇](docs/learn/redis/20-tool-response-cache.md)）。
 

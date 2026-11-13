@@ -13,7 +13,7 @@ AI 客服的对话上下文按 `chatId` 维维护，是一个三层记忆结构�
 | 层 | 实现 | 介质 | 生命周期 |
 |---|---|---|---|
 | L1 | `HeapMemory` | JVM 堆（`ConcurrentHashMap`） | 进程存活期 |
-| L2 | `RedisMemory` | Redis List | 聚焦会话 24 小时 / 非聚焦 30 分钟 |
+| L2 | `RedisMemory` | Redis List | 保存/完整回填设 24 小时；切换会话时给旧会话设 30 分钟，后续回填可重新设 24 小时 |
 | L3 | `MysqlMemory` | MySQL | 永久 |
 
 读路径是 **L1 → L2 → L3** 逐层回源并回填；写路径是 **先落 MySQL，再按租约追加 L2 / L1**。触发频率决定了问题的严重性：`ChatServiceImpl` 每轮对话都调 `memory.get`，Agent 每轮结束都调 `messageMemory.save`——「读回填」和「并发追加」每轮对话都可能撞上。
@@ -26,7 +26,7 @@ T2 写线程：save → 追加消息 11（L3、L2、L1）
 T1：用 S 整体替换 L2 → L2 变回 [1..10]，消息 11 从缓存里消失
 ```
 
-这不是脏读而是**丢失**：脏读会自愈（TTL 到期或下次写入修正），丢失不会——L2 看起来是完整的（非空），后续命中该缓存的读不会回源 MySQL，直到数据过期或失效，消息 11 在缓存失效或被清理前持续缺失，MySQL 中的消息仍存在。
+这是缓存里的消息遗漏，MySQL 中的消息仍存在：L2 看起来完整且非空，命中期间不会回源，遗漏会持续到该缓存过期、失效或被清理。若旧列表又被回填进无 TTL 的 L1，陈旧状态还可能持续更久。
 
 ---
 
@@ -34,7 +34,7 @@ T1：用 S 整体替换 L2 → L2 变回 [1..10]，消息 11 从缓存里消失
 
 | Key | 结构 | TTL | 语义 |
 |---|---|---|---|
-| `chat:history:{chatId}` | List（JSON 字符串） | 聚焦 24 小时 / 非聚焦 30 分钟 | 消息队列：`RPUSH` 追加、`LRANGE 0 -1` 读取 |
+| `chat:history:{chatId}` | List（JSON 字符串） | 保存/回填 24 小时；切换时旧会话改为 30 分钟，并非永久固定分类 | 消息队列：`RPUSH` 追加、`LRANGE 0 -1` 读取 |
 | `chat:history:version:{chatId}` | String（整数） | **`-1`（`PERSIST` 永久保留）** | Lease 版本号：`INCR` 递增、永不归零 |
 | `chat:history:staging:{chatId}:{uuid}` | List | 1 分钟（`STAGING_TTL`） | 回填暂存区：正常路径立刻被 Lua 消费，TTL 是崩溃兜底 |
 
@@ -123,17 +123,17 @@ T1  overwriteIfLeaseValid(chatId, S, 5)
 
 ### 4.4 为什么回填要绕一次暂存 key
 
-回填数据不能直接作为 `ARGV` 传给 Lua——消息列表**可能很大**（`getAll` 读整个会话，长期对话几千条）：客户端产生巨大请求体、Redis 侧占用与数据等量的临时内存、受 `proto-max-bulk-len` 协议限制。
+当前将消息先写入 staging，再让 Lua 只处理 key、版本号和 TTL，缩短脚本内数据搬运路径。消息理论上也可作为 ARGV 传递，但仍有请求大小与脚本耗时成本。现有 rightPushAll 仍一次发送全量消息，并没有消除大请求或内存开销。
 
 暂存 key 把「数据搬运」和「原子性保证」分开：
 
 ```
-MULTI: RPUSH → staging（普通命令，可分批、可以很大）+ EXPIRE 1min
-EVAL:  只传三个 key 名 + 一个版本号（极小）
+MULTI: rightPushAll → staging（当前一次传入全部序列化消息，未分批）+ EXPIRE 1min
+EVAL:  传三个 key 名 + 版本号 + 数据 TTL 毫秒（共两个 ARGV）
        脚本内部做 DEL / RENAME（O(1) 的元数据操作，不搬数据）
 ```
 
-`RENAME` 只改 key 的元数据指针，**不复制 value**。暂存 key 的三个出口全部消费它：
+RENAME 不逐条复制列表；但覆盖已存在的目标 key 会隐式删除旧值，大目标释放可能产生额外耗时，不能将整个回填一概视为固定 O(1)。暂存 key 的三个出口全部消费它：
 
 | 出口 | 对暂存 key 的操作 |
 |---|---|
@@ -169,7 +169,7 @@ T1  heapMemory.overwrite(chatId, S)    ← L1 变成 [1..10]
 
 **L1 的数据丢失比 L2 更致命**——L1 短路了整条回源链路，L2 修得再好也救不回来。`HeapMemory` 因此也引入版本号（`record Entry(List<Message>, long version)`），「校验 + 替换」在 `ConcurrentHashMap.compute` 内对同一 `chatId` 原子。
 
-L1 租约失效时的动作是**保留并发写入内容**（`return existing`）：写顺序是「先 MySQL 再追加 L2/L1」，L1 里的列表包含最新追加的消息，清空反而丢数据。L1 要么是完整上下文、要么包含最新追加，后续由 `MessageWindow.tail` 与 L2/MySQL 校正。
+L1 租约失效时的动作是**保留并发写入内容**（`return existing`）：写顺序是「先 MySQL 再追加 L2/L1」，L1 里的列表包含最新追加的消息，清空反而丢数据。这是 overwriteIfVersionMatch 的回填分支，只保留当前条目；写路径 appendIfVersionMatch 在版本不符或原消息为空时会写入空消息列表并递增版本，让后续读回源。MessageWindow.tail 仅校验/截取传入列表，不会向 L2/MySQL 校正数据；L1 非空命中时也不会自动检查其他实例的写入。
 
 ### 4.7 版本 key 必须永久保留（`PERSIST`）
 
@@ -195,7 +195,7 @@ T1  overwriteIfLeaseValid(S, 1) → current(1) == 1 → 校验【通过】！
 |---|---|---|
 | **版本号 + 拒绝回填** | 回填时合并（union） | 消息没有稳定 ID 可去重；且合并语义在「删除过消息」的场景同样错 |
 | **版本号** 而非**时间戳** | `System.currentTimeMillis()` 当 lease | 多实例时钟不同步；同一毫秒两次写入无法区分。`INCR` 由 Redis 单点产生，全局单调 |
-| 暂存 key + `RENAME` | 消息列表作为 `ARGV` | 消息量不可控；`RENAME` O(1) 不搬数据（4.4） |
+| 暂存 key + RENAME | 消息列表作为 ARGV | 将数据写入移到 Lua 外；当前仍一次传输全量列表，覆盖已有目标时释放旧值仍可能耗时（4.4） |
 | `INCR` 与 `RPUSH` 同脚本 | 两条独立命令 | 否则存在「数据已追加、版本未递增」的隐蔽窗口（4.5） |
 | **版本 key `PERSIST` 永久保留** | 与数据 key 同 TTL | 同 TTL 会被 `clear` 或一起过期归零，旧租约可能撞上重置后的小版本号（4.7） |
 | L1 也引入版本号 | 只修 L2 | L1 短路整条回源链路（4.6） |
@@ -210,7 +210,7 @@ T1  overwriteIfLeaseValid(S, 1) → current(1) == 1 → 校验【通过】！
 
 1. **回填被拒时没有 single-flight**：N 个并发 miss 同时被拒 → N 次 MySQL 查询。性能问题而非正确性问题。
 2. **`getAll`（`LRANGE 0 -1`）成本随对话长度线性增长**：Lease 解决正确性，没有解决读取成本。
-3. **L1 与 L2 的租约互不相关**：可能出现「L2 回填成功、L1 回填被拒」的组合——正确（L1 保留并发写入），但两层内容短暂不一致，下次读 L1 miss 后自愈。
+3. **L1 与 L2 的租约互不相关**：可能出现「L2 回填成功、L1 回填被拒」的组合——正确（L1 保留并发写入），但两层内容短暂不一致，本实例 L1 被清理或失效后才会回源；不能保证下一次读取就 miss。
 4. **版本号没有上界检查**：Redis `INCR` 超出有符号 64 位整数范围时返回错误，不会回绕；Java 堆内版本的 `long + 1` 未做溢出检查。
 5. **版本 key 不回收**（4.7 的代价）：会话量大时该前缀 key 单调增长。
 

@@ -15,7 +15,7 @@
 ② begin(chatId, toolCallId)      → break=yes：会话挂起，等待用户确认
 ③ confirm 事件（携带 confirmationId）推给前端
 ④ 用户点击确认/拒绝 → POST /chat/v2/r/{chatId} {confirmationId, confirmed}
-⑤ CONFIRM Lua（校验 15 分钟 → break=resuming → 签发 ReadyForCreate）
+⑤ CONFIRM Lua（编号/状态校验；接受需≤15分钟并签发权限，拒绝清权限；break=resuming）
 ⑥ OrderAgent.resume：接回工具链，先持久化悬空的工具应答
 ⑦ createOrder → consume()（一次性消费）→ 真正落单
 ```
@@ -87,7 +87,7 @@ state ~= yes（未挂起）                    → return 0
 
 1. `getPersisted`（直读 MySQL 权威数据）拿到挂起前的历史；
 2. **先持久化悬空的 `ToolResponseMessage`**——挂起时 `pendingToolCall` 的调用没有应答，协议要求恢复后必须成对出现（`MessageWindow` 的配对校验）。用数据库事实补，避免「持久化成功而缓存失败后重复保存工具应答」；
-3. 注入固定 feedback（「用户已确认 / 已拒绝」+ 可选用户补充说明）继续工具循环；
+3. 将固定 feedback 与用户 prompt 作为缺失的 notifyUser 工具应答保存；若数据库历史已有该调用应答，则不重复保存或替换，也不另外追加本次 prompt；清理 break / pendingToolCall / confirmationAccepted 后继续工具循环；
 4. `markOrderReadyForCreate`（只读）→ `createOrder` → `consume()`。
 
 ### 4.4 挂起拦截与 DANGER 守卫前置
@@ -96,7 +96,7 @@ state ~= yes（未挂起）                    → return 0
 
 ### 4.5 会话粘滞
 
-`ChatServiceImpl` 路由时若 Redis 里 `classification == ORDER`，**只有分类成功且不是 DANGER 后才按旧 ORDER 路由给 `OrderAgent`**——恢复期间用户的消息（「帮我确认」）可能被分类成 DAILY，粘滞保证它仍进入订单链路。
+`ChatServiceImpl` 路由时若 Redis 里 `classification == ORDER`，**只有分类成功且不是 DANGER 后才按旧 ORDER 路由给 `OrderAgent`**——普通 /c 请求通过前置检查后可能得到 DAILY 等分类，旧 ORDER 仍使其留在下单链路；/r 本身不走分类，不能用粘滞解释恢复路由。
 
 ---
 

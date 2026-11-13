@@ -13,7 +13,7 @@
 1. **验证码 5 分钟有效**，过期作废；
 2. **发送冷却 60 秒**——同一邮箱 1 分钟内不能重复发送（防轰炸，也节省 SMTP 配额）；
 3. **同一验证码最多成功消费一次**——并发提交两个相同验证码，只能有一个通过；
-4. **错误 5 次后验证码作废**——防无限暴力尝试；
+4. **进入 VERIFY Lua 的 6 位数字错误码累计 5 次后验证码作废**；格式不合法的输入在 Java 层返回 false，不计数；
 5. **发送失败要能重试**——SMTP 挂了不能把用户锁在冷却里；
 6. **注册 / 重置密码在事务中预留验证码**——业务回滚后验证码应可再次使用，提交成功后才真正消费。
 
@@ -41,7 +41,7 @@
 
 | 方法 | 职责 |
 |---|---|
-| `EmailCodeService.sendCode` | `SecureRandom` 生成 6 位验证码 → `ISSUE` Lua 原子判定冷却并发送 → 发邮件，失败走 `CLEANUP` |
+| `EmailCodeService.sendCode` | SecureRandom 生成 6 位验证码 → ISSUE Lua 判定冷却并保存 Redis 状态 → Java 调用 SMTP 发邮件，失败走 CLEANUP；Lua 不发送邮件 |
 | `EmailCodeService.verifyAndConsume` | `VERIFY` Lua 校验 + 计数 + 消费/预留；事务场景挂 `afterCompletion` 走 `COMPLETE` |
 | `EmailCodeService.isInCooldown` | 只读检查冷却 key 是否存在 |
 | `EmailCodeService.sendEmail` | 发送邮件；异常时按 issueId 归属清理（`CLEANUP`）后抛 500 |

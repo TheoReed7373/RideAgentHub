@@ -1,6 +1,6 @@
 # 订单安全约定
 
-POST /order/estimate 现在要求登录，并与认证接口一起受来源地址频率限制。经纬度按数值范围校验；预约时间必须晚于当前业务时间，业务 DATETIME 使用 Asia/Shanghai。
+POST /order/estimate 现在要求登录，并与认证接口一起受来源地址频率限制。经纬度按数值范围校验；预约时间必须晚于当前业务时间，订单创建与流转的 BusinessTime 使用 Asia/Shanghai；但 OrderTimeoutJob 数据库补偿筛选仍调用 JVM 默认时区的 LocalDateTime.now，不能描述成整个项目已统一时区。
 
 POST /order 的 userId 一律取当前身份，客户端传入的预估价、倍率、里程和 Mongo 轨迹标识不作为权威数据。服务端重新规划和计价。即时订单忽略 scheduledTime。
 

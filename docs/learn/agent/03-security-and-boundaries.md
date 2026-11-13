@@ -86,12 +86,12 @@ PaymentVerifier unavailablePaymentVerifier() {
 
 **`service/base/RidePricing.java`（服务端重算价格）**：起步 `8.00` 含 `2.0km`，超出 `2.20/km`，`>20km` 部分再加 `1.10/km`；时长按 `CEILING` 取整 × `0.50/min`；加急固定 `+5.00` 且**在同一类内**给 `finalMultiplier` 再 `+0.20`（工具层无独立加价），车型倍率 `1.0/1.6/2.5`；`estPrice = (subTotal + (加急 ? 5.00 : 0)) × (车型倍率 + (加急 ? 0.20 : 0))`，`BigDecimal` + `setScale(2, HALF_UP)`。调用点：`RideOrderServiceImpl.calculatePrice`（估价/创建/结束行程复用）、`OrderTool.getEstPrice`、`OrderSearchTool.calcEstPriceByOrderToolRule`。**客户端与模型传的价格都只是展示值**。
 
-**`exception/GlobalExceptionHandler.java`**：`UnauthorizedException` → 401、`ForbiddenException` → 403、`BusinessException.code` 在 400–599 直接透传（越界钳制为 400）、参数类异常 → 400、`DuplicateKeyException` → 409、其它 → 500。`ChatInfoService.assertOwned` 三分支：会话不存在 `BusinessException(404)` → 404；**不属于当前用户 `ForbiddenException` → 403**；已停用 `BusinessException(410)` → 410。
+**`exception/GlobalExceptionHandler.java`**：`UnauthorizedException` → 401、`ForbiddenException` → 403、BusinessException 的 HTTP 状态取 400–599 内的 code，越界仅将 HTTP 状态改为 400；Result.code 仍保留原值、参数类异常 → 400、`DuplicateKeyException` → 409、其它 → 500。`ChatInfoService.assertOwned` 三分支：会话不存在 `BusinessException(404)` → 404；**不属于当前用户 `ForbiddenException` → 403**；已停用 `BusinessException(410)` → 410。
 
 | 异常 | 位置 | HTTP |
 |---|---|---|
 | `UnauthorizedException` / `ForbiddenException` | `GlobalExceptionHandler.java:15-18` | 401 / 403 |
-| `BusinessException` | `:19-20,35-37` | `code`（400–599 透传，越界钳 400） |
+| `BusinessException` | `:19-20,35-37` | HTTP 状态：400–599 内取 code，越界为 400；响应体 code 不改 |
 | `IllegalArgumentException` / 参数绑定异常 | `:21-25` | 400 |
 | `DuplicateKeyException` | `:26-29` | 409 |
 | 其它 `Exception` | `:30-34` | 500 |
@@ -144,7 +144,7 @@ PaymentVerifier unavailablePaymentVerifier() {
 2. **「权限缓存」实现了吗？** 没有独立权限缓存，但**「鉴权链不查库」是错的**：`PermissionAspect` 只读 ThreadLocal，上游 `TokenServiceImpl.getToken()` 每次请求仍要查 Redis（`auth:token:*`）+ DB（`sys_user` 的 `is_deleted/status/role` 与密码摘要，`TokenServiceImpl.java:66-78`）。准确说法是「**切面不查库，但每请求仍有 Redis + DB 往返；缺的是独立角色缓存**」。
 3. **两套限流的 key 有什么区别？** 对话按 `userId`（`chat:ratelimit:`），入口按来源地址**摘要**（`request:rate:`），后者不存明文 IP；`OPTIONS` 放行。
 4. **支付为什么不能先放行再补核验？** 订单状态会变成已支付，资金与业务状态不一致；默认拒绝是唯一安全的未接入态。
-5. **为什么 `BusinessException.code` 要钳制 400–599？** 防止业务异常把非法状态码传给 HTTP 层；超出范围统一归一。
+5. **为什么 `BusinessException.code` 要钳制 400–599？** 限制实际 HTTP 状态；超出范围时 HTTP 返回 400，但 Result.code 仍为原始值，二者可能不同。
 6. **`chatId` 必须来自 `/newuuid` 吗？** 不必。`ChatRequestRunner` 只做 `UUID.fromString` 格式校验，会话须属于当前用户即可（[`src/main/resources/api/chat-security.md`](../../../src/main/resources/api/chat-security.md) 已回写）。
 7. **还能怎么加强？** 在配置文件中显式列出已有 `web.cors.allowed-origins`、锁与令牌的可观测性、支付渠道适配器、RAG 线程池参数外置 —— 都是**可选优化**。**但「限流阈值配置化」不是未实现**：`ChatGuardProperties`（prefix `chat.guard`）已在 `application.yaml:76-81` 外置 `rate-limit-max=30`、`rate-limit-window-seconds=60`、`classify-cache-ttl-seconds=21600`、`fingerprint-length=32`，`ChatRateLimiter` 与 `ClassificationCache` 均注入该 Bean；仍硬编码的是入口层 120 次/60 秒（`RequestRateLimitInterceptor.java:22`）、3 分钟超时与线程池参数。
 

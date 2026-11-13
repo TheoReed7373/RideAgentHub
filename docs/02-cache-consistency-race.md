@@ -85,7 +85,7 @@ T2 写线程：save → 追加消息 11（L3、L2、L1）
 T1：用 S 整体替换 L2 → L2 变回 [1..10]，消息 11 从缓存里消失
 ```
 
-这不是脏读而是**丢失**：脏读会自愈，丢失不会 —— L2 看起来是完整的（非空），后续读在命中旧缓存时不会回源 MySQL，直到缓存失效或过期。
+这是缓存中的消息遗漏，MySQL 记录仍存在。L2 看起来完整且非空，命中期间不会回源 MySQL；缓存失效或过期后才有机会重建，若旧列表又进入无 TTL 的 L1，陈旧状态还可能持续更久。
 
 为什么另外两个解法在此失效：
 
@@ -100,7 +100,7 @@ T1：用 S 整体替换 L2 → L2 变回 [1..10]，消息 11 从缓存里消失
 2. **写路径使所有在途租约失效**：`save` 先落 MySQL，再走 `APPEND_HISTORY_IF_VERSION_MATCH`——版本不符时 `DEL` 数据（让在途租约必然失效），版本相符且数据 key 已存在时 `RPUSH` + `PEXPIRE`，缓存缺失时不新建只含增量的残缺历史；版本递增与数据追加在同一次 Lua 内完成，不存在「消息可见但版本未变」的中间态。
 3. **回填持租约**：数据先写入暂存 key（`MULTI` 原子 `RPUSH` + 1 分钟 TTL），再由 `OVERWRITE_IF_VERSION_MATCH` Lua 原子完成「校验版本 + `RENAME` 暂存为数据 key」。租约失效 → 脚本 `DEL` 暂存 → 回填放弃（**被拒绝是正确行为**，代价只是一次多余的 MySQL 查询）。回填数据走暂存 key 而非 `ARGV`，是因为消息量不可控，而 `RENAME` 是 O(1) 的元数据操作。
 4. **版本 key 永久保留**：五段脚本都会 `PERSIST` 版本 key。若版本 key 与数据同生命周期（一起 TTL 或被 `clear` 同时删除），版本号会归零重新计数，某个在途租约恰好等于重置后的小值时会「复活」。版本号是租约的时钟——**可以停，不能倒转**。
-5. **L1 也要租约**：`HeapMemory` 每条目带版本号，`overwriteIfVersionMatch` 在 `ConcurrentHashMap.compute` 内原子校验；租约失效时保留并发写入内容（写顺序是先 MySQL 再追加 L2/L1，L1 里是包含最新消息的列表，清空反而丢数据）。
+5. **L1 也要租约**：`HeapMemory` 每条目带版本号，`overwriteIfVersionMatch` 在 `ConcurrentHashMap.compute` 内原子校验；租约失效时保留并发写入内容（写顺序是先 MySQL 再追加 L2/L1，回填拒绝保留当前条目；写追加版本失配则失效为只保留版本的空列表，跨实例 L1 陈旧仍是独立边界）。
 
 **边界**：回填被拒时无 single-flight，N 个并发 miss 会产生 N 次 MySQL 查询（性能问题而非正确性问题）；`getAll`（`LRANGE 0 -1`）的读取成本随对话长度线性增长。
 
@@ -126,7 +126,7 @@ T1：用 S 整体替换 L2 → L2 变回 [1..10]，消息 11 从缓存里消失
 
 ### 3.5 工具结果 MySQL 重复行
 
-`ToolResponseMemory.save` 每次调用都 `mapper.insert` 新行，读取按 `orderByDesc(id) LIMIT 1` 取最新。同一 `(callId, chatId)` 重复保存会累积冗余行——不影响正确性（取到的永远是最新），但表会缓慢膨胀，属于已知存储冗余。
+`ToolResponseMemory.save` 每次调用都 `mapper.insert` 新行，读取按 `orderByDesc(id) LIMIT 1` 取最新。同一 `(callId, chatId)` 重复保存会累积冗余行。数据库回源取最大 id 的行；Redis 命中不核对数据库版本，同一调用若保存不同内容，缓存仍可能陈旧，因此只有相同内容不可变的前提下才只是存储冗余。
 
 ---
 

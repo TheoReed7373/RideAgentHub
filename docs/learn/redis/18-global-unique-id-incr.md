@@ -83,7 +83,7 @@ SnowflakeIdWorker guarded = new SnowflakeIdWorker(workerId, datacenterId) {
 
 三个关键点：
 
-1. **启动即抢**（`tryLockAsync(0, -1, ...)`，无等待、看门狗续期）：两个实例配了相同的 `workerId`，**第二个启动直接失败**——比「运行中产生重复 ID」好排查一万倍；
+1. **启动即抢**（`tryLockAsync(0, -1, ...)`，无等待、看门狗续期）：两个实例配了相同的 `(datacenterId, workerId)` 组合，**第二个启动直接失败**——比「运行中产生重复 ID」好排查一万倍；
 2. **发号前校验租约**：看门狗依赖后台线程续期，Redis 长期故障时租约可能失效（锁被释放或被别的进程持有）。`nextId` 每次发号前 `isHeldByThread(owner)` 校验——**租约丢了就停止发号**（抛异常），绝不「无租约地继续生成可能重复的 ID」；
 3. **`NodeLease` 实现AutoCloseable**：应用正常关闭时 `close()` 释放租约（`unlockAsync(owner)`），节点号可以被下一个实例立即接管。
 
@@ -110,7 +110,7 @@ SnowflakeIdWorker guarded = new SnowflakeIdWorker(workerId, datacenterId) {
 
 ## 六、边界与已知问题
 
-1. **`INCR` 依赖 Redis 可用**：Lua 返回 null 时为 503；实际 Redis 连接等异常未在 generateTicketId 捕获，通常由全局处理器返回 500。设计取舍：编号不唯一不可接受，编号不连续可接受（Redis 重启后当日计数归零——48h TTL 的 key 消失，序号从 1 重来，**撞号由唯一索引兜底**为 409）。
+1. **`INCR` 依赖 Redis 可用**：Lua 返回 null 时为 503；实际 Redis 连接等异常未在 generateTicketId 捕获，通常由全局处理器返回 500。设计取舍：编号不唯一不可接受，编号不连续可接受（Redis 重启且持久化未恢复该计数、或 key 被删除/淘汰后，当日计数可能归零；重启本身并不必然丢 key。计数丢失时序号才会从 1 重来，**撞号由唯一索引兜底**为 409）。
 2. **雪花时钟回拨**：`SnowflakeIdWorker.nextId` 检测到 `timestamp < lastTimestamp` 会抛 RuntimeException 并拒绝发号；序列耗尽时自旋等下一毫秒。此检查针对同一 worker 实例，不是跨重启的持久时间围栏。
 3. **租约校验有粒度**：`isHeldByThread` 是发号时的检查，Redis 故障的极短窗口内（检查通过 → 故障 → 发号）理论可越过；这是性能与一致性的折中。
 4. **`id.worker-id` 未外置提醒**：默认值 1 对单实例开发够用；多实例部署漏配会在第二实例启动时被拦下（明确的报错信息）。

@@ -46,7 +46,7 @@ flowchart LR
 
 | 模块 | 职责 | 关键事实 |
 |---|---|---|
-| `ChatController` | 6 个 `/chat/v2` 映射 | 只做参数接收，把执行委托给 `ChatRequestRunner` |
+| `ChatController` | 6 个 /chat/v2 映射 | 仅 /c、/r 委托 Runner；/lock、GET/POST restore、newuuid 分别直接调用会话组件 |
 | `ChatRequestRunner` | 单轮执行锁、格式校验、后台订阅、解锁 | 使用 `chatExecutor` 线程池 |
 | `ChatServiceImpl` | 分类、守卫、分发、恢复确认 | `resolveClassification()` 内联，无独立 `Classifier` 类 |
 | 4 个 Agent | 领域工具循环 | 均 `internalToolExecutionEnabled(false)`；**仅 Daily/Order/Support 三个**有 `history.size() - originalHistorySize > 200` 上限，`FallbackAgent` 无工具、无循环、单轮流式回复 |
@@ -63,16 +63,16 @@ flowchart LR
 1. **入口**：`ChatController` 的两个端点返回 `Flux<AgentEvent>`，由 Spring MVC 按协商流式输出（**源码没有 `produces = text/event-stream` 声明**，项目依赖是 `spring-boot-starter-web` Servlet 栈，不是 WebFlux），委托 `ChatRequestRunner.run(...)`。
 2. **格式校验**：`UUID.fromString(chatId)` 在 `Flux.defer` 外只做**格式校验**（不要求来自 `/chat/v2/newuuid`）。
 3. **单轮锁**：`redissonClient.getLock("chat:execution:" + chatId)`，调用 **`tryLockAsync(0, -1, TimeUnit.SECONDS, owner)`** —— `waitTime=0` 不排队、`leaseTime=-1` 走 Redisson 看门狗续期（**无显式 TTL**）、`owner` 是随机持有者令牌；随后 `acquisition.get(3, TimeUnit.SECONDS)` 的 **3 秒只是等待 Future 的上限**，不是抢锁超时、更不是锁过期时间。超时用 `thenAccept` 补偿解锁，抢锁失败发 `error` 事件并结束流。
-4. **锁内归属校验**：`chats.assertOwned(userId, chatId, !resume)`（**三参**，第三参 `allowNew`：`resume` 时为 `false`，禁止在恢复链路上新建会话）；会话不存在 404、**非本人 403**、停用 410。
+4. **锁内归属校验**：`chats.assertOwned(userId, chatId, !resume)`（**三参**，第三参 `allowNew`：`resume` 时为 `false`，禁止在恢复链路上新建会话）；allowNew=true 时不存在视为新会话，false 时不存在 404；非本人 403、historyDeleted=true 为 410。
 5. **后台订阅**：`sink.asFlux().doOnSubscribe(...).doFinally(signal -> lock.unlockAsync(owner)).publish().autoConnect(2)`，并在 `:61` 主动 `events.subscribe(...)` 构成第一个订阅者（另一个是前端）。业务在 `doOnSubscribe` 里提交到 `chatExecutor`，因此前端断开既不取消执行、也不提前放锁。
 6. **前置守卫**（普通 chat 先检查 isLocked，再调 `ChatServiceImpl.canStartChat`）：参数非空（空 prompt 不消耗限流配额，以 error 事件结束）→ `ChatRateLimiter.tryAcquire`（30 次/60 秒，Redis 异常放行）。
 7. **状态检查**：`assertOwned` → `break == yes` 时提示「请先确认或拒绝当前订单」并结束流 → `memory.get(userId, chatId, 100)` → 分类。
 8. **分类**：`resolveClassification()` 先查 `ClassificationCache`（`v2` 长度前缀指纹、6h），未命中调分类模型 `qwen3-max-preview`，结果 `normalizeClassification()` 归一化到 5 个标签；异常或无效分类返回 null，上游发路由失败消息并结束；DANGER 直接拦截；只有通过这两关，旧 classification 为 ORDER 才粘滞路由给 OrderAgent。
 9. **Agent 工具循环**：Daily/Order/Support 三个 Agent 手动循环（`history.size() - originalHistorySize > 200` 上限）逐轮调用工具、把结果写回上下文；`internalToolExecutionEnabled(false)` 表示由项目自己驱动。`FallbackAgent` 不注册工具、无循环。
-10. **事件流**：`AgentEvent` 共 5 类（`message` / `tool_start` / `notify` / `confirm` / `error`，源码工厂方法名是 `AgentEvent.tool`、`AgentEvent.comfirm`）；工具事件来自 `ToolNotifySupport` 的回调，回调异常被隔离。
+10. **事件流**：`AgentEvent` 共 5 类（`message` / `tool_start` / `notify` / `confirm` / `error`，其中 confirm 的 payload 是需再解析的 JSON 字符串；源码工厂方法名是 `AgentEvent.tool`、`AgentEvent.comfirm`）；工具事件来自 `ToolNotifySupport` 的回调，回调异常被隔离。
 11. **收尾**：`AgentStreams.guard(sink, action)` 是 **`void` 方法**，捕获同步动作异常后 `tryEmitNext(error)` + `tryEmitError`；`subscribe(...)` 内的 `takeUntilOther(Mono.delay(3min).flatMap(Mono.error(TimeoutException)))` 给**单次模型流调用**设上限（每次工具循环重新 `subscribe`，计时重置，整轮 SSE 无总时长上限）；解锁在 `ChatRequestRunner` 的 `doFinally`。
 
-`POST /chat/v2/r/{id}` 走同一个 `run(resume=true)`，区别在第 8 步之后：`ChatServiceImpl.resume` 先调 `OrderConfirmation.confirm(confirmationId, confirmed)` 做授权，再调 `orderAgent.resume(sink, id, userId, feedback + chatParam.getPrompt())` —— **用户 `prompt` 被原样拼接在固定 feedback 之后**（空 prompt 时自动填「确认/拒绝」），并未切断注入面；真正的授权边界在服务端 `CONFIRM`/`CONSUME` 两段 Lua，而不是「不转发用户原话」。
+`POST /chat/v2/r/{id}` 走同一个 `run(resume=true)`，从服务分支开始就不同：不执行 chat 的 isLocked / break=yes / history 分类链；先补齐默认 prompt、做参数与限流检查，再验证归属并执行确认。`ChatServiceImpl.resume` 先调 `OrderConfirmation.confirm(confirmationId, confirmed)` 做授权，再调 `orderAgent.resume(sink, id, userId, feedback + chatParam.getPrompt())` —— **用户 `prompt` 被原样拼接在固定 feedback 之后**（空 prompt 时自动填「确认/拒绝」），并未切断注入面；真正的授权边界在服务端 `CONFIRM`/`CONSUME` 两段 Lua，而不是「不转发用户原话」。
 
 ---
 

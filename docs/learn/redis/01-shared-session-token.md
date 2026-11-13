@@ -67,7 +67,7 @@
 
 `getToken` 反序列化后依次校验，任一不符返回 null（客户端表现为 401）：
 
-1. 载荷字段齐全且 `sessionVersion == currentVersion(userId)`——全量撤销（`REVOKE` 已 `INCR` 版本）后，旧令牌立即失效；
+1. userId、role、credentialStamp 非 null，且 `sessionVersion == currentVersion(userId)`；代码未逐项校验 authId、username、email 或载荷内 token——全量撤销（`REVOKE` 已 `INCR` 版本）后，旧令牌立即失效；
 2. DB 里 `is_deleted=0` 且 `status=1` 且 `role` 匹配——注销 / 停用 / 改角色立即生效；
 3. `CredentialStamp.of(user.getPassword())` 与载荷一致——**改密后旧令牌立即失效**，防止「密码重置期间旧验证请求产生有效会话」。
 

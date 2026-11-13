@@ -104,6 +104,8 @@ return 0
 
 在缓存 key 存续期间，`SYNC_ORDER_STATUS` 只允许状态码不降低：一个迟到提交的旧状态回调（例如网络延迟的「已接单」同步）不能把「行程中」的缓存改回「已接单」。注意 `current == false or tonumber(current) == nil` 的双重判断——**不存在的 key 在 Lua 里返回 false 而非 nil**（[10 篇](10-lua-scripts-overview.md) 的陷阱）。
 
+实际状态机包含 DRIVER_ACCEPTED → CREATED 的回池分支：handleArriveTimeout 成功后调用 refreshOrderStatus 删除缓存，而不是用 SYNC_ORDER_STATUS 写入更小状态码。key 缺失/过期后单调保护重新开始，不能把数字单调性描述为整个业务状态机永不回退。
+
 ### 4.6 接单成功后的联动
 
 `driverAcceptOrder` 成功路径一次串起四件事：

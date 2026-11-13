@@ -68,7 +68,7 @@ if (cached != null) return cached;
 // DB 回源后回填
 ```
 
-**固定 24 小时 TTL，读取不续期**：工具结果的价值集中在「对话后的短时间内」（用户追问上下文）；活跃会话的 `chat:info` / 历史消息有自己的 TTL 策略，工具缓存不需要跟着续。滑动过期（读一次续一次）会让活跃会话的工具结果无限累积。
+**每次写入或数据库回源回填设置 24 小时 TTL，Redis 命中不续期**：工具结果的价值集中在「对话后的短时间内」（用户追问上下文）；活跃会话的 `chat:info` / 历史消息有自己的 TTL 策略，工具缓存不需要跟着续。滑动过期（读一次续一次）会让活跃会话的工具结果无限累积。
 
 ### 4.3 `getCalling` 工具：归属校验
 
@@ -76,7 +76,7 @@ if (cached != null) return cached;
 
 ### 4.4 MySQL 侧的重复行
 
-同一 `(callId, chatId)` 重复 save 会累积多行（每次 `mapper.insert` 新行），读取取 `orderByDesc(id) LIMIT 1`（最新）。正确性不受影响（取到的永远是最新），表会缓慢膨胀——已知存储冗余（[docs/02](../../02-cache-consistency-race.md) §3.5 同一条）。
+同一 `(callId, chatId)` 重复 save 会累积多行（每次 `mapper.insert` 新行），读取取 `orderByDesc(id) LIMIT 1`（最新）。数据库回源取最大自增 id 的行；Redis 命中直接返回，且无不可变约束或版本校验，不能保证每次反查取到数据库最新行。表还会因重复保存而膨胀——已知存储冗余（[docs/02](../../02-cache-consistency-race.md) §3.5 同一条）。
 
 ### 4.5 `MessageWindow` 的工具配对
 

@@ -31,7 +31,7 @@
 | 工单编号唯一性 | INCR 日序号 | `TICKET_SEQUENCE` Lua，与雪花 ID 并存 | `TicketServiceImpl`、`config/IdGeneratorConfig` | [18](learn/redis/18-global-unique-id-incr.md) |
 | 对话上下文读取加速 | 多级缓存 | Heap → Redis → MySQL + 版本租约 | `agentbase/memory/MessageMemory` | [19](learn/redis/19-multi-level-cache.md) |
 | 工具结果按需反查 | 两级辅助索引 | Redis 24h + MySQL | `agentbase/memory/ToolResponseMemory` | [20](learn/redis/20-tool-response-cache.md) |
-| LLM 分类调用降本 | 结果缓存 | 指纹 key + TTL 可禁用 | `service/base/ClassificationCache` | [21](learn/redis/21-llm-classification-cache.md) |
+| LLM 分类调用降本 | 结果缓存 | 输入三元组指纹 key + TTL 可禁用 | `service/base/ClassificationCache` | [21](learn/redis/21-llm-classification-cache.md) |
 | 对话与入口限流 | 滑动窗口 | ZSet + Lua，两套并存 | `service/base/ChatRateLimiter`、`interceptor/RequestRateLimitInterceptor` | [22](learn/redis/22-sliding-window-rate-limit.md) |
 | 工单池分页排序 | ZSet 复合排序 | score 位权 + 版本令牌发布 | `service/base/TicketPoolIndex` | [23](learn/redis/23-ticket-pool-zset.md) |
 | 用户位置存取 | Hash | 三字段结构化小对象 | `UserServiceImpl.saveUserLocation` | [24](learn/redis/24-user-location-hash.md) |
@@ -73,7 +73,7 @@
 
 **Lua 脚本（`RedisScripts` + 5 个业务类）**。22 个主脚本集中维护于 `util/RedisScripts.java`，另有 11 个内联脚本分散在 `TokenServiceImpl`(3)、`EmailCodeService`(4)、`TicketServiceImpl`(1)、`OrderConfirmation`(2)、`OrderSearchTool`(1)。总览与逐脚本拆解见 [10 篇](learn/redis/10-lua-scripts-overview.md)。
 
-**多阶段确认令牌**。Hash 字段做流程门禁：取消订单前由 `verifyCancelConditions` 写入绑定订单号与时间的令牌，`CANCEL` Lua 在执行时校验 5 分钟时效并原子消费；订单创建权限由 `OrderConfirmation` 的 `CONFIRM` / `CONSUME` 两段 Lua 管理，报价 15 分钟有效、一次性消费、相同决定可幂等重放。见 [11 篇](learn/redis/11-two-phase-confirm-token.md)。
+**多阶段确认令牌**。Hash 字段做流程门禁：取消订单前由 `verifyCancelConditions` 写入绑定订单号与时间的令牌，`CANCEL` Lua 在执行时校验 5 分钟时效并原子消费；订单创建权限由 `OrderConfirmation` 的 `CONFIRM` / `CONSUME` 两段 Lua 管理，接受/消费校验 15 分钟时效，拒绝不检查报价年龄；创建权限一次性消费，同决定仅在 break=resuming 且状态未清理时可重放。见 [11 篇](learn/redis/11-two-phase-confirm-token.md)。
 
 **会话锁（`HASH_SET_WITH_EXPIRE`）**。`chat:info:{chatId}` Hash 的 `locked` 字段与 60 分钟过期在一段 Lua 内原子写入，避免「HSET 成功、EXPIRE 失败」把会话永久锁死。它与单轮执行锁 `chat:execution:{chatId}` 是两个 key、两种语义，后者由 `ChatRequestRunner` 用 Redisson 看门狗管理，客户端断开不提前放锁。见 [12 篇](learn/redis/12-chat-lock-atomic.md)。
 
@@ -105,7 +105,7 @@
 
 **用户位置 Hash（`UserServiceImpl.saveUserLocation`）**。三字段小对象用 Hash 而非 JSON String，与司机在线 GEO 是两套独立数据。见 [24 篇](learn/redis/24-user-location-hash.md)。
 
-**订单 HITL 状态机（`OrderAgent` + `OrderConfirmation`）**。`chat:info:{chatId}` Hash 的 `break` 字段有 `yes` / `resuming` 两态；`confirm` 事件携带服务端签发的 `confirmationId`，恢复链路经 `CONFIRM`（15 分钟时效校验、幂等重放）与 `CONSUME`（一次性消费）两段 Lua 授权。见 [25 篇](learn/redis/25-agent-hitl-state.md)。
+**订单 HITL 状态机（`OrderAgent` + `OrderConfirmation`）**。`chat:info:{chatId}` Hash 的 `break` 字段有 `yes` / `resuming` 两态；`confirm` 事件携带服务端签发的 `confirmationId`，恢复链路经 `CONFIRM`（接受时检查 15 分钟，幂等仅限 resuming 状态窗口）与 `CONSUME`（一次性消费）两段 Lua 授权。见 [25 篇](learn/redis/25-agent-hitl-state.md)。
 
 ---
 

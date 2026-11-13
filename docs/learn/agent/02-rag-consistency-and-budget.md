@@ -60,7 +60,7 @@ flowchart LR
 2. `deleteByQuery` 删除该 `groupId` 的所有旧文档，并校验 `timedOut()`/`failures()`；
 3. 从 DB 读当前 `QaInfo` 与该组所有 `QaElasticMap` 问题，逐条 `embedding.embed(question)` 重嵌并 `es.index(...)`；
 4. `es.indices().refresh(...)` 让新文档立刻可见；
-5. 成功后 `jobs.deleteById(groupId)`；**任何异常都 `jobs.defer(groupId)`**（约 30 秒后再可领取）并 `log.warn`，不阻塞后续正常任务。
+5. 成功后 jobs.deleteById(groupId)；单组处理异常被捕获后调用 defer 并记录 warn，正常情况下继续下一个任务。claimBatch 或 defer 自身异常未在此隔离，会退出本轮；慢的外部调用仍会占用调度线程并持有本批任务锁。
 
 ### 3.3 检索路径（8 秒共享预算 + 双路 + RRF + 权威库）
 
@@ -78,9 +78,10 @@ CompletableFuture.allOf(vectorFuture, bm25Future).get(remaining(deadline), TimeU
 - **共享 deadline**：向量化、向量检索、BM25 三个 Future 都用同一个 `remaining(deadline)`，不是各自 8 秒；超时后 `finally` 对未完成 Future `cancel(true)`（**逻辑取消**）。
 - **双路**：`knn` on `questionVector`（`k=100`、`numCandidates=200`）与 `match` on `question`（`size=100`），`source` 只取 `id/groupId/question/answer`。
 - **RRF**：`score = 1.0 / (60 + i + 1)`，`K=60`、窗口 100，按分降序后按 `groupId` 手动 collapse 去重，取到 5 条停止。
+- **不足 5 条不补位**：Top5 截取在 authoritative 之前；无效候选被剔除后不会继续从 RRF 后续排名补足，同组较低排名的有效问题也不再重试。
 - **`authoritative()`**：用 ES 文档 id 反查 `QaElasticMap`，校验 `question` 与 `groupId` **完全一致**，再用当前 `QaInfo.answer` 覆盖 `doc.setAnswer(...)`；无映射 / 问题已变 / 组已删除 → 丢弃该条。
 
-最后一步是整个设计的「安全网」：即使 ES 索引滞后或残留旧文档，**答案内容永远来自当前 DB**。
+最后一步是整个设计的「安全网」：即使 ES 索引滞后或残留旧文档，**返回答案由本次 QaInfo 查询结果覆盖**。映射与答案是两次查询，未用同一只读事务固定快照；查询后仍可能有并发修改，不能承诺响应时刻的绝对最新。
 
 ### 3.4 `version` 递增与 `SKIP LOCKED` 的并发领取语义（补充）
 
@@ -88,7 +89,7 @@ CompletableFuture.allOf(vectorFuture, bm25Future).get(remaining(deadline), TimeU
 
 ### 3.5 超时路径的完整状态流（补充）
 
-`remaining(deadline)` 在任一阶段超限时抛 `TimeoutException`（`RagService.java:389-393`）；`finally` 对未完成的 `CompletableFuture` 调 `cancel(true)`（`:330-331,385`）。这条路径**不会**返回「部分检索结果」或执行 `authoritative()`，而是让 `searchAnswers` 直接抛异常 —— 因为只融合了一路的结果在 RRF 下没有统计意义，宁可失败也不返回偏斜答案。`CompletableFuture.cancel(true)` 标记 Future 已取消，并不保证中断实际执行线程，已提交到 `ragExecutor` 的阻塞 ES / Embedding HTTP 调用没有中断点，**物理上仍在占用线程**；若队列持续被打满，`supplyAsync` 会抛 `RejectedExecutionException`（`AsyncWorkConfig` 未配置拒绝策略，默认 AbortPolicy），这是 8 秒预算之外的第二个容量边界。
+`remaining(deadline)` 在任一阶段超限时抛 `TimeoutException`（`RagService.java:389-393`）；`finally` 对未完成的 `CompletableFuture` 调 `cancel(true)`（`:330-331,385`）。这条路径**不会**返回「部分检索结果」或执行 `authoritative()`，而是让 `searchAnswers` 直接抛异常 —— 因为只融合了一路的结果在 RRF 下没有统计意义，宁可失败也不返回偏斜答案。`CompletableFuture.cancel(true)` 标记 Future 已取消；CompletableFuture 的 mayInterruptIfRunning 参数不控制底层计算的中断，已提交到 `ragExecutor` 的阻塞 ES / Embedding HTTP 调用没有中断点，**物理上仍在占用线程**；若队列持续被打满，`supplyAsync` 会抛 `RejectedExecutionException`（`AsyncWorkConfig` 未配置拒绝策略，默认 AbortPolicy），这是 8 秒预算之外的第二个容量边界。
 
 ---
 
@@ -114,13 +115,13 @@ CompletableFuture.allOf(vectorFuture, bm25Future).get(remaining(deadline), TimeU
 
 | 机制 | 原理 | 优势 | 局限 |
 |---|---|---|---|
-| 事务内持久任务表 | DB 事务边界 = 任务可见性边界 | 不需要 MQ；回滚自动撤销任务 | 靠轮询，默认 5 秒延迟 |
-| `SKIP LOCKED` | 跳过已被锁的行 | 多实例并行领取、不互相阻塞 | 失败任务需 `defer` 才会被再次领取 |
+| 事务内持久任务表 | DB 事务边界 = 任务可见性边界 | 不需要 MQ；回滚自动撤销任务 | fixedDelay 默认 5 秒是本轮结束到下轮开始的间隔，非可见性延迟上限 |
+| `SKIP LOCKED` | 跳过已被锁的行 | 多实例并行领取、不互相阻塞 | defer 将失败任务延后领取；不延期会很快再次命中到期任务，并非不 defer 就不能再领取 |
 | 8 秒共享 deadline | 向量化与双路 Future 的等待共享预算 | 避免每阶段独立等待 8 秒 | RRF 融合与 authoritative 同步数据库核对未受 deadline 控制，非整个接口的硬超时；取消 Future 不保证中断底层调用 |
 | RRF | 倒数排名融合，不依赖两路分数可比 | 无需归一化分数，鲁棒 | `K=60`、窗口 100 是经验值 |
-| 权威库核对 | 以 DB 当前行覆盖 ES 答案 | 索引滞后不产生错误答案 | 对候选问题映射与答案分别批量查询 DB，通常两次 |
+| 权威库核对 | 以本次 DB 查询读到的行覆盖 ES 答案 | 排除已识别的失效映射；不提供跨两次 DB 查询的原子快照 | 对候选问题映射与答案分别批量查询 DB，通常两次 |
 
-**方案对比**：① 同步双写（简单但 ES 故障会拖垮写入、回滚不一致）；② MQ / binlog CDC（解耦更彻底，需额外组件与幂等消费）；③ 定时全量重建（无任务表，但浪费且延迟更高）。当前选 ① 的可靠性 + ③ 的简单性折中，适合管理端低频写入的客服知识库。**纯理论**的「用 ES 作为唯一数据源」在这里不成立：答案正确性由 DB 负责。
+**方案对比**：① 同步双写（简单但 ES 故障会拖垮写入、回滚不一致）；② MQ / binlog CDC（解耦更彻底，需额外组件与幂等消费）；③ 定时全量重建（无任务表，但浪费且延迟更高）。当前采用事务内持久任务表与后台按组重建，适合管理端低频写入的客服知识库。**纯理论**的「用 ES 作为唯一数据源」在这里不成立：答案正确性由 DB 负责。
 
 ---
 
