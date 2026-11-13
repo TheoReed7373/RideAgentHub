@@ -1,163 +1,102 @@
-# Agent 的人机协同（HITL）：等待确认标记
+# Agent 的 HITL 等待确认：break 状态机与 confirmationId
 
-> **Redis 考点**：用 `chat:info:{chatId}` Hash 的一个 `break` 字段表达「会话被挂起、等待用户确认」，把跨请求的暂停状态外置到 Redis。
-> **来源**：`docs/01-redis-application-points.md` 一、现状盘点（`chat:info:{chatId}` Hash，属已实现部分）
-> **完整路径**：`src/main/java/com/fancy/rideagenthub/agents/OrderAgent.java`（历史快照 `:99-141`、`:262-305`）、`service/base/OrderConfirmation.java`、`service/impl/ChatServiceImpl.java`
-> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
-
----
-
-## 【当前实现对照】
-
-> **审计阅读约定（2026-11-13 代码反向复核）**：本篇 4.2/4.3/6.3/6.4/三/七章写于「单态 break、无 confirmationId、跨天可确认」的改造前版本，**作为推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
-
-| # | 正文中的旧说法 | 当前代码事实 |
-|---|---|---|
-| 1 | 4.2「`ChatServiceImpl.chat` 全文没有 break」「服务端不在普通消息中检查 break」 | `ChatServiceImpl.java:95-99` 在**分类之前**检查 `break == yes`：等待确认期间追加普通聊天会被 `notify("请先确认或拒绝当前订单，再继续对话")` 拦截并结束流 |
-| 2 | 恢复守卫校验 `"yes"`、`HDEL` 单字段、6.4「跨天可确认」、验证 #4 期望「非法恢复请求」 | `OrderAgent.resume` 校验 **`break == "resuming"`**（`:108`）并一次 `HDEL` **三字段** `break, pendingToolCall, confirmationAccepted`（`:146`）；报价窗口 **900000ms（15 分钟）**（`OrderConfirmation.java:19,34`）；相同 `confirmationId` + 相同决定可幂等重放、不同决定返回 409（`:20-23,64`） |
-
-### 4.4 `CONFIRM` / `CONSUME` 授权脚本逐行（补充）
-
-`service/base/OrderConfirmation.java:16-39` 两段内联 Lua 就是「服务端自授权」的全部实现：
-
-1. `CONFIRM` 先校验 `HGET(quoteId) == ARGV[1]`，**旧的 `confirmationId` 因 `quoted()` 重生成 UUID 而失配**（`:41-48`）；
-2. `ARGV[2] == 'yes'` 时校验 `now - quoteCreatedAt <= 900000`，超时返回 0 → 409；时间由 Java `System.currentTimeMillis()` 传入，不是 Redis TTL；
-3. `state == 'resuming'` 时**相同决定返回 1（幂等重放）、不同决定返回 0**，避免网络重试造成重复下单；
-4. 首次确认置 `break=resuming`、`confirmationAccepted`，`yes` 再写 `confirmedQuote` / `ReadyForCreate`（均等于 quoteId）；`no` 则 `HDEL` 这两字段；
-5. `CONSUME` 要求 `quoteId == confirmedQuote == ReadyForCreate` **三者相等**，通过后 `HDEL` 两字段一次性消费；重复调用抛 409（`:74-77`）。
-
-**边界区分**：`quoted()` 给 `chat:info` 设的是 **24h key TTL**，15 分钟是脚本内用字段时间戳算出的**报价有效期**，两者不是一回事；`break` 的两态（`yes` 等待 / `resuming` 已登记）把「等用户」与「等 Agent 恢复」分开，才使得幂等重放与一次性下单能同时成立。
-
-> HITL 设计动机、悬空 tool call 补齐机制的推导**保留**；本页「单态 break」「无 confirmationId」「跨天可确认」「`Chat2Controller`」等结论已整体重写。
-
-| 项 | 当前实现 |
-|---|---|
-| `break` 两态 | `yes` = 等待用户确认；`resuming` = 确认已登记、等待 Agent 恢复。字段由 `service/base/OrderConfirmation` 的 `CONFIRM`/`CONSUME` 两段内联 Lua 统一维护：`quoteId`(=`confirmationId`)、`ReadyforConfirm`、`quoteCreatedAt`、`ReadyForCreate`、`confirmedQuote`、`confirmationAccepted`、`pendingToolCall`、`break` |
-| 挂起前置 | `OrderAgent.handleNotifyUser` 先调 `orderConfirmation.begin(chatId, toolCallId)`：要求已有有效报价，否则 **409**；取回 `confirmationId` 写入 `orderJson`，再落历史 + `HSET break yes` + `AgentEvent.comfirm` |
-| 主动检查 | `ChatServiceImpl.chat` 在分类**之前**检查 `break`：为 `yes` 时 `notify("请先确认或拒绝当前订单，再继续对话")` 并结束流，等待确认期间不能追加普通聊天 |
-| 恢复链路 | `POST /chat/v2/r/{id}` 传 `{confirmationId, confirmed, prompt}` → `ChatServiceImpl.resume` 先 `orderConfirmation.confirm(...)`（CONFIRM Lua 校验 **15 分钟**报价有效期、置 `break=resuming`、签发 `ReadyForCreate`）→ 以**固定 feedback** 调 `OrderAgent.resume` → 校验 `break=="resuming"` → `messageMemory.getPersisted` → 从 `pendingToolCall` 取 toolCallId → **先持久化 `ToolResponseMessage`** → 一次 `HDEL break, pendingToolCall, confirmationAccepted` |
-| 幂等重放 | `break == resuming` 时**相同决定**返回 1 可重放，不同决定返回 0；新报价使旧 `confirmationId` 失配失效；创建权限由 `CONSUME` 一次性消费 ✅ 已修复「可重复下单」 |
-| 时效 | `quoted()` 给 `chat:info` 设 **24h TTL**；`CONFIRM`/`CONSUME` 校验 **900000ms（15 分钟）**；超时 409 ✅ 已修复「跨天可确认」；`confirmationAccepted`/`confirmedQuote` 已结构化记录 |
-| 工具降级 | `markOrderReadyForCreate()` **只读** `isConfirmed`；`createOrder()` 落单前调 `consume()` |
-| 幽灵引用 | `Chat2Controller.java` 与 `/order/resume/{chatId}` 已在 `a8f4e33` **删除**；恢复接口只有 `POST /chat/v2/r/{id}` |
-
-**时序图修订**：根 `README.md` 的时序图已补 `CS->>OrderConfirmation: confirm(confirmationId, confirmed)` 授权环节，并把 `markOrderReadyForCreate()` 标注为「仅查询 isConfirmed」。详见 [`11-two-phase-confirm-token.md`](11-two-phase-confirm-token.md)、[`../agent/01-orchestration-and-sse.md`](../agent/01-orchestration-and-sse.md)。
+> **Redis 考点**：Agent 执行到「高风险动作」前主动挂起（Human-in-the-Loop）——挂起状态外置到 Redis Hash（`break` 字段），跨请求恢复靠服务端签发的 `confirmationId` 一次性令牌。
+> **来源**：`docs/01-redis-application-points.md` §2.6（其它应用点）
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/OrderConfirmation.java`、`src/main/java/com/fancy/rideagenthub/agents/OrderAgent.java`、`src/main/java/com/fancy/rideagenthub/service/impl/ChatServiceImpl.java`（`resume`）
 
 ---
 
 ## 一、业务场景
 
-下单是一个有**副作用**的操作：一旦调用 `createOrder()`，DB 里就多了一张真实订单，用户可能要被扣钱。让大模型自主决定下单是不可接受的 —— 它必须先把「将要创建的订单长什么样」摆给用户看，等用户点头。
-
-这就是 human-in-the-loop（HITL）：
+订单创建是资金相关操作，不能让「模型觉得用户想下单」就直接执行。HITL（Human-in-the-Loop）断点的完整链路：
 
 ```
-LLM 收齐参数 → notifyUser() 输出订单摘要 → ⏸ 挂起，等用户回复
-                                              ↓
-用户「确认无误，直接下单」→ ▶ 恢复 → markOrderReadyForCreate() → createOrder()
+① Agent 补齐订单参数 → 算价（quoted()：quoteId + 时间戳）
+② begin(chatId, toolCallId)      → break=yes：会话挂起，等待用户确认
+③ confirm 事件（携带 confirmationId）推给前端
+④ 用户点击确认/拒绝 → POST /chat/v2/r/{chatId} {confirmationId, confirmed}
+⑤ CONFIRM Lua（校验 15 分钟 → break=resuming → 签发 ReadyForCreate）
+⑥ OrderAgent.resume：接回工具链，先持久化悬空的工具应答
+⑦ createOrder → consume()（一次性消费）→ 真正落单
 ```
 
-难点在于**暂停是跨 HTTP 请求的**。Agent 是一个无状态的 Spring Bean，方法返回后内存里什么都不剩；下一轮用户消息到达时，服务端必须能回答一个问题：这次该「重新分类 + 正常处理」，还是「接着上次的挂起状态往下走」？答案存在 Redis 里。
+「挂起」的难点：**Agent 的执行状态（等哪个工具调用、等谁确认）必须跨请求存活**——HTTP 请求已结束，状态只能外置。这就是 `chat:info` Hash 的 `break` 字段。
 
 ---
 
 ## 二、Redis 结构选型
 
-| Key | 结构 | 用到的字段 | TTL | 语义 |
-|---|---|---|---|---|
-| `chat:info:{chatId}` | Hash | `break` | **视流程而定，见 6.3** | `break=yes` 表示该会话正等待用户确认 |
+`chat:info:{chatId}` Hash 上与 HITL 相关的字段：
 
-Key 前缀定义在 `constant/RedisKeyConstants.java:55`（`CHAT_INFO_KEY`），构建方法在 `:250-252`（`chatInfoKey`）。
+| 字段 | 值 | 语义 |
+|---|---|---|
+| `break` | `yes` / `resuming` | 挂起状态机：`yes`=等待确认，`resuming`=已确认正在恢复 |
+| `pendingToolCall` | toolCallId | 挂起时悬空的工具调用（恢复时先补应答） |
+| `quoteId` | UUID | 报价标识 = **confirmationId**（前端回传的就是它） |
+| `quoteCreatedAt` | 毫秒时间戳 | 报价时刻（15 分钟时效的基准） |
+| `confirmationAccepted` | `yes` / `no` | 用户当时的选择（幂等重放的比对基准） |
+| `confirmedQuote` / `ReadyForCreate` | quoteId | 创建权限（confirm 签发、consume 消费） |
 
-这个 Hash 是项目的「会话状态袋」，除 `break` 外还装着订单参数槽位（`START_LAT`、`END_LNG`…）、流程令牌（`ReadyforRoute` / `ReadyforConfirm` / `ReadyForCreate`）、`classification`、`locked` 等，见 [`11-two-phase-confirm-token.md`](11-two-phase-confirm-token.md) 与 [`12-chat-lock-atomic.md`](12-chat-lock-atomic.md)。
+`quoted()` 同时把 `chat:info` 续 24 小时 TTL——挂起中的会话不该在用户思考时过期。
 
 ---
 
 ## 三、代码落点
 
-| 位置 | 方法 | 职责 |
-|---|---|---|
-| `OrderAgent.java:240-243` | `handleToolCalls` | 检测到 `notifyUser` 调用即中断工具循环 |
-| `OrderAgent.java:262-305` | `handleNotifyUser` | 发 `confirm` 事件 + **写 `break=yes`** |
-| `OrderAgent.java:295` | — | `HSET chat:info:{chatId} break yes` |
-| `OrderAgent.java:99-141` | `resume` | 挂起后的恢复入口 |
-| `OrderAgent.java:105-110` | `resume` 内 | **校验 `break`**，非挂起态直接报错返回 |
-| `OrderAgent.java:113` | — | `HDEL chat:info:{chatId} break` |
-| `OrderAgent.java:122-137` | `resume` 内 | 找回 `notifyUser` 的 toolCallId，把用户回复包装成工具结果 |
-| `OrderAgent.java:270-283` | `handleNotifyUser` 内 | 遍历 `OrderInfoEnum` 读回订单参数槽位 |
-| `agentbase/tool/OrderTool.java:386-395` | `notifyUser` | 工具本体（只做前置校验，不写 `break`） |
-| `service/impl/ChatServiceImpl.java:180-184` | `resume` | 直接转发给 `orderAgent.resume` |
-| `controller/ChatController.java:49-57` | `POST /chat/v2/r/{id}` | 恢复接口（正式） |
-| ~~`controller/Chat2Controller.java:53-60`~~ | ~~`POST /order/resume/{chatId}`~~ | **已删除**（`a8f4e33`）；当前恢复接口仅 `controller/ChatController.java` 的 `POST /chat/v2/r/{chatId}` |
+| 位置 | 职责 |
+|---|---|
+| `OrderConfirmation.quoted` | 报价时清旧字段 + 写 `quoteId` / `quoteCreatedAt`，key 续 24h |
+| `OrderConfirmation.begin` | 校验有效报价（否则 409）；写 `break=yes` + `pendingToolCall`；返回 quoteId |
+| `OrderConfirmation.confirm` | `CONFIRM` Lua：时效 + 状态机 + 幂等；失败 409 |
+| `OrderConfirmation.consume` | `CONSUME` Lua：一次性消费创建权限 |
+| `OrderAgent` | 工具循环中触发 confirm 事件；`resume(sink, chatId, userId, feedback)` 恢复执行 |
+| `ChatServiceImpl.resume` | 恢复编排：`confirm` 授权 → `orderAgent.resume(feedback + prompt)` |
+| `ChatServiceImpl.canStartChat` | `chat` 在 canStartChat 之后检查 `break == yes`（canStartChat 本身只校验 prompt 与限流） → 提示「请先确认或拒绝当前订单」 |
 
 ---
 
 ## 四、实现拆解
 
-### 4.1 挂起：`notifyUser` 一被调用就中断循环
+### 4.1 两态 `break`：为什么不是一态
 
-大模型要「提出确认请求」时，会调用 `notifyUser` 工具。这个工具的**本体几乎是空的**（`OrderTool.java:386-395`）：只检查 `ReadyforConfirm` 是否存在，然后返回空串。它存在的意义在注释里写得很直白（`:388-389`）——*这个工具只是为了让大模型显式地调用它，好让 Agent 侧的 switch 触发 `sink.tryEmitComplete()`*。
+- `yes`：等待用户输入——**普通对话被拦**（`canStartChat` 检查到 `break == yes` 发提示并结束流），恢复接口处理；
+- `resuming`：确认已受理、Agent 正在恢复执行——**幂等重放**（用户双击确认）应放行，`CONFIRM` 检查 `confirmationAccepted` 相同决定返回 1 而非 409；恢复期间的新消息由执行锁（`chat:execution`）互斥拒绝；`OrderAgent.resume` 补齐工具应答后主动删除 break / pendingToolCall / confirmationAccepted，再继续模型循环。
 
-真正的挂起动作发生在 Agent 的工具循环里（`OrderAgent.java:240-243`）：
+### 4.2 `CONFIRM` Lua：授权的原子判定
 
-```java
-if ("notifyUser".equals(toolName)) {
-    handleNotifyUser(toolCall, history, originalHistorySize, sink, chatId, userId, toolContext);
-    return; // 中断循环，等待用户确认
-}
+失败分支（confirmationId 不匹配 / 超 15 分钟 / 相反决定的重放 / 非挂起态）统一映射 409「确认已失效或已被使用」：
+
+```
+quoteId 不匹配                            → return 0
+confirmed=yes 且 超 15 分钟               → return 0
+state == resuming 且决定相同              → return 1   （幂等重放）
+state == resuming 且决定不同              → return 0
+state ~= yes（未挂起）                    → return 0
+→ HSET break=resuming + confirmationAccepted
+→ yes：签发 confirmedQuote / ReadyForCreate = quoteId
+   no ：HDEL 两者（拒绝不签发权限）
 ```
 
-`handleNotifyUser`（`:285-299`）依次做四件事：
+**幂等只对「相同决定」开放**——`confirmed=true` 重放放行，`true` 之后改提 `false` 被拒（授权已给出，不能反悔）。
 
-```java
-String orderJson = objectMapper.writeValueAsString(orderParams);
-sink.tryEmitNext(AgentEvent.comfirm(orderJson));        // ① 把订单摘要推给前端
-saveNewMessages(userId, chatId, history, originalHistorySize);  // ② 落history
-stringRedisTemplate.opsForHash().put(chatInfoKey, "break", "yes");  // ③ 写挂起标记
-sink.tryEmitComplete();                                 // ④ 结束 sink
-```
+`ChatServiceImpl.resume` 把用户 `prompt` **原样拼接**在固定 feedback 之后传给 `orderAgent.resume`——注入面不靠「不转发原话」防御（挡不住提示词注入），靠的是：**授权与执行分离**（模型收到的只是文本，真正的门禁在 `consume` 的 Lua 里）。
 
-注意顺序：**`break` 是三个写入步骤中的最后一步**（`tryEmitComplete` 只是收尾）。若中途序列化失败，catch 分支（`:300-304`）只发 error 就结束，不会留下一个「没人等着的 break」。反过来说，`break` 有可能因为 Redis 异常而写失败，此时前端仍收到了 `confirm` 事件、用户仍会回复 —— 那次回复将被 4.2 的守卫拦下，如实报错，不会静默走错路径。
+### 4.3 恢复执行：先补悬空的工具应答
 
-`orderParams` 来自 `:270-283` 对 Hash 的遍历：`OrderInfoEnum` 的每个枚举名（`VEHICLE_TYPE`、`START_LAT`、`EST_PRICE`…）就是 Hash 字段名，逐字段 `HGET` 出来拼成一份 JSON（跳过 `MONGO_TRACE_ID`，另补一个 `"EST_TIME"`）。**Hash 在这里被当作一张可以按字段名随机访问的「订单草稿表」用** —— 这正是选 Hash 而非单个 JSON String 的理由，见 [`24-user-location-hash.md`](24-user-location-hash.md) 5.1。
+`OrderAgent.resume` 的关键步骤（顺序重要）：
 
-### 4.2 恢复：`break` 是守卫，不是路由开关
+1. `getPersisted`（直读 MySQL 权威数据）拿到挂起前的历史；
+2. **先持久化悬空的 `ToolResponseMessage`**——挂起时 `pendingToolCall` 的调用没有应答，协议要求恢复后必须成对出现（`MessageWindow` 的配对校验）。用数据库事实补，避免「持久化成功而缓存失败后重复保存工具应答」；
+3. 注入固定 feedback（「用户已确认 / 已拒绝」+ 可选用户补充说明）继续工具循环；
+4. `markOrderReadyForCreate`（只读）→ `createOrder` → `consume()`。
 
-这是最容易读错的一处。**服务端不会在收到普通消息时检查 `break` 来决定走不走 `resume`**：
+### 4.4 挂起拦截与 DANGER 守卫前置
 
-- `ChatServiceImpl.chat`（`:80-141`）的通路里**只看 `chatManager.isLocked(id)` 与分类结果**（`:83`、`:117-123`），全文没有 `break`；
-- 是否走恢复路径，由**客户端选哪个 URL** 决定：`POST /chat/v2/c/{id}` 走 `chat`，`POST /chat/v2/r/{id}` 走 `resume`（`ChatController.java:39-57`）。前端在流里收到 `confirm` 事件、用户点了「确认」按钮后，才会打到 `/r/{id}`。
+普通对话在 `break == yes` 时被拦：**挂起期间用户补充的信息（「再等等」）不进入会话历史**，避免污染挂起前的上下文。普通聊天先检查 break，再分类与拦截 DANGER；`resume` 不调用分类器，因此没有 DANGER 分类守卫，恢复授权由 CONFIRM / CONSUME 校验。
 
-因此 `:105` 那个判断是**防误用的守卫**，而不是分派逻辑：
+### 4.5 会话粘滞
 
-```java
-Object breakFlag = stringRedisTemplate.opsForHash().get(chatInfoKey, "break");
-if (breakFlag == null || !"yes".equals(breakFlag.toString())) {
-    sink.tryEmitNext(AgentEvent.error("非法的恢复请求：对话不在等待确认状态"));
-    sink.tryEmitComplete();
-    return;
-}
-stringRedisTemplate.opsForHash().delete(chatInfoKey, "break");   // :113 一次性消费
-```
-
-它挡住了三种情况：客户端 `confirm` 事件处理有 bug、用户手抖重复点确认、以及会话已换到下一轮。删除是**无条件**的（`HDEL` 不看返回值），紧接着的 `:122-127` 还会要求 history 里能找到一个 `notifyUser` 的 toolCallId，否则同样报错退出 —— 双重校验，删标记与取历史不一致时也不会把对话带跑偏。
-
-### 4.3 恢复后：把用户回复伪装成工具返回值
-
-`OrderAgent.java:130-137`：
-
-```java
-ToolResponseMessage.ToolResponse toolResponse = new ToolResponseMessage.ToolResponse(
-        lastToolCallId,      // 那次 notifyUser 的 id
-        "notifyUser",
-        feedback);           // 用户的原话
-history.add(toolResponseMessage);
-runLoopStep(history, originalHistorySize, sink, chatId, userId);   // :140 重新进循环
-```
-
-关键设计：**恢复不是「新开一轮对话」，而是「把上一轮那个悬空的 tool call 补上返回值」**。大模型看到的上下文是连续的 —— 它自己调了 `notifyUser`，现在工具返回了「确认无误，直接下单」，于是自然接着调 `markOrderReadyForCreate` → `createOrder`（`OrderTool.java:397-404`、`:406-411`）。没有这一步，模型会失去「我刚才在等确认」的语境。
-
-**挂起的触发条件**：无额外条件 —— 只要模型选择调用 `notifyUser`（`:240` 按工具名精确匹配），就一定挂起。而「模型什么时候会调 `notifyUser`」是提示词约束的（`config/ChatProperties.java:78-81`：*调用 notifyUser() 输出将要创建的订单摘要，并请用户确认/修改*）。也就是说，**挂起的判定权在模型（提示词）手里，不在 Redis 字段里**。
+`ChatServiceImpl` 路由时若 Redis 里 `classification == ORDER`，**只有分类成功且不是 DANGER 后才按旧 ORDER 路由给 `OrderAgent`**——恢复期间用户的消息（「帮我确认」）可能被分类成 DAILY，粘滞保证它仍进入订单链路。
 
 ---
 
@@ -165,84 +104,53 @@ runLoopStep(history, originalHistorySize, sink, chatId, userId);   // :140 重�
 
 | 选择 | 备选 | 为什么选这个 |
 |---|---|---|
-| 挂起标记放 Redis | 存 DB（`chat` 表加一列 `pending_confirm`） | 读发生在**每一条消息进入时**（热路径），写只在 `notifyUser` 时发生一次 —— 典型写少读多，且读要尽量便宜。Redis 一次 `HGET` 搞定，DB 要多一次查询 |
-| 标记是**会话级瞬时状态**，丢了可接受 | 持久化保证不丢 | 丢了最多是「用户再发一遍」，没有数据损坏。这与「订单不能丢」是不同等级的状态，见 [`11-two-phase-confirm-token.md`](11-two-phase-confirm-token.md) 对状态分级的讨论 |
-| 用同一个 Hash 的独立字段 `break` | 单独开 `chat:break:{chatId}` key | `break` 与订单槽位、`classification` **同生共死**（同一轮下单流程），拆成两个 key 会引入「一个过期另一个没过期」的不一致；且 HSET/HDEL 都是单命令原子 |
-| `HDEL` 在守卫之后立刻执行 | 等流程真正跑完再删 | 一次性消费语义：即使用户连点两次确认，第二次也会被守卫挡回，不会重复下单 |
-| 值用 `"yes"` 哨兵而非布尔 | 用 `"true"` / 存 `1` | **与项目内其它标记不一致**：`locked` 用 `"true"`、`ReadyForCreate` 用 `"true"`、`readyForCancel` 用 `"true"`。`break` 是唯一的 `"yes"`。属历史遗留的不统一，改动前需确认没有旧客户端依赖（见第六节） |
+| 挂起状态外置（`break` 字段） | 请求内等待（长连接） | SSE 适合流式输出不适合挂机等待；外置使恢复与挂起可在不同实例 |
+| confirmationId = quoteId | 独立随机 ID | 报价与确认天然一对一：新报价 → 新 quoteId → 旧确认自动失效 |
+| 两态 break | 一态（有/无） | `resuming` 承载「幂等重放窗口」与「恢复中不拦普通对话」两个语义 |
+| 15 分钟时效 | 无时效 / 24h | 报价含价格——太久后价格失真；15 分钟覆盖正常决策 |
+| 恢复先补工具应答 | 直接继续 | 协议要求 call/response 成对；缺失会让下一轮模型调用报错 |
+| prompt 原样拼接 + Lua 门禁 | 过滤用户原话 | 过滤挡不住注入；授权在服务端 Lua，模型文本无权限 |
 
 ---
 
 ## 六、边界与已知问题
 
-### 6.1 与 `ReadyFor*` 令牌的区别
-
-两者都往 `chat:info:{chatId}` 里写状态位，但**决策主体完全不同**：
-
-| | `break` 标记 | `ReadyFor*` 令牌 |
-|---|---|---|
-| 字段 | `break` | `ReadyforRoute` / `ReadyforConfirm` / `ReadyForCreate` / `readyForCancel` |
-| 谁触发 | 用户在对话里回复确认 | Agent 流程内部的前置步骤完成 |
-| 回答的问题 | 「**用户**点头了吗」 | 「**流程**走到这一步了吗」 |
-| 谁消费 | `OrderAgent.resume`（`:105`、`:113`） | `OrderTool` 的各个工具：`notifyUser` 查 `ReadyforConfirm`（`OrderTool.java:391`）、`createOrder` 查 `ReadyForCreate`（`:411`）、`cancelOrder` 查 `readyForCancel`（`OrderSearchTool.java:254`） |
-| 检查失败的含义 | 客户端发起了非法恢复 | 模型跳步了，提示它先调前置工具 |
-
-一句话：`break` 是**用户侧**确认，`ReadyFor*` 是**流程侧**前置条件。二者串联：`ReadyforConfirm` → `notifyUser` → `break=yes` → 用户确认 → `resume` → `ReadyForCreate` → `createOrder`。
-
-**顺带记录一处命名混乱**：三个 `ReadyFor` 系列字段的大小写互不相同 —— `ReadyforRoute` / `ReadyforConfirm`（小写 f）vs `ReadyForCreate`（大写 F），取消流程又是 `readyForCancel`（小写开头）。它们都是散在各个工具类里的字符串字面量，没有集中定义，搜索时容易漏。
-
-### 6.2 `break` 会不会被别处的流程误清掉
-
-`HDEL chat:info:{chatId} break` 在全项目只出现在 `OrderAgent.java:113` 这一处（另有一次 `HSET` 在 `:295`）。所以挂起标记的生命周期只有两个出口：被 `resume` 正常消费，或随整个 key 一起过期/删除。
-
-### 6.3 TTL：`break` 会不会「自己消失」——**待确认**
-
-`chat:info:{chatId}` 的 TTL 由 `ChatManager` 管理，常量是 `ChatManager.java:24` 的 `expireLock = Duration.ofMinutes(60)`，通过 Lua 脚本与 `HSET locked true` 一起原子设置（`:26-37`）。但把这个结论直接套到 `break` 上会得出**错误**的判断，需要分清两条路径：
-
-- **`chat:info` key 的首次创建不带 TTL**。新会话第一次写入这个 key 的地方是 `ChatServiceImpl.java:124` 的 `HSET classification`，它是裸的 `opsForHash().put`，**没有 `EXPIRE`**；`OrderAgent:295` 写 `break` 同样是裸 `HSET`。`ChatManager.initChat` 只写 DB（`ChatInfoService.java:23-33`），不碰 Redis。
-- **TTL 只在 `lockChat` 被调用后才出现**：`createOrder` 成功后（`OrderTool.java:436`）、用户切换到别的会话时（`MessageMemory.java:196`）、或显式调 `POST /chat/v2/lock/{id}`。此外 `ChatManager.getRestorableChat` 会刷新 TTL（`:57-64`），而 `ChatInfoService` 的 `restoreChat` 反过来用 `PERSIST` **移除** TTL（`ChatInfoService.java:82-85`）。
-
-结论：**「用户挂起后 60 分钟没回复，标记会过期、Agent 回到正常分类路径」这个场景，在下单流程走完之前通常不会发生** —— 因为那时 key 上根本没有 TTL，`break` 会一直驻留，直到用户回复或会话被锁定/清理。
-
-那么**待确认**的是：如果 `break` 真的因为某种原因消失了（比如用户在挂起期间切走又切回、key 被 `lockChat` 打了 TTL 后过期），用户此后再点「确认」，`resume` 会走到 `:106` 的分支，返回「非法的恢复请求：对话不在等待确认状态」。用户看到的是一条错误提示，而不是被引导去重新下单 —— 这个降级体验是否可接受，代码里没有兜底，**需要产品侧确认预期**。
-
-### 6.4 其它
-
-1. **挂起状态不区分「确认」与「修改」**。用户回复「终点改成成都南站」与「确认无误」走的是完全相同的路径（`resume` 只把原话塞进 `ToolResponseMessage`，`:130-137`），由模型自行判断是继续下单还是回到补槽位。这意味着**「用户到底确认了没有」这件事没有被结构化的记录** —— 审计或补偿时无法从 Redis 里查证。
-2. **`break` 没有防重放之外的时间约束**。一个挂了很久的会话（比如跨天），用户再回来说「确认」，`resume` 依然会接着上次的上下文往下走，而订单参数槽位可能已经不符合当前情况（比如预约时间已过期）。当前没有「挂起超过 N 分钟则强制重新确认」的检查。
-3. **`resume` 结束后不写 `break=no`，而是直接 `HDEL`**（`:113`）。缺字段与 `break=no` 在读侧（`:106` 判 `null || !"yes"`）等价，所以两种表示都安全 —— 选 `HDEL` 只是省一个字段。
+1. **确认期间用户改主意（想改地址）**：只能拒绝当前报价重新对话——改参数 = 新报价 = 新 confirmationId，语义自洽。
+2. **`consume` 成功而订单创建失败**：创建权限已消费，需重新报价确认（与 [11 篇](11-two-phase-confirm-token.md) 的「消费与执行分离」同一残留）。
+3. **挂起 24 小时后 key 过期**：quoted 设置 24h，但 GET /restore 命中会改成 60min，POST /restore 会 persist，不能把 24h 当作全链路硬上界——过期后 confirm 返回 409，用户重新对话。
+4. **`break=resuming` 期间的新输入**：执行锁串行化，不会并发；恢复轮结束后按正常分类路由。
 
 ---
 
 ## 七、如何验证
 
 ```bash
-# 1. 走到「请确认订单」那一步后，观察挂起标记
-redis-cli HGETALL chat:info:{chatId}
-# 期望：看到 break = yes，以及 START_LAT / END_LNG / EST_PRICE 等订单槽位
+# 1. 挂起状态：对话走到报价确认后
+redis-cli HGET chat:info:<chatId> break              # 期望 yes
+redis-cli HGET chat:info:<chatId> quoteId            # 期望 UUID（= confirmationId）
+redis-cli HGET chat:info:<chatId> pendingToolCall    # 期望：工具调用 id
+redis-cli TTL chat:info:<chatId>                     # 期望 ≤ 86400（quoted 续的 24h）
 
-# 2. 挂起态下把用户回复打到恢复接口（POST /chat/v2/r/{id}）
-#    期望：SSE 流继续输出，最终触发 markOrderReadyForCreate → createOrder
+# 2. 确认后（POST /r 提交 confirmed=true）
+redis-cli HGET chat:info:<chatId> break              # 期望 resuming
+redis-cli HGET chat:info:<chatId> ReadyForCreate     # 期望 = quoteId
+#    createOrder 后：ReadyForCreate 被消费（nil）
 
-# 3. 确认标记已被一次性消费
-redis-cli HGET chat:info:{chatId} break   # 期望 (nil)
+# 3. 幂等重放：仅 break=resuming 且决定相同时 Lua 返回成功；resume 清理 break 后不保证重放成功
+#    改提相反 confirmed → 409
 
-# 4. 重复确认：再次调 /r/{id}
-#    期望：收到「非法的恢复请求：对话不在等待确认状态」，且不产生第二张订单
+# 4. 时效：手工把 quoteCreatedAt 改到 16 分钟前
+redis-cli HSET chat:info:<chatId> quoteCreatedAt 1730000000000
+#    → 接受被拒（BusinessException 409）；拒绝不因报价超龄被拒。流内异常由 guard 转为 error 事件
 
-# 5. 观察这个 key 到底有没有 TTL（-1 表示无过期，与 6.3 的结论对照）
-redis-cli TTL chat:info:{chatId}
-redis-cli HGET chat:info:{chatId} locked
-
-# 6. 挂起期间对比一下其它流程令牌
-redis-cli HMGET chat:info:{chatId} ReadyforConfirm ReadyForCreate
+# 5. 挂起期间普通对话被拦：POST /c/{id} → notify「请先确认或拒绝当前订单」
 ```
 
 ---
 
 ## 八、延伸阅读
 
-- [`11-two-phase-confirm-token.md`](11-two-phase-confirm-token.md) —— `ReadyFor*` 流程侧前置条件令牌，与本文的 `break` 用户侧确认对照
-- [`12-chat-lock-atomic.md`](12-chat-lock-atomic.md) —— `chat:info:{chatId}` 的 `locked` 字段、60 分钟 TTL 与 HSET+EXPIRE 的原子性
-- [`24-user-location-hash.md`](24-user-location-hash.md) —— 同一个项目里 Hash 的另一种用法与选型思路
-- [`14-grab-order-lua.md`](14-grab-order-lua.md) —— 下单链路的下一环：抢单的 Lua 原子预检
+- [`11-two-phase-confirm-token.md`](11-two-phase-confirm-token.md) —— 令牌族全景（取消令牌 / 确认令牌对照）
+- [`12-chat-lock-atomic.md`](12-chat-lock-atomic.md) —— `chat:info` 的 TTL 语义与单轮执行锁
+- [`19-multi-level-cache.md`](19-multi-level-cache.md) —— `MessageWindow` 工具批次配对（恢复补应答的依据）
+- [`../agent/01-orchestration-and-sse.md`](../agent/01-orchestration-and-sse.md) —— 恢复链路的完整调用时序

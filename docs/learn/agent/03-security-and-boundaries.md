@@ -12,7 +12,7 @@ AI Agent 系统里「用户输入」和「模型输出」都不可信：客户�
 
 1. 身份与角色只从登录态取，不信任请求体；
 2. 价格、轨迹、订单状态由服务端重算/重查；
-3. 高风险动作（下单、支付、取消）必须由服务端签发的一次性令牌授权；
+3. Agent 下单与取消工具使用服务端一次性权限；HTTP POST /order 与取消接口不依赖聊天确认令牌，支付依赖 PaymentVerifier，不能泛化为所有入口共用令牌；
 4. 并发注册、跨用户访问、异常到 HTTP 状态码要有统一裁决。
 
 ---
@@ -84,7 +84,7 @@ PaymentVerifier unavailablePaymentVerifier() {
 
 `service/PaymentVerifier.java` 的签名只有 `(orderId, userId, channel, tradeNo, amount)`；源码注释里的「商户 / 币种 / 支付终态」是**接入渠道时需实现的未来契约**，不是现有能力。把它写成「已核验商户和币种」就是典型的「把设计写成实现」。
 
-**`service/base/RidePricing.java`（服务端重算价格）**：起步 `8.00` 含 `2.0km`，超出 `2.20/km`，`>20km` 部分再加 `1.10/km`；时长按 `CEILING` 取整 × `0.50/min`；加急固定 `+5.00` 且**在同一类内**给 `finalMultiplier` 再 `+0.20`（工具层无独立加价），车型倍率 `1.0/1.6/2.5`；`estPrice = (subTotal + 5.00) × finalMultiplier`，`BigDecimal` + `setScale(2, HALF_UP)`。调用点：`RideOrderServiceImpl.calculatePrice`（估价/创建/结束行程复用）、`OrderTool.getEstPrice`、`OrderSearchTool.calcEstPriceByOrderToolRule`。**客户端与模型传的价格都只是展示值**。
+**`service/base/RidePricing.java`（服务端重算价格）**：起步 `8.00` 含 `2.0km`，超出 `2.20/km`，`>20km` 部分再加 `1.10/km`；时长按 `CEILING` 取整 × `0.50/min`；加急固定 `+5.00` 且**在同一类内**给 `finalMultiplier` 再 `+0.20`（工具层无独立加价），车型倍率 `1.0/1.6/2.5`；`estPrice = (subTotal + (加急 ? 5.00 : 0)) × (车型倍率 + (加急 ? 0.20 : 0))`，`BigDecimal` + `setScale(2, HALF_UP)`。调用点：`RideOrderServiceImpl.calculatePrice`（估价/创建/结束行程复用）、`OrderTool.getEstPrice`、`OrderSearchTool.calcEstPriceByOrderToolRule`。**客户端与模型传的价格都只是展示值**。
 
 **`exception/GlobalExceptionHandler.java`**：`UnauthorizedException` → 401、`ForbiddenException` → 403、`BusinessException.code` 在 400–599 直接透传（越界钳制为 400）、参数类异常 → 400、`DuplicateKeyException` → 409、其它 → 500。`ChatInfoService.assertOwned` 三分支：会话不存在 `BusinessException(404)` → 404；**不属于当前用户 `ForbiddenException` → 403**；已停用 `BusinessException(410)` → 410。
 
@@ -105,7 +105,7 @@ PaymentVerifier unavailablePaymentVerifier() {
 - **反向索引 TTL ×2**：`auth:user_tokens:{userId}` 比单个 token 活得更久，保证遍历踢下线时不会先于 token 过期；这是「Set 索引 + 多个 String」结构的常见陷阱。
 - **两套限流并存**：按 `userId` 30/60（对话，前置在 `ChatServiceImpl.canStartChat()`）与按来源摘要 120/60（入口层），维度不同、共用 `SLIDING_WINDOW_RATE_LIMIT` Lua。**故障行为相反**：`ChatRateLimiter` 对 Redis 异常 `try/catch` 后放行（fail-open）；`RequestRateLimitInterceptor` **无 try/catch**，Redis 异常会继续抛出并由 `GlobalExceptionHandler` 兜底为 500，只有「配额耗尽」才主动抛 `BusinessException(429)`。
 - **生成列唯一索引**：`sql/init.sql` 用生成列 + `uk_active_username_role` 保证「同角色、未删除账号」的用户名/邮箱唯一；逻辑删除后名称可复用。`sql/migrations/20261113_security_consistency.sql` 是旧库升级路径，迁移前需人工确认历史重复数据，不自动删账号。
-- **雪花 ID 与节点租约**：`config/IdGeneratorConfig` 用 Redisson `id:node:{dc}:{worker}` 的**永久租约**（`leaseTime = -1` + 看门狗）；重复节点配置启动即抛异常，`SnowflakeIdWorker.nextId()` 发现租约丢失就拒绝发号，避免多实例 workerId 相同产生重复 ID。`config/Config.jacksonCustomizer()` 把 `BigDecimal` 与超过 `2^53-1` 的 `Long` 序列化成字符串，防止雪花 ID 在前端丢精度。
+- **雪花 ID 与节点租约**：`config/IdGeneratorConfig` 用 Redisson `id:node:{dc}:{worker}` 的**看门狗续期租约**（`leaseTime = -1` + 看门狗）；重复节点配置启动即抛异常，`SnowflakeIdWorker.nextId()` 发现租约丢失就拒绝发号，避免多实例 workerId 相同产生重复 ID。`config/Config.jacksonCustomizer()` 把 `BigDecimal` 与超过 `2^53-1` 的 `Long` 序列化成字符串，防止雪花 ID 在前端丢精度。
 
 ---
 
@@ -130,7 +130,7 @@ PaymentVerifier unavailablePaymentVerifier() {
 |---|---|---|---|
 | 改密后旧令牌 | 旧 `X-Auth-Token` | `credentialStamp` 与 DB 新密码摘要不符 | `getToken` 返回 null → 401 |
 | 全量撤销 | `deleteAllTokensByUserId` | `INCR` 会话版本 + 批量 `DEL` + `SREM` | 所有旧令牌 401；事务未提交时不执行 |
-| 重复节点配置 | 两个实例同 `dc:worker` | 抢永久租约失败 | 启动即抛 `IllegalStateException` |
+| 重复节点配置 | 两个实例同 `dc:worker` | 抢看门狗续期租约失败 | 启动即抛 `IllegalStateException` |
 | 伪造价格下单 | 请求体带 `estPrice=1` | 服务端 `RidePricing.calculate` 重算 | 价格以服务端为准 |
 | 支付请求 | `payOrder` | 参数非空 400 → `withOrderLock` → **非本人** 403 → 状态非 `FINISHED_WAIT_PAY` 409 → `paymentVerifier == null` 503「支付核验尚未配置」/ 默认 Bean 503 | `503 支付渠道尚未接入` |
 | 跨用户访问会话 | 别人的 `chatId` | `assertOwned` 抛 `ForbiddenException` | **HTTP 403**（会话不存在 404、停用 410） |
@@ -146,6 +146,6 @@ PaymentVerifier unavailablePaymentVerifier() {
 4. **支付为什么不能先放行再补核验？** 订单状态会变成已支付，资金与业务状态不一致；默认拒绝是唯一安全的未接入态。
 5. **为什么 `BusinessException.code` 要钳制 400–599？** 防止业务异常把非法状态码传给 HTTP 层；超出范围统一归一。
 6. **`chatId` 必须来自 `/newuuid` 吗？** 不必。`ChatRequestRunner` 只做 `UUID.fromString` 格式校验，会话须属于当前用户即可（[`src/main/resources/api/chat-security.md`](../../../src/main/resources/api/chat-security.md) 已回写）。
-7. **还能怎么加强？** CORS 白名单外置、锁与令牌的可观测性、支付渠道适配器、RAG 线程池参数外置 —— 都是**可选优化**。**但「限流阈值配置化」不是未实现**：`ChatGuardProperties`（prefix `chat.guard`）已在 `application.yaml:76-81` 外置 `rate-limit-max=30`、`rate-limit-window-seconds=60`、`classify-cache-ttl-seconds=21600`、`fingerprint-length=32`，`ChatRateLimiter` 与 `ClassificationCache` 均注入该 Bean；仍硬编码的是入口层 120 次/60 秒（`RequestRateLimitInterceptor.java:22`）、3 分钟超时与线程池参数。
+7. **还能怎么加强？** 在配置文件中显式列出已有 `web.cors.allowed-origins`、锁与令牌的可观测性、支付渠道适配器、RAG 线程池参数外置 —— 都是**可选优化**。**但「限流阈值配置化」不是未实现**：`ChatGuardProperties`（prefix `chat.guard`）已在 `application.yaml:76-81` 外置 `rate-limit-max=30`、`rate-limit-window-seconds=60`、`classify-cache-ttl-seconds=21600`、`fingerprint-length=32`，`ChatRateLimiter` 与 `ClassificationCache` 均注入该 Bean；仍硬编码的是入口层 120 次/60 秒（`RequestRateLimitInterceptor.java:22`）、3 分钟超时与线程池参数。
 
 > 关联：[01 编排与 SSE](01-orchestration-and-sse.md)、[02 RAG 一致性与预算](02-rag-consistency-and-budget.md)、[`../redis/01-shared-session-token.md`](../redis/01-shared-session-token.md)、[`../redis/22-sliding-window-rate-limit.md`](../redis/22-sliding-window-rate-limit.md)。

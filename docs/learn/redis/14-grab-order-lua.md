@@ -1,80 +1,25 @@
-# 司机抢单：Lua 原子预检（秒杀模型）
+# 司机抢单：Lua 原子预检
 
-> **Redis 考点**：用 Lua 脚本把「多次读-判-写」合并成一次原子执行，实现秒杀式的资格校验 + 扣减。
-> **来源**：`docs/01-redis-application-points.md` P0-1
-> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/OrderGrabService.java`
-> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
-
----
-
-## 【当前实现对照】
-
-> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文与七章 `redis-cli` 命令写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
-
-| # | 正文中的旧说法 | 当前代码事实（`service/base/OrderGrabService.java`） |
-|---|---|---|
-| 1 | 4.3「`rollbackGrab` 读-写非原子，属已知残留窗口」、4.4「`releaseDriver(String driverId)` 写 `__IDLE__`」、六章「`warmUpDriverActive` 窗口 / 状态缓存 2 小时 / 占位 6 小时」 | 当前统一 `CACHE_TTL=5min`、只有 `__IDLE__`（`:29-30`）；回滚经 `afterCompletion → rollbackGrab`（`:87-94,112-119`）并用 `RELEASE_LOCK_IF_MATCH` 原子 CAS（`:115`）；`releaseDriver` 为**双参** `(driverId, orderId)`（`:122-126`）；预热已并入 `tryGrab` 事务 |
-| 2 | 七章 `SET order:status:{orderId} 10` 未带 `EX` | 应为 `SET order:status:123 10 EX 300`；`driver:active:{driverId}` 期望 `__IDLE__` 且 TTL ≈300 |
-| 3 | 延伸阅读「项目全部 **7 个** Lua 脚本」 | 当前 **22 个主脚本 + 11 个内联 = 33 段**，见 [10 篇 3.1](10-lua-scripts-overview.md) |
-
-### 【补充】当前抢单链路（本篇二～八章未覆盖）
-
-`@Transactional(MANDATORY)` 要求调用方已有事务；**两道行锁**串行化同一司机与同一订单：司机账号 `SELECT ... FOR UPDATE`（`:45-50`）、在途订单 `LIMIT 1 FOR UPDATE`（`:56-62`）。随后按 DB 权威值回填 `driver:active` 与 `order:status`（`:63-75`），再执行 `GRAB_ORDER_ATOMIC`（`RedisScripts.java:238-247`）：`statusKey != '10'` → `-1`；`driverActiveKey != '__IDLE__'` → `-2`；否则 `SET driverActiveKey = orderId EX ARGV[4]` → `1`。
-
-`GrabResult`（`:36-38`）有**四态**：`SUCCESS`（1）、`DRIVER_BUSY`（-2）、`ORDER_NOT_GRABBABLE`（其它返回值）、`ORDER_NOT_FOUND`（回表查无单，`:71-73`，**不执行 Lua**）。提交后由 `afterCommit` 用 `SYNC_ORDER_STATUS` 单调推进状态（`:101-105`；`RedisScripts.java:250-257`，数值回退时先删缓存）；事务回滚由 `afterCompletion` 触发 `rollbackGrab`。真正的 DB 条件更新（`orderStatus=10 && driverId is null → 20`）在 `RideOrderServiceImpl.java:275-284`，**不在本类**。
-
-这套设计的边界：Redis 占位只是**预检与快速失败**，正确性最终由 DB 行锁 + 条件更新保证；5 分钟 TTL 只用于「释放路径因进程崩溃未执行」时防止司机被永久锁为忙。
-
-> 秒杀模型「判断与占位一步完成」、返回码设计、DB 条件更新兜底的推导**全部保留**；以下实现细节已重写。
-
-| 项 | 当前实现 |
-|---|---|
-| TTL | `OrderGrabService.CACHE_TTL` 统一 **5 分钟（300s）**；`__MISSING__`、2h / 6h 分档已删除，`__IDLE__` 保留 |
-| 事务与预热 | 预热合并进 `tryGrab`，标注 `@Transactional(propagation = MANDATORY)`；事务内两处 `FOR UPDATE`（**司机账号行锁**、**在途订单行锁**）→ 写 5 分钟状态 → `GRAB_ORDER_ATOMIC` Lua 预检占位 → DB 条件更新裁决。旧 `warmUpDriverActive` 独立方法已删除 |
-| 回滚 | `releaseDriver(driverId, orderId)` 签名含 `orderId`；回滚经 `afterCompletion` 走 `RELEASE_LOCK_IF_MATCH` 校验令牌，不再「读写非原子」✅ 已修复 |
-| 状态同步 | 新增 `SYNC_ORDER_STATUS` Lua：**单调推进**，只允许新状态 ≥ 当前状态（相等刷新 TTL）；回池到 `CREATED` 这类数值回退必须先由 `refreshOrderStatus` 删缓存 key，否则脚本拒绝覆盖 |
-| 统一订单锁 | 7 个状态变更（接单 / 到达 / 开始 / 结束 / 支付 / 取消 / 超时）共用 `withOrderLock`（Redisson 看门狗），锁竞争 409 时**不触碰** Mapper / 延迟队列 / 缓存 |
-
-**验证修订**：`SET order:status:123 10 EX 300`（不是 7200/21600）；`OrderGrabIntegrationTest` 覆盖两处行锁与回滚，`OrderLockRegressionTest` 覆盖锁竞争不触碰业务。详见 [`13-distributed-lock.md`](13-distributed-lock.md)、[`10-lua-scripts-overview.md`](10-lua-scripts-overview.md)。
+> **Redis 考点**：秒杀模型——「判断可抢」与「占住司机」必须在同一次执行内完成，否则两个并发请求可以同时通过判断；正确性由数据库行锁与条件更新最终裁决。
+> **来源**：`docs/01-redis-application-points.md` §2.5（订单与司机）
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/OrderGrabService.java`、`src/main/java/com/fancy/rideagenthub/service/impl/RideOrderServiceImpl.java`（`driverAcceptOrder`）
 
 ---
 
 ## 一、业务场景
 
-司机点击「接单」，系统必须同时满足两个条件才允许：
+司机抢单与电商秒杀是同构问题：
 
-1. **订单可抢** —— 订单处于「待接单」状态；
-2. **司机空闲** —— 该司机没有其他进行中的订单（业务上的「一人一单」）。
+| 秒杀 | 抢单 |
+|---|---|
+| 优惠券库存（=1） | 待接单订单（`order_status=CREATED` 且 `driver_id IS NULL`） |
+| 抢购用户 | 接单司机 |
+| 一人一单校验 | 一个司机同时只能有一个进行中订单 |
+| Lua 原子扣库存 | Lua 原子「订单可抢 + 司机空闲」判断与占位 |
 
-改造前这段逻辑完全依赖 DB（`RideOrderServiceImpl.driverAcceptOrder`）：
+两个约束**必须在同一临界区**：订单唯一（多人抢一单）与司机唯一（一人抢多单）。分开校验的话，同一司机并发请求两个订单可能双双通过「司机空闲」的判断。
 
-```java
-// ① 每个司机抢单都要 selectCount 一次「我有没有未结束订单」
-Long activeCount = rideOrderMapper.selectCount(new LambdaQueryWrapper<RideOrder>()
-        .eq(RideOrder::getDriverId, driverIdLong)
-        .notIn(RideOrder::getOrderStatus, List.of(...)));
-if (activeCount != null && activeCount > 0) {
-    throw new BusinessException(409, "司机已有未结束订单，无法接单");
-}
-
-// ② 再用乐观锁更新订单
-int updated = rideOrderMapper.update(null, new LambdaUpdateWrapper<RideOrder>()
-        .eq(RideOrder::getOrderId, orderId)
-        .eq(RideOrder::getOrderStatus, RideOrderStatus.CREATED.getCode())
-        .isNull(RideOrder::getDriverId)
-        .set(RideOrder::getDriverId, driverIdLong)
-        ...);
-```
-
-三个问题：
-
-| # | 问题 | 后果 |
-|---|---|---|
-| 1 | `activeCount` 是**热点行查询** | 抢单高峰时所有司机的请求压在同一索引上 |
-| 2 | ① 与 ② 是**两次独立 DB 往返** | 两次之间存在窗口，同一司机的两个并发请求可能双双通过预检 |
-| 3 | 一人一单校验与订单可抢校验**不在同一临界区** | 同一司机理论上可以同时接下一个以上的订单 |
-
-第 2、3 条是**正确性**问题，第 1 条是**性能**问题。Redis 在这里同时解决两者。
+Redis 只承担**快速预检与占位**，正确性由数据库兜底——即使 Redis 缓存过期或丢失（`driver:active` / `order:status` 是 5 分钟 TTL 的缓存语义），DB 的行锁与条件更新仍然保证约束成立。
 
 ---
 
@@ -82,128 +27,91 @@ int updated = rideOrderMapper.update(null, new LambdaUpdateWrapper<RideOrder>()
 
 | Key | 结构 | TTL | 语义 |
 |---|---|---|---|
-| `order:status:{orderId}` | String | 2 小时（哨兵 60 秒） | 订单当前状态码，`__MISSING__` 表示订单不存在 |
-| `driver:active:{driverId}` | String | 6 小时 | 司机当前进行中的 orderId，`__IDLE__` 表示空闲 |
+| `driver:active:{driverId}` | String | 5 分钟（`CACHE_TTL`） | `__IDLE__` = 空闲；订单号 = 被该订单占用（占位） |
+| `order:status:{orderId}` | String | 5 分钟 | 订单状态码缓存 |
 
-TTL 常量定义在 `OrderGrabService.java:63`（`ORDER_STATUS_TTL_SECONDS`）、`:71`（`MISSING_SENTINEL_TTL_SECONDS`）、`:80`（`DRIVER_ACTIVE_TTL_SECONDS`）。
-
-**两个哨兵值是本方案的关键设计**（`:48`、`:55`）：
-
-```java
-static final String IDLE_SENTINEL = "__IDLE__";       // 司机空闲
-static final String MISSING_SENTINEL = "__MISSING__"; // 订单不存在
-```
-
-它们让「key 不存在」只剩下**一种**含义 —— *本进程此前没关心过它*，需要回源 DB。否则无法区分：
-
-- 「司机确实空闲」 vs 「key 被淘汰 / Redis 重启导致状态丢失」
-
-后者会让一个正在跑单的司机被误判为空闲。这沿用了 `CityCodeUtil` 中 `__NULL__` 空值哨兵的思路（见 [`06-null-sentinel-and-prewarm.md`](06-null-sentinel-and-prewarm.md)）。
+占位值是**订单号**：释放时 `RELEASE_LOCK_IF_MATCH` 校验「值等于本订单」才删——司机随后接到的新订单占位不会被旧订单的回滚误删。
 
 ---
 
 ## 三、代码落点
 
-| 位置 | 方法 | 职责 |
-|---|---|---|
-| `OrderGrabService.java:115-160` | `tryGrab` | 抢单原子预检主流程 |
-| `OrderGrabService.java:175-181` | `rollbackGrab` | 预检通过但落库失败时，回滚司机占位 |
-| `OrderGrabService.java:191-200` | `releaseDriver` | 行程结束 / 订单取消时释放司机 |
-| `OrderGrabService.java:211-220` | `syncOrderStatus` | 订单每次流转时写透状态缓存 |
-| `OrderGrabService.java:230-244` | `refreshOrderStatus` | 预检与 DB 不一致时，用 DB 权威值覆盖缓存 |
-| `OrderGrabService.java:252-275` | `warmUpDriverActive` | 司机占位缺失时回源 DB |
-| `RedisScripts.java:144-155` | `GRAB_ORDER_ATOMIC` | Lua 脚本本体 |
-| `RideOrderServiceImpl.java:327-368` | `driverAcceptOrder` | 调用方：预检 → 乐观锁落库 → 回滚/同步 |
+| 位置 | 职责 |
+|---|---|
+| `OrderGrabService.tryGrab` | `@Transactional(MANDATORY)`：司机账号行锁 → 在途订单行锁 + **顺带修复占位缓存** → 订单状态缓存惰性预热 → `GRAB_ORDER_ATOMIC` 抢占 → 注册回滚回调 |
+| `OrderGrabService.syncOrderStatus` | 提交后 `SYNC_ORDER_STATUS` 单调推进状态缓存 |
+| `OrderGrabService.refreshOrderStatus` | 提交后删除状态缓存（下次重建） |
+| `OrderGrabService.rollbackGrab` / `releaseDriver` | `RELEASE_LOCK_IF_MATCH` 校验令牌后释放占位 |
+| `RideOrderServiceImpl.driverAcceptOrder` | `withOrderLock`（订单锁）内调 `tryGrab` → DB 条件更新 → 成功后同步状态 / 失效 GEO 池 / 刷新司机位置 / 改期延迟队列 |
+| `RedisScripts.GRAB_ORDER_ATOMIC` | 原子预检 + 占位 |
+| `RedisScripts.SYNC_ORDER_STATUS` | 状态单调推进 |
 
 ---
 
 ## 四、实现拆解
 
-### 4.1 Lua 脚本：判断与占位合并成一步
-
-`RedisScripts.java:144-155`：
+### 4.1 `GRAB_ORDER_ATOMIC`：判断与占位一步完成
 
 ```lua
-local status = redis.call('GET', KEYS[1])
-if status == false or status ~= ARGV[1] then
-    return -1                                  -- 订单不可抢
-end
-local active = redis.call('GET', KEYS[2])
-if active == false or active ~= ARGV[2] then
-    return -2                                  -- 司机已是忙 / 状态未预热
-end
-redis.call('SET', KEYS[2], ARGV[3], 'EX', ARGV[4])   -- 占住司机位
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end    -- 订单状态 ≠ CREATED
+if redis.call('GET', KEYS[2]) ~= ARGV[2] then return -2 end    -- 司机占位 ≠ __IDLE__
+redis.call('SET', KEYS[2], ARGV[3], 'EX', ARGV[4])             -- 占位：写入订单号，5 分钟
 return 1
 ```
 
-`KEYS[1] = order:status:{orderId}`、`KEYS[2] = driver:active:{driverId}`、`ARGV[2] = "__IDLE__"`、`ARGV[3] = orderId`。
+- 返回 `-1`（订单不可抢）/ `-2`（司机忙）/ `1`（占位成功）——失败原因语义化；
+- 「判断」与「占位」之间**没有间隙**：两个并发请求只有一个能把 `__IDLE__` 换成自己的订单号。
 
-两点值得注意：
+### 4.2 事务内的两道 DB 兜底：`tryGrab` 为什么标 `MANDATORY`
 
-1. **`active ~= ARGV[2]` 而非 `active == false`** —— 只有「明确等于空闲哨兵」才放行。这样 key 缺失（状态未知）会走 `-2` 拒绝，而不是被当成空闲放过去。
-2. **判断通过后立刻 `SET` 占位** —— 「检查空闲」与「占住司机」必须是同一步。否则两个并发请求仍可同时通过检查、再先后占位，照样一人两单。
+`tryGrab` 必须在调用方的事务内执行（无事务直接抛异常），事务内做两件事：
 
-### 4.2 调用方：三步走，Redis 只是预检
+1. **司机账号行锁**：`userAuthMapper.selectOne(... FOR UPDATE)`——同一司机的所有接单事务在账号行上串行化。这是**跨订单**的一人一单约束（订单锁只锁单笔订单，见 [13 篇](13-distributed-lock.md) 4.5）；
+2. **在途订单行锁 + 缓存修复**：查司机当前在途订单（`FOR UPDATE`），把 `driver:active` **修复**为真实状态（`__IDLE__` 或在途订单号）——缓存过期或丢失时，行锁查询顺带重建（「事务内预热」，见 [06 篇](06-null-sentinel-and-prewarm.md) 4.2）。
 
-`RideOrderServiceImpl.java:327-368`：
+**占位是 Redis 的，约束是 DB 的**：`tryGrab` 先查询并锁定司机账号及在途订单，再执行 Redis 预检；不能描述成「无效请求都在访问 DB 前被挡住」。最终是否接单成功由订单条件更新裁决。
 
-```java
-return withOrderLock(orderId, () -> {
-    // 阶段一：Redis 原子预检
-    OrderGrabService.GrabResult grabResult = orderGrabService.tryGrab(orderId, driverId);
-    if (grabResult != OrderGrabService.GrabResult.SUCCESS) {
-        throw new BusinessException(409, grabFailureMessage(grabResult));
-    }
+### 4.3 DB 条件更新：最终裁决
 
-    // 阶段二：DB 乐观锁落库 —— 预检只是加速，DB 才是最终裁决者
-    int updated = rideOrderMapper.update(null, new LambdaUpdateWrapper<RideOrder>()
-            .eq(RideOrder::getOrderStatus, RideOrderStatus.CREATED.getCode())
-            .isNull(RideOrder::getDriverId)
-            ...);
-
-    if (updated <= 0) {
-        // 预检通过但落库失败：缓存态与 DB 不一致，把占位还回去
-        orderGrabService.rollbackGrab(driverId, orderId);
-        orderGrabService.refreshOrderStatus(orderId);
-        return false;
-    }
-    orderGrabService.syncOrderStatus(orderId, RideOrderStatus.DRIVER_ACCEPTED.getCode());
-    ...
-});
-```
-
-### 4.3 回滚为什么必须带上 `expectedOrderId`
-
-`OrderGrabService.java:175-181`：
+`driverAcceptOrder` 在 `tryGrab` 成功后执行条件更新：
 
 ```java
-public void rollbackGrab(String driverId, String expectedOrderId) {
-    String key = RedisKeyConstants.driverActiveKey(driverId);
-    String current = redisTemplate.opsForValue().get(key);
-    if (expectedOrderId != null && expectedOrderId.equals(current)) {
-        redisTemplate.opsForValue().set(key, IDLE_SENTINEL, DRIVER_ACTIVE_TTL_SECONDS, TimeUnit.SECONDS);
-    }
-}
+rideOrderMapper.update(null, new LambdaUpdateWrapper<RideOrder>()
+        .eq(RideOrder::getOrderId, orderId)
+        .eq(RideOrder::getOrderStatus, RideOrderStatus.CREATED.getCode())   // 仍是待接单
+        .isNull(RideOrder::getDriverId)                                      // 仍无司机
+        .set(RideOrder::getDriverId, driverIdLong)
+        .set(RideOrder::getOrderStatus, RideOrderStatus.DRIVER_ACCEPTED.getCode())
+        ...);
 ```
 
-先读回当前值、确认「确实是我这次抢单写入的占位」才释放。**如果没有这个二次校验**，会出现：T1 抢 A 单失败正在回滚，T2 已经让同一司机抢到 B 单 —— T1 的回滚会把 B 单的占位抹掉，司机又被判为空闲。
+`updated == 0`（预检通过但 DB 已被抢走 / 取消）时：`rollbackGrab` 归还占位 + `refreshOrderStatus` 删缓存，返回失败——**预检只是加速，DB 才是最终裁决者**。
 
-注意这里还有一个非原子窗口（读 `current` → 写 `IDLE_SENTINEL` 两条命令），理论上极端并发下仍可能误释放。要完全消除需再写一个 Lua 做 CAS。当前属于已知的、代价极低的残留窗口。
+### 4.4 回滚与释放：只还本订单的占位
 
-### 4.4 释放司机：写哨兵而不是 `DEL`
+`tryGrab` 抢占成功后注册 `afterCompletion` 回调：事务**回滚**时 `rollbackGrab`——`RELEASE_LOCK_IF_MATCH` 校验占位值等于**本订单**才删。`releaseDriver`（订单正常终态时调用）同样语义：**只释放该订单持有的占位，保护司机随后接到的新订单**。
 
-`OrderGrabService.java:191-200`：
+### 4.5 `SYNC_ORDER_STATUS`：状态单调推进
 
-```java
-public void releaseDriver(String driverId) {
-    ...
-    redisTemplate.opsForValue().set(
-            RedisKeyConstants.driverActiveKey(driverId),
-            IDLE_SENTINEL, DRIVER_ACTIVE_TTL_SECONDS, TimeUnit.SECONDS);
-}
+```lua
+local current = redis.call('GET', KEYS[1])
+if current == false or tonumber(current) == nil or tonumber(current) <= tonumber(ARGV[1]) then
+    redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+    return 1
+end
+return 0
 ```
 
-用 `SET __IDLE__` 而非 `DEL`：删除会让 key 退回「未知」状态，下一次抢单需要多一次 DB 回源才能确认司机空闲。写哨兵则保持「已知的空」，正常路径零 DB 查询。
+在缓存 key 存续期间，`SYNC_ORDER_STATUS` 只允许状态码不降低：一个迟到提交的旧状态回调（例如网络延迟的「已接单」同步）不能把「行程中」的缓存改回「已接单」。注意 `current == false or tonumber(current) == nil` 的双重判断——**不存在的 key 在 Lua 里返回 false 而非 nil**（[10 篇](10-lua-scripts-overview.md) 的陷阱）。
+
+### 4.6 接单成功后的联动
+
+`driverAcceptOrder` 成功路径一次串起四件事：
+
+- `syncOrderStatus(DRIVER_ACCEPTED)`——提交后单调推进缓存；
+- `orderGeoPool.remove(orderId)`——订单离开待接单，提交后失效附近订单索引；
+- `driverGeoIndex.refreshIfExist(driverId, lng, lat)`——用请求里携带的坐标**刷新仍在线的司机位置**（`refreshIfExist` 而非 `goOnline`：未上线的司机不该因为接单就凭空出现在在线池）；
+- `orderDelayQueue.schedule(到达超时)`——覆盖「无人接单」待办，改为盯「司机是否按时到达」。
 
 ---
 
@@ -211,47 +119,48 @@ public void releaseDriver(String driverId) {
 
 | 选择 | 备选 | 为什么选这个 |
 |---|---|---|
-| Redis 只做**预检**，DB 乐观锁仍是唯一裁决 | 让 Redis 直接决定抢单结果 | 缓存「绝不成为正确性依赖」（`OrderGrabService` 类注释）。Redis 丢失/不一致时，结果是「退化成原来的 DB 路径」，而不是「抢单结果错了」 |
-| `SET ... EX` 写在 Lua 内 | 脚本外再 `EXPIRE` | 与 `ChatManager` 的 `HSET`+`EXPIRE` 是同一类问题：两步之间崩溃会留下永不过期的占位 key（见 [`12-chat-lock-atomic.md`](12-chat-lock-atomic.md)） |
-| 占位 key 带 6 小时 TTL | 显式释放就够，不要 TTL | 释放路径若因异常未执行（进程崩溃、DB 异常），司机将被永久锁在「忙」。TTL 是兜底，不是主路径 |
-| `order:status` 用 String 而非 Hash | 一个 Hash 存所有订单状态 | 单订单粒度可独立设 TTL、独立淘汰，避免大 key |
-
-**为什么不用 BitMap 或 Set 表示「司机忙」**：需要存的是「占住该司机的是哪个订单」，回滚时要校验 orderId，Set/BitMap 存不下这个信息。
+| Lua 预检 + DB 兜底 | 纯 DB（行锁 + 条件更新） | 当前预检前已经查询 DB 并加司机行锁；Lua 提供状态与占位的原子检查，不能宣称使失败请求免于访问 DB |
+| 占位值 = 订单号 | `__LOCKED__` 固定标记 | 释放可校验「是不是本订单占的位」；固定标记无法区分、会误删新占位 |
+| 同步落库（事务内） | Redis Stream 异步落库（削峰） | 异步化让「接口成功」与「订单可见」出现窗口，需补消息表 / 补偿 / 幂等消费；行锁 + 条件更新已把热点请求串行化，削峰收益抵不过正确性成本 |
+| 缓存 5 分钟统一 TTL | 更长 TTL | 占位与状态都是「短生命周期」语义，长 TTL 会放大「缓存与 DB 不一致」的窗口；5 分钟内 DB 兜底接管一切 |
+| `refreshIfExist` 刷新位置 | `goOnline` | 接单不应使未上线司机凭空上线 |
 
 ---
 
 ## 六、边界与已知问题
 
-1. **`rollbackGrab` 的读-写不是原子的**（`OrderGrabService.java:177-180`），极端并发下可能误释放他人的占位，见 4.3。
-2. **`warmUpDriverActive` 与 Lua 之间存在窗口**（`:137-139`）—— key 缺失时才回源，回源结果写入后 Lua 才执行。若两次抢单同时命中「key 缺失」，会各自回源一次（多一次 DB 查询，不影响正确性）。
-3. **订单状态缓存的 TTL 是 2 小时**（`:63`），正常路径靠每次流转 `syncOrderStatus` 写透，不依赖过期。
-4. **`driver:active` 的判定口径**（`:280-285`）与原先的 `selectCount` 保持一致：待支付/已支付/已取消三种终态不再占用司机。
-
-> 曾经的 `driverAcceptOrder` 签名里收了 `currentLat` / `currentLng` 却从不使用 —— 这对参数现在在 P0-2 的 GEO 改造中派上了用场（`RideOrderServiceImpl.java:361-363`），见 [`15-nearby-order-geo.md`](15-nearby-order-geo.md)。
+1. **Redis 故障时不能抢单**：订单锁与预检都依赖 Redis，当前没有绕过这些步骤的降级分支；不能仅凭实现断言作者的取舍原因，也不能说正常路径不访问 DB。
+2. **占位 5 分钟后自动失效**：极端时序（接单事务卡 5 分钟以上）下占位过期，key 缺失本身不等于 `__IDLE__`，其他接单事务会先加 DB 行锁并依据在途订单修复占位——但 DB 行锁仍然串行化同一司机，不会产生双订单。
+3. **`tryGrab` 必须在事务内**（`MANDATORY`）：无事务调用直接抛异常——行锁与缓存修复需要事务边界。
+4. **`driverAcceptOrder` 的 `currentLat/currentLng`** 只用于刷新在线司机位置，不做「按距离匹配订单」（那是 [15 篇](15-nearby-order-geo.md) 的职责）。
 
 ---
 
 ## 七、如何验证
 
 ```bash
-# 1. 观察抢单预检写入的两个 key
-redis-cli GET order:status:{orderId}      # 期望 "10"（待接单）
-redis-cli GET driver:active:{driverId}    # 期望 "__IDLE__"
+# 1. 司机占位与状态缓存
+redis-cli GET driver:active:<driverId>       # 空闲：__IDLE__；接单后：订单号
+redis-cli TTL driver:active:<driverId>       # 期望 ≤ 300（5 分钟）
+redis-cli GET order:status:<orderId>         # 期望：状态码（数字）
+redis-cli TTL order:status:<orderId>         # 期望 ≤ 300
 
-# 2. 同一司机并发抢两个订单，只有一个应该成功
-#    成功后：driver:active:{driverId} 变为该订单号
+# 2. 状态缓存单调推进：接单前 10（CREATED）→ 接单后 20（DRIVER_ACCEPTED）
+#    手工把缓存改成 40（IN_TRIP）再触发迟到的 20 同步 → 缓存保持 40（单调性）
 
-# 3. 手工制造「预检通过但落库失败」
-redis-cli SET order:status:{orderId} 10        # 让预检认为可抢
-# 同时把 DB 中该单状态改掉 → 乐观锁 updated=0
-# 期望：日志出现回滚，driver:active 恢复为 "__IDLE__"，order:status 被刷新为 DB 真实值
+# 3. 占位释放：订单取消 / 完成后
+redis-cli GET driver:active:<driverId>       # 期望：key 消失或下次接单时被修复为 __IDLE__
+
+# 4. 并发抢单：两个司机同时抢同一单 → 一个成功，另一个 409
+# 5. 同一司机并发抢两单 → 后者被拒（行锁串行 + 占位非 __IDLE__）
 ```
 
 ---
 
 ## 八、延伸阅读
 
-- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— 项目全部 7 个 Lua 脚本的原子性总表
-- [`13-distributed-lock.md`](13-distributed-lock.md) —— 同一路径上并存的 Redisson 订单锁，与本文的 Lua 各管一段
-- [`17-order-timeout-delay-queue.md`](17-order-timeout-delay-queue.md) —— 抢单成功后会改写延迟队列的待办
-- Redis 官方文档：[Scripting with Lua](https://redis.io/docs/manual/programming/lua/)、[EVAL 的原子性保证](https://redis.io/commands/eval/)
+- [`13-distributed-lock.md`](13-distributed-lock.md) —— 订单锁（withOrderLock）与本篇司机行锁的分工
+- [`06-null-sentinel-and-prewarm.md`](06-null-sentinel-and-prewarm.md) —— `__IDLE__` 状态哨兵与事务内预热
+- [`15-nearby-order-geo.md`](15-nearby-order-geo.md) —— 接单成功后的 GEO 池失效
+- [`17-order-timeout-delay-queue.md`](17-order-timeout-delay-queue.md) —— 接单后的延迟队列改期
+- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— `GRAB_ORDER_ATOMIC` / `SYNC_ORDER_STATUS` 速查

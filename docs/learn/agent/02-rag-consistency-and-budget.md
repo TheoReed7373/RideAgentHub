@@ -2,7 +2,7 @@
 
 > **学习目标**：解释「管理员改了知识库，为什么检索结果可能仍旧/查不到」，理解事务内持久任务表、`FOR UPDATE SKIP LOCKED` 领取、双路检索 + RRF、共享 deadline 与权威库核对的完整链路。
 > **代码基准**：`src/main/java/com/fancy/rideagenthub/agentbase/rag/`（只有 `RagService.java`、`QaIndexSynchronizer.java`）、`mapper/QaSyncJobMapper.java`（**在 `mapper/` 包，不在 `service/` 或 `agentbase/rag/`**）、`domain/entity/QaSyncJob.java`、`controller/RagController.java`、`config/AsyncWorkConfig.java`、`src/main/resources/api/rag-consistency.md`。
-> **测试依据**：`RagConsistencyRegressionTest`、`RepairDatabaseIntegrationTest`（静态断言核对，未实机运行外部中间件）。
+> **测试代码参考**：`RagConsistencyRegressionTest`、`RepairDatabaseIntegrationTest`。本篇描述以生产源码为准，测试文件存在不等于本轮已经执行。
 
 ---
 
@@ -24,7 +24,7 @@
 flowchart LR
     ADM[ADMIN 接口<br/>RagController 7 端点] --> RS[RagService 写路径<br/>@Transactional]
     RS --> DB[(MySQL<br/>sys_qa_info / sys_qa_es)]
-    RS --> JOB[(qa_sync_job 持久任务表)]
+    RS --> JOB[(sys_qa_sync_job 持久任务表)]
     JOB --> SYNC[QaIndexSynchronizer<br/>@Scheduled 5s]
     SYNC --> ES[(ES qa_knowledge_base<br/>1024 维 dense_vector + text)]
     Q[用户提问] --> RS2[RagService.searchAnswers<br/>8 秒共享 deadline]
@@ -46,13 +46,13 @@ flowchart LR
 
 ### 3.1 写入路径（事务内只写 DB + 任务）
 
-`RagService.addQA / addQAs / deleteQA / updateAnswer / updateQuestion` 全部 `@Transactional`：改 `sys_qa_info` / `sys_qa_es`，然后 `syncJobs.enqueue(groupId)` 往 `qa_sync_job` 写一行持久任务；**不调用 ES**。`updateQuestion` 额外 `selectOne(...).last("FOR UPDATE")` 锁住问题行，防止并发改写导致向量与文本错配。
+`RagService.addQA / addQAs / deleteQA / updateAnswer / updateQuestion` 全部 `@Transactional`：改 `sys_qa_info` / `sys_qa_es`，然后 `syncJobs.enqueue(groupId)` 往 `sys_qa_sync_job` 写一行持久任务；**不调用 ES**。`updateQuestion` 额外 `selectOne(...).last("FOR UPDATE")` 锁住问题行，防止并发改写导致向量与文本错配。
 
 **为什么把任务表放进同一个 DB 事务**：DB 回滚时任务也回滚，绝不会出现「DB 没改、ES 却重建」；DB 提交后任务一定可见，不需要额外的可靠消息通道。这是「用数据库事务边界换消息可靠性」的经典做法。
 
 ### 3.2 索引重建（领取 → 重嵌 → 提交/延期）
 
-`QaIndexSynchronizer.synchronize()` 用 `@Scheduled(fixedDelayString = "${rag.sync.interval-ms:5000}")` 每 5 秒扫一次，`@Transactional(isolation = READ_COMMITTED)` 内 `jobs.claimBatch()` 通过 `FOR UPDATE SKIP LOCKED LIMIT 5` 领取任务。`SKIP LOCKED` 让多实例并发领取时互不阻塞：被别人锁住的行直接跳过，而不是排队等待。
+`QaIndexSynchronizer.synchronize()` 用 `@Scheduled(fixedDelayString = "${rag.sync.interval-ms:5000}")` 每 5 秒扫一次，`@Transactional(isolation = READ_COMMITTED)` 内 `jobs.claimBatch()` 通过 `LIMIT 5 FOR UPDATE SKIP LOCKED` 领取任务。`SKIP LOCKED` 让多实例并发领取时互不阻塞：被别人锁住的行直接跳过，而不是排队等待。
 
 `synchronizeGroup(groupId)`：
 
@@ -84,11 +84,11 @@ CompletableFuture.allOf(vectorFuture, bm25Future).get(remaining(deadline), TimeU
 
 ### 3.4 `version` 递增与 `SKIP LOCKED` 的并发领取语义（补充）
 
-`QaSyncJobMapper.enqueue()` 用 `INSERT ... ON DUPLICATE KEY UPDATE version = version + 1`（`:9-11`）：同一 `groupId` 被连续改写时**不新增任务行，只把版本号 +1**；`claimBatch()` 用 `LIMIT 5 FOR UPDATE SKIP LOCKED`（`:12-14`）领取并返回当时的 `version`。重建完成时删除任务以该版本号为准，因此「慢的那次重建」即使后完成，也不会把「快的新版本」任务删掉 —— 这是任务表能替代 MQ 而不丢更新的关键。多实例下 `SKIP LOCKED` 让被别人锁住的行直接跳过，互不阻塞；失败任务由 `defer()` 写 `DATE_ADD(NOW(), INTERVAL 30 SECOND)` 的 `next_attempt_at`（`:15-16`），下次扫描只取到期的行，避免坏任务饿死正常任务。
+`QaSyncJobMapper.enqueue()` 对同组 UPSERT 并递增 version，`claimBatch()` 用 `LIMIT 5 FOR UPDATE SKIP LOCKED` 领取任务。当前 `synchronize` 在同一 READ_COMMITTED 事务里持有任务行锁直到 ES 重建完成，成功调用 `deleteById(groupId)`，**没有 version 条件删除**。并发 enqueue 会等待此行锁，待同步事务结束后再插入或更新，防丢更新依靠事务锁，不是版本比较。失败调用 defer，将 next_attempt_at 延后约 30 秒。
 
 ### 3.5 超时路径的完整状态流（补充）
 
-`remaining(deadline)` 在任一阶段超限时抛 `TimeoutException`（`RagService.java:389-393`）；`finally` 对未完成的 `CompletableFuture` 调 `cancel(true)`（`:330-331,385`）。这条路径**不会**返回「部分检索结果」或执行 `authoritative()`，而是让 `searchAnswers` 直接抛异常 —— 因为只融合了一路的结果在 RRF 下没有统计意义，宁可失败也不返回偏斜答案。`cancel(true)` 只能中断线程标志，已提交到 `ragExecutor` 的阻塞 ES / Embedding HTTP 调用没有中断点，**物理上仍在占用线程**；若队列持续被打满，`supplyAsync` 会抛 `RejectedExecutionException`（`AsyncWorkConfig` 未配置拒绝策略，默认 AbortPolicy），这是 8 秒预算之外的第二个容量边界。
+`remaining(deadline)` 在任一阶段超限时抛 `TimeoutException`（`RagService.java:389-393`）；`finally` 对未完成的 `CompletableFuture` 调 `cancel(true)`（`:330-331,385`）。这条路径**不会**返回「部分检索结果」或执行 `authoritative()`，而是让 `searchAnswers` 直接抛异常 —— 因为只融合了一路的结果在 RRF 下没有统计意义，宁可失败也不返回偏斜答案。`CompletableFuture.cancel(true)` 标记 Future 已取消，并不保证中断实际执行线程，已提交到 `ragExecutor` 的阻塞 ES / Embedding HTTP 调用没有中断点，**物理上仍在占用线程**；若队列持续被打满，`supplyAsync` 会抛 `RejectedExecutionException`（`AsyncWorkConfig` 未配置拒绝策略，默认 AbortPolicy），这是 8 秒预算之外的第二个容量边界。
 
 ---
 
@@ -99,7 +99,7 @@ CompletableFuture.allOf(vectorFuture, bm25Future).get(remaining(deadline), TimeU
 | `agentbase/rag/RagService.java` `@Value("${rag.search.timeout-ms:8000}")` | 8 秒预算是**代码默认值**，未在 `application.yaml` 外置 |
 | `RagService.addQA` / `deleteQA` / `updateAnswer` | `@Transactional`，只写 DB + `syncJobs.enqueue(groupId)` |
 | `RagService.updateQuestion` | `FOR UPDATE` 行锁，必须重嵌向量 |
-| `QaSyncJobMapper.claimBatch()` | `FOR UPDATE SKIP LOCKED LIMIT 5` |
+| `QaSyncJobMapper.claimBatch()` | `LIMIT 5 FOR UPDATE SKIP LOCKED` |
 | `QaIndexSynchronizer.synchronize()` | `fixedDelayString` 5s、`jobs.defer()` 失败重试、异常只 warn |
 | `RagService.searchVectorOnly` / `searchBm25Only` | 窗口 100、`source` 精简 |
 | `RagService.authoritative()` | DB 最新答案覆盖、校验问题文本与 groupId |
@@ -116,9 +116,9 @@ CompletableFuture.allOf(vectorFuture, bm25Future).get(remaining(deadline), TimeU
 |---|---|---|---|
 | 事务内持久任务表 | DB 事务边界 = 任务可见性边界 | 不需要 MQ；回滚自动撤销任务 | 靠轮询，默认 5 秒延迟 |
 | `SKIP LOCKED` | 跳过已被锁的行 | 多实例并行领取、不互相阻塞 | 失败任务需 `defer` 才会被再次领取 |
-| 8 秒共享 deadline | `nanoTime` 单点计时，各阶段 `get(remaining)` | 避免「三段各 8 秒」把总耗时放大到 24 秒 | `cancel(true)` 只是逻辑中断，底层 HTTP 客户端可能仍占用线程 |
+| 8 秒共享 deadline | 向量化与双路 Future 的等待共享预算 | 避免每阶段独立等待 8 秒 | RRF 融合与 authoritative 同步数据库核对未受 deadline 控制，非整个接口的硬超时；取消 Future 不保证中断底层调用 |
 | RRF | 倒数排名融合，不依赖两路分数可比 | 无需归一化分数，鲁棒 | `K=60`、窗口 100 是经验值 |
-| 权威库核对 | 以 DB 当前行覆盖 ES 答案 | 索引滞后不产生错误答案 | 每次检索多一次 DB 查询 |
+| 权威库核对 | 以 DB 当前行覆盖 ES 答案 | 索引滞后不产生错误答案 | 对候选问题映射与答案分别批量查询 DB，通常两次 |
 
 **方案对比**：① 同步双写（简单但 ES 故障会拖垮写入、回滚不一致）；② MQ / binlog CDC（解耦更彻底，需额外组件与幂等消费）；③ 定时全量重建（无任务表，但浪费且延迟更高）。当前选 ① 的可靠性 + ③ 的简单性折中，适合管理端低频写入的客服知识库。**纯理论**的「用 ES 作为唯一数据源」在这里不成立：答案正确性由 DB 负责。
 
@@ -128,7 +128,7 @@ CompletableFuture.allOf(vectorFuture, bm25Future).get(remaining(deadline), TimeU
 
 管理员调 `POST /rag/admin/qa/update-answer` 把「退费规则」答案改成 A2：
 
-1. 事务内更新 `sys_qa_info.answer=A2`，`qa_sync_job` 增加该 `groupId`，接口返回 `Result.ok()`；
+1. 事务内更新 `sys_qa_info.answer=A2`，`sys_qa_sync_job` 增加该 `groupId`，接口返回 `Result.ok()`；
 2. 5 秒内若有用户提问，双路检索可能命中旧 ES 文档（答案 A1、旧向量）；
 3. `authoritative()` 反查 DB，校验问题文本一致后用 **A2** 覆盖 → 用户看到新答案，即使索引还没重建；
 4. `QaIndexSynchronizer` 领取任务：`deleteByQuery` 旧文档 → 重嵌 → `refresh` → 删任务；
@@ -141,7 +141,7 @@ CompletableFuture.allOf(vectorFuture, bm25Future).get(remaining(deadline), TimeU
 ## 七、常见问题与面试延伸
 
 1. **「接口成功」能不能直接对前端承诺「立刻可检索」？** 不能。接口只保证 DB 提交 + 任务入队。
-2. **为什么不用 `CompletableFuture` 各给 8 秒？** 共享 deadline 才能保证端到端预算；各段独立计时会累积超时。
+2. **为什么不用 `CompletableFuture` 各给 8 秒？** 共享 deadline 限制向量化与双路查询的等待预算；不覆盖后续融合和 DB 核对；各段独立计时会累积超时。
 3. **`cancel(true)` 能中断 ES / Embedding 的 HTTP 请求吗？** 不能保证，只是不再等待结果；这是**逻辑取消**（`api/rag-consistency.md` 已声明）。
 4. **RRF 的 K 为什么取 60？** 论文经验值，压低头部单路结果的支配力；本项目窗口 100、Top5 按 `groupId` 去重。
 5. **为什么 `answer` 字段 `index(false)`？** 答案不参与检索，只作展示，且最终由 DB 覆盖；省索引空间。

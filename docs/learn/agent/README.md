@@ -1,8 +1,8 @@
 # Agent 学习笔记
 
-本目录用于整理本项目 AI Agent 层（`src/main/java/com/fancy/rideagenthub/agentbase/`、`agents/`）的学习笔记，与 [`../redis/`](../redis/README.md) 平行。原抬头写的 `com/fancy/taxiagent/` 是历史快照，当前包名已改为 `com.fancy.rideagenthub`。
+本目录用于整理本项目 AI Agent 层（`src/main/java/com/fancy/rideagenthub/agentbase/`、`agents/`）的学习笔记，与 [`../redis/`](../redis/README.md) 平行。
 
-> **代码版本**：以下主题按当前工作区（`a8f4e33` 安全与一致性改造之后）的真实代码归类。25 篇 Redis 笔记聚焦数据结构与并发原语，Agent 编排 / RAG / 安全边界这三块知识空白由本目录三篇新笔记补齐。
+> **说明**：25 篇 Redis 笔记聚焦数据结构与并发原语；Agent 编排、RAG 一致性与安全边界由本目录三篇笔记覆盖。
 
 ## 已完成的笔记
 
@@ -21,7 +21,7 @@ Redis 侧的对应笔记见 [`../redis/README.md`](../redis/README.md)（25 篇 
 | 主题 | 代码落点 | 现状 | 对应笔记 |
 |---|---|---|---|
 | 四类 Agent 的职责划分与路由 | `agents/DailyAgent`、`OrderAgent`、`SupportAgent`、`FallbackAgent`；`service/impl/ChatServiceImpl.resolveClassification()`（**内联分类**，无 `Classifier` 类） | 已实现（`CLASSIFIER_*` 提示词 + `ClassificationCache` 缓存） | [01](01-orchestration-and-sse.md)、[redis/21](../redis/21-llm-classification-cache.md) |
-| 工具调用（Function Calling）注册与手动循环 | `agentbase/tool/`；4 个 Agent 均 `internalToolExecutionEnabled(false)`，但**只有 Daily/Order/Support 三个**有 `history.size() - originalHistorySize > 200` 的循环上限；`FallbackAgent` 无工具、无循环、单轮直接流式回复 | 已实现 | [01](01-orchestration-and-sse.md) |
+| 工具调用（Function Calling）注册与手动循环 | `agentbase/tool/`；4 个 Agent 均 `internalToolExecutionEnabled(false)`，但**只有 Daily/Order/Support 三个**有 `history.size() - originalHistorySize > 200` 的新增消息数量阈值；`FallbackAgent` 无工具、无循环、单轮直接流式回复 | 已实现 | [01](01-orchestration-and-sse.md) |
 | 工具事件通知链路 | `agentbase/tool/ToolNotifySupport.java` 的 `Consumer<String>` 回调与异常隔离；`notifyToolListener` 调用点共 **39 处 / 14 个类**，真正注入 `AgentEvent.tool` 回调的只有 **6 处**（Daily/Order/Support 各 2），`agentbase/tool/` 共 16 个类 | 已实现 | [01](01-orchestration-and-sse.md) |
 | 记忆系统的分层存储 | `agentbase/memory/`：**Heap(L1) → Redis(L2) → MySQL(L3)**；工具结果另有 `ToolResponseMemory`（Redis + MySQL 两级） | 已实现；MongoDB 只存订单路线轨迹，ES 只服务 RAG 知识库 | [redis/19](../redis/19-multi-level-cache.md)、[redis/20](../redis/20-tool-response-cache.md) |
 | 消息解析、消息窗口与 Advisor 机制 | `agentbase/memory/MessageParser`（TOOL 消息保存全文）、`MessageWindow.tail`（工具调用批次配对） | 已实现；`MemoryAdvisor` 返回 `null`、`ESMemory` 为空类，**均 0 调用方** | [redis/19](../redis/19-multi-level-cache.md)、[redis/20](../redis/20-tool-response-cache.md) |

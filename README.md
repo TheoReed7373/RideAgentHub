@@ -56,9 +56,9 @@ Agent 这条线将网约车场景拆成了清晰的执行链路：
 
 - **多 Agent 分工明确**：`OrderAgent`、`DailyAgent`、`SupportAgent`、`FallbackAgent`
 - **前置分类路由**：基于用户对话的连续性进行分类，再分发到领域 Agent；分类内联在 `ChatServiceImpl.resolveClassification()`，结果由 `ClassificationCache` 缓存
-- **双模型编排**：当前实现里，路由/分类与领域执行使用不同模型
+- **双模型编排**：路由/分类与领域执行使用不同模型
 - **订单 HITL**：下单前触发 `confirm` 事件（携带 `confirmationId`），用户确认后再 `resume`；报价 15 分钟有效、创建权限一次性消费
-- **工具结果指针化**：长工具结果可只保留 `call_id`，需要时再反查。**当前实现补充**：历史消息中的 TOOL 响应改为保存全文；`ToolResponseMemory` 退化为 Redis + MySQL 两级辅助索引（key `chat:tool:v2:{chatId}:{callId}`，24h），`getCalling(callId, chatId)` 反查链路与提示词契约仍完整保留 —— 「指针化」是按需反查能力，不是把历史替换成指针（[20 篇](docs/learn/redis/20-tool-response-cache.md)）
+- **工具结果按需反查**：历史消息中的 TOOL 响应保存全文，`ToolResponseMemory`（Redis 24h + MySQL 两级，key `chat:tool:v2:{chatId}:{callId}`）提供按 `(callId, chatId)` 的辅助反查，`getCalling(callId)`（chatId 由服务端上下文提供） 与提示词契约配合，需要时才把长工具结果重新注入上下文（[20 篇](docs/learn/redis/20-tool-response-cache.md)）
 - **多层记忆**：Heap(L1) + Redis(L2) + MySQL(L3)，配合 Lease 版本令牌；版本 key `PERSIST` 永久保留
 - **混合检索 RAG**：向量检索 + BM25 + RRF 融合；另有 8 秒共享检索预算与 `authoritative()` 用 DB 最新答案覆盖（[agent/02](docs/learn/agent/02-rag-consistency-and-budget.md)）
 - **SSE 生命周期受控**：`ChatRequestRunner` 的 Redisson 单轮执行锁（看门狗、无显式 TTL）与 `doFinally` 解锁、`AgentStreams.guard` 统一异常出口、`AgentStreams.subscribe` 内**单次模型流 3 分钟**超时（每次工具循环重置，整轮无总时长上限）、`ragExecutor`/`chatExecutor` 双线程池隔离（[agent/01](docs/learn/agent/01-orchestration-and-sse.md)）
@@ -146,7 +146,7 @@ flowchart LR
 - **抢单正确性由数据库约束兜底**：司机账号行锁保障跨订单的一人一单，订单条件更新裁决是否接单成功；Redis Lua 承担原子预检与占位。
 - **故障策略按组件区分**：附近订单与工单池索引不可用时回退数据库查询，对话限流异常时放行；抢单路径仍依赖 Redisson 锁与 Redis 预检，不能承诺 Redis 故障时继续接单。延迟队列的任务丢失由数据库扫描补偿，实际状态流转仍会获取订单锁。
 
-> [`docs/02-cache-consistency-race.md`](docs/02-cache-consistency-race.md) 与 [`docs/learn/redis/`](docs/learn/redis/README.md) 可作学习索引，但部分项目名、行号与实现描述仍沿用旧版本，具体行为以当前源码为准；两者已按 `a8f4e33` 之后的代码回写并保留「改造前对照」。目前，会话锁的 `HSET` + `EXPIRE` 已由 `HASH_SET_WITH_EXPIRE` Lua 原子化，令牌锁释放会校验持有者（`RELEASE_LOCK_IF_MATCH`）；工具确认/取消令牌的**消费**也已由 `CANCEL` / `CONSUME` Lua 原子化，**仍存在**的是 `hasKey` 预检、`finally` 冗余删除以及令牌消费与业务执行分离；布隆过滤器仍原地删除后重建，存在重建期假阴性风险（后果已由 DB 唯一索引兜底）；城市编码墓碑机制已就位并通过回归测试，但**写路径未接线**（部分实现）。详见 [`docs/DOC_CONSISTENCY_DIAGNOSIS.md`](docs/DOC_CONSISTENCY_DIAGNOSIS.md) 第零章与 [`docs-maintenance/文档更新执行计划.md`](docs-maintenance/文档更新执行计划.md)。
+关于缓存一致性的三种解法（延迟双删 / 墓碑 / Lease）各自解决什么、仍留下什么（例如令牌消费已原子化但与业务执行分离、城市编码墓碑写路径未接线、布隆重建期假阴性由唯一索引兜底），统一整理在 [`docs/02-cache-consistency-race.md`](docs/02-cache-consistency-race.md) 与各考点笔记的「边界与已知问题」章节。
 
 ## Agent 与 RAG 链路
 
@@ -198,7 +198,7 @@ sequenceDiagram
 
     User->>API: POST /chat/v2/c/{chatId}
     API->>RR: run(...)：UUID 格式校验 + 单轮执行锁 + assertOwned
-    RR->>CS: canStartChat()：限流 / break 检查 / DANGER 守卫
+    RR->>CS: chat()：isLocked → canStartChat（参数/限流）→ break 检查 → 分类 / DANGER
     CS->>CS: resolveClassification() => ORDER（ClassificationCache）
     CS->>OA: invoke()
 
@@ -237,7 +237,7 @@ sequenceDiagram
 - **算价与路径规划分离**，起终点未变时可以只重新算价；价格由服务端 `RidePricing` 重算，模型不能自报价格
 - **订单创建前必须确认**，由 `confirm` 事件把服务端签发的 `confirmationId` 交给前端原样回传；前端不能从用户文字推断 `confirmed`
 - **恢复不是补一句话继续聊**，而是 `ChatServiceImpl.resume` 先调 `OrderConfirmation.confirm()`（校验 15 分钟有效期、置 `break=resuming`、签发 `ReadyForCreate`），再调 `orderAgent.resume(sink, id, userId, feedback + chatParam.getPrompt())` 接回工具链 —— 固定 feedback 后**原样拼接用户 `prompt`**（空则自动填「确认/拒绝」），注入面靠服务端确认状态机兜底，而非靠「不转发原话」；相同决定可幂等重放，不同决定返回 409
-- **`markOrderReadyForCreate()` 已降级为只读查询**，创建权限由 `createOrder()` 落单前调 `consume()` 一次性消费，模型无法自授权限或重复下单
+- **`markOrderReadyForCreate()` 只做只读查询**，创建权限由 `createOrder()` 落单前调 `consume()` 一次性消费，模型无法自授权限或重复下单
 - **订单创建后先 `lockChat` 再写 `OrderId`**（接收方是 `ChatManager`，不是 `ChatServiceImpl`），引导用户开启新会话处理后续需求
 - 完整调用链与 SSE 生命周期见 [`docs/learn/agent/01-orchestration-and-sse.md`](docs/learn/agent/01-orchestration-and-sse.md)，确认状态机见 [`docs/learn/redis/25-agent-hitl-state.md`](docs/learn/redis/25-agent-hitl-state.md)
 
@@ -288,7 +288,7 @@ RAG 部分不是单一路径检索，而是：
 
 读取顺序是 `Heap -> Redis -> MySQL`，三层都取全量再由 `MessageWindow.tail` 截出完整的工具调用批次；回填时先取版本租约，再用 Lua 校验版本后写回，版本 key 通过 `PERSIST` 永久保留（避免数据过期/清空后旧租约复活）。写入顺序与读取相反：**先落 MySQL，再按租约追加 Redis(L2) 与 Heap(L1)**，并对会话做归属守卫 `isNewOwnedChat` / `assertOwned`（会话不存在 404、**非本人 `ForbiddenException` → 403**、停用会话 410）。详见 [19 篇](docs/learn/redis/19-multi-level-cache.md) 与 [09 篇](docs/learn/redis/09-lease-token.md)。
 
-此外，工具结果还会单独进入 `ToolResponseMemory`（Redis 24h + MySQL 两级），需要时再反查，避免长结果把上下文撑爆；历史消息里的 TOOL 响应本身保存全文，`getCalling(callId, chatId)` 提供按 `(callId, chatId)` 的辅助反查（[20 篇](docs/learn/redis/20-tool-response-cache.md)）。
+此外，工具结果还会单独进入 `ToolResponseMemory`（Redis 24h + MySQL 两级），需要时再反查；历史窗口内仍包含完整工具结果，不能保证长结果不占上下文；历史消息里的 TOOL 响应本身保存全文，`getCalling(callId)`（chatId 由服务端上下文提供） 提供按 `(callId, chatId)` 的辅助反查（[20 篇](docs/learn/redis/20-tool-response-cache.md)）。
 
 ### 数据层职责
 
@@ -348,15 +348,11 @@ src/main/java/com/fancy/rideagenthub
 └─ config/                 # 配置与系统 Prompt
 
 docs/
-├─ 01-redis-application-points.md   # Redis 应用点盘点（规划稿 + P1-3 事后补记）
-├─ 02-cache-consistency-race.md     # 缓存一致性竞态盘点（改造前快照 + 当前状态标注）
-├─ DOC_CONSISTENCY_DIAGNOSIS.md     # 第一轮一致性诊断（已附复核裁决修订）
+├─ 01-redis-application-points.md   # Redis 应用点全景：每个考点对应的业务需求与当前实现
+├─ 02-cache-consistency-race.md     # 缓存一致性三解法的竞态推导与当前落地边界
 └─ learn/
-   ├─ redis/                        # 25 篇考点文档，撰写于 bdc40d7；a8f4e33 后已按当前源码回写
+   ├─ redis/                        # 25 篇考点笔记，一个考点一篇
    └─ agent/                        # 3 篇 Agent 层笔记（编排与 SSE / RAG 一致性 / 安全边界）
-
-docs-maintenance/
-└─ 文档更新执行计划.md              # 复核裁决、修改任务矩阵与验收标准
 ```
 
 ## 快速启动
@@ -379,41 +375,40 @@ docs-maintenance/
 
 执行：
 
-```bash
-src/main/resources/sql/init.sql
-src/main/resources/sql/bus_citycode.sql
+在 MySQL 客户端中执行（以下是 SQL 客户端命令）：
+
+```sql
+SOURCE src/main/resources/sql/init.sql;
+SOURCE src/main/resources/sql/bus_citycode.sql;
 ```
+
+`init.sql` 面向新库，直接 CREATE TABLE，未创建/选择数据库，也不是可重复执行的迁移脚本；执行前需在客户端选中目标数据库（默认配置为 taxi_agent）。旧库升级应先备份并核对历史重复数据，再按 `src/main/resources/sql/migrations/20261113_security_consistency.sql` 的迁移说明执行。
 
 ### 3. 填写配置
 
-修改 [`src/main/resources/application.yaml`](src/main/resources/application.yaml) 中的占位值：
+`application.yaml` 已导入工作目录下的 `.env.properties`。优先在此 Git 忽略文件或环境变量中配置凭据；MySQL 的 `MYSQL_USERNAME` / `MYSQL_PASSWORD` 无默认值，必须提供。其他服务也可在 `.env.properties` 中用完整 Spring 属性名覆盖占位值：
 
-```yaml
-spring:
-  ai:
-    dashscope:
-      api-key: your-dashscope-api-key
-    openai:
-      api-key: your-deepseek-api-key
-  datasource:
-    url: your-database-url
-    username: your-database-username
-    password: your-database-password
-  elasticsearch:
-    uris: your-elasticsearch-url
-  data:
-    redis:
-      host: your-redis-host
-    mongodb:
-      uri: your-mongodb-uri
-
-amap:
-  key: your-amap-api-key
-
-qweather:
-  key: your-qweather-api-key
-  token: your-qweather-api-token
+```properties
+MYSQL_URL=jdbc:mysql://127.0.0.1:3306/taxi_agent?useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+MYSQL_USERNAME=your-database-username
+MYSQL_PASSWORD=your-database-password
+spring.ai.dashscope.api-key=your-dashscope-api-key
+spring.ai.openai.api-key=your-deepseek-api-key
+spring.elasticsearch.uris=http://127.0.0.1:9200
+spring.elasticsearch.username=your-elasticsearch-username
+spring.elasticsearch.password=your-elasticsearch-password
+spring.data.redis.host=127.0.0.1
+spring.data.redis.password=your-redis-password
+spring.data.mongodb.uri=mongodb://127.0.0.1:27017/rideagenthub
+spring.mail.host=your-mail-host
+spring.mail.username=your-mail-username
+spring.mail.password=your-mail-password
+amap.key=your-amap-api-key
+qweather.key=your-qweather-api-key
+qweather.token=your-qweather-api-token
 ```
+
+上述地址为示例，以本机部署为准。多实例须为每个实例配置唯一的 `(id.datacenter-id, id.worker-id)` 组合（均默认 1、范围 0–31）；重复组合会在启动时被节点锁拒绝。现有多 key Lua 未统一使用 Redis Cluster hash tag，不能直接假定支持 Cluster。
 
 ### 4. 启动项目
 
@@ -430,18 +425,17 @@ mvn spring-boot:run
 - `POST /chat/v2/c/{id}`：发起对话，返回 `Flux<AgentEvent>` SSE 流
 - `POST /chat/v2/r/{id}`：恢复订单确认后的会话，请求体 `{"confirmationId":"确认事件返回的编号","confirmed":true,"prompt":"可选补充说明"}`；报价 15 分钟内有效，创建权限一次性消费
 - `GET /chat/v2/restore`：检查是否存在可恢复订单会话，返回 `Result<Boolean>`（仅判定，并续 60 分钟）
-- `POST /chat/v2/restore`：恢复当前用户最近的可恢复订单会话，返回 `Result<RestoreChatVO>`（chatId + 最近 100 条 `simpleParse` 消息），且会 `unlockChat` + `persist`
+- `POST /chat/v2/restore`：恢复当前用户最近的可恢复订单会话，返回 `Result<RestoreChatVO>`（chatId + 以 100 条为目标、保留完整工具批次后经 simpleParse 的消息（可能超过 100 条）），且会 `unlockChat` + `persist`
 - `POST /chat/v2/lock/{id}`：锁定本人会话
 
-注意：GET 与 POST `/restore` 的**返回类型和副作用不同** —— GET 只读判定，POST 才真正恢复并把 `chat:info` 设为永久，这正是 [12 篇](docs/learn/redis/12-chat-lock-atomic.md) 讨论的 TTL 语义矛盾来源。经 `ChatRequestRunner.run` 的 `/c/{id}`、`/r/{id}` 只要求 `chatId` 是合法 UUID 格式且会话属于当前用户，不要求由 `/newuuid` 签发；`/lock/{id}` 只校验归属、不做 UUID 格式校验。另：两个流式端点只返回 `Flux<AgentEvent>`，**源码没有 `produces = text/event-stream` 声明**，项目是 `spring-boot-starter-web` Servlet 栈，靠返回值协商输出。
-
-早期直连 Agent 的测试控制器（`POST /order/chat/{chatId}`、`/order/resume/{chatId}`、`/order/daily/chat/{chatId}`）与 `/test/rag` 已在 `a8f4e33` 删除（见 [`src/main/resources/api/chat-security.md`](src/main/resources/api/chat-security.md)）。本地调试统一使用 `/chat/v2/**`：先 `POST /chat/v2/newuuid` 拿到 chatId，再发起对话。
+注意：GET 与 POST `/restore` 的**返回类型和副作用不同** —— GET 判定并续期，POST 才真正恢复并把 `chat:info` 设为永久，这正是 [12 篇](docs/learn/redis/12-chat-lock-atomic.md) 讨论的 TTL 语义矛盾来源。经 `ChatRequestRunner.run` 的 `/c/{id}`、`/r/{id}` 只要求 `chatId` 是合法 UUID 格式且会话属于当前用户，不要求由 `/newuuid` 签发；`/lock/{id}` 只校验归属、不做 UUID 格式校验。另：两个流式端点只返回 `Flux<AgentEvent>`，**源码没有 `produces = text/event-stream` 声明**，项目是 `spring-boot-starter-web` Servlet 栈，靠返回值协商输出。
 
 示例：
 
 ```bash
 curl -N -X POST http://localhost:8080/chat/v2/c/<chatId> \
   -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
   -H "X-Auth-Token: <token>" \
   -d '{"prompt":"帮我从杭州东站打车去西湖，快车，现在出发"}'
 ```

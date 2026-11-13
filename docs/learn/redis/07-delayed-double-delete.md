@@ -1,282 +1,89 @@
-# 延迟双删：工单统计缓存的读写竞态
+# 延迟双删
 
-> **Redis 考点**：Cache-Aside 下「读线程回填覆盖了写线程的删除」这一经典竞态，以及用**第二次延迟删除**兜住窗口的做法 —— 连同它「sleep 多久靠猜」的固有缺陷。
-> **来源**：`docs/02-cache-consistency-race.md` 2.1；`docs/02` 第四节演练顺序第 1–2 步
-> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/impl/TicketServiceImpl.java`、`src/main/java/com/fancy/rideagenthub/service/base/DelayedCacheEvictor.java`
-> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
-
----
-
-## 【当前实现对照】
-
-> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文与 `文件:行号` 写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。
-
-| # | 正文中的旧说法 | 当前代码事实 |
-|---|---|---|
-| 1 | 一章 `afterTicketMutation` 代码块是**先 `evictTicketStatistics` 再注册索引失效**的旧顺序 | 当前 `TicketServiceImpl.java:1213-1219` 是 `afterTicketMutation()` 同时注册「统计缓存延迟双删」与「工单池索引失效」，第一次删在 `afterCommit`；读代码时以 `evictTicketStatistics():1236-1250` 为准 |
-| 2 | 4.5 四个设计点（「项目当时没有开启 `@EnableScheduling`」、成功 debug 日志、`key.isBlank()` 参数校验、「全类 80 行」） | `DelayedCacheEvictor.java` 现 56 行、字段初始化守护单线程、`@PreDestroy` + `awaitTermination(5s)`，**无参数校验、无成功日志，异常只 `log.warn`**；启动类 `RideAgentHubApplication.java:8` 有 `@EnableScheduling`，与延迟双删并存而非互斥 |
-| 3 | 缺「第二次删除不保证执行」的边界 | 单线程 daemon 调度 + 无重试 + 进程重启丢任务 ⇒ 第二次删除是**尽力而为**；脏窗口最终靠统计缓存 20~30 秒 TTL 收敛，而不是靠删除一定成功。这是延迟双删与 Lease 令牌（09 篇）的能力边界差异 |
-
-### 4.6 事务回调统一模式：五篇对照（补充）
-
-| 篇 | 触发点 | 回调类型 | 回滚行为 | 失败降级 |
-|---|---|---|---|---|
-| [07](07-delayed-double-delete.md) | `TicketServiceImpl.afterTicketMutation` | `afterCommit` 第一次删 + `DelayedCacheEvictor` 500ms 第二次删 | 回滚则不失效 | 只 `log.warn`，靠短 TTL 收敛 |
-| [14](14-grab-order-lua.md) | `OrderGrabService.tryGrab` | `afterCommit` 同步状态、`afterCompletion` 调 `rollbackGrab` | 回滚删占位、恢复 `__IDLE__` | `RELEASE_LOCK_IF_MATCH` 原子 CAS |
-| [15](15-nearby-order-geo.md) | `OrderGeoPool.add` | `afterCommit` 才 `INVALIDATE` 整池 | 回滚不发布 | `isCurrent` 失败整页降级 DB |
-| [17](17-order-timeout-delay-queue.md) | `OrderDelayQueue.schedule/cancel` | `afterCommit` 入队/取消 | 回滚不入队 | 60 秒 DB 补偿扫描兜底 |
-| [23](23-ticket-pool-zset.md) | `TicketPoolIndex` 失效 | `afterCommit` 换版本 + `DEL` | 回滚不失效 | 下一次读经重建锁重建 |
-
-共同点：**Redis 副作用一律不早于 DB 提交**。事务回滚时缓存操作必须能被撤销或本身不发生，否则 DB 与缓存会出现「业务没改、缓存已改」的幽灵状态。
-
-> 500ms 双删的竞态时序推导**完整保留**；以下是当前代码与本页原描述的差异。
-
-| 项 | 当前实现 |
-|---|---|
-| 顺序 | `TicketServiceImpl.afterTicketMutation()` **先注册 `afterCommit(() -> ticketPoolIndex.syncByTicketId(...))`，再 `evictTicketStatistics()`** —— 与原文顺序相反。注释说明「统计缓存删除失败不阻止索引版本推进」，这是刻意的容错顺序 |
-| 第一次删除 | 包在 `try/catch(RuntimeException)` 里，失败只 `log.warn`；无论成败都调度 `DelayedCacheEvictor` 的 500ms 二次删除 |
-| `DelayedCacheEvictor` | 当前 56 行，字段初始化 `executor`（不是构造器建 `scheduler`）；一行类注释、无成功 debug 日志、`catch RuntimeException`、`shutdown` 带 `awaitTermination(5s)`；启动类 `RideAgentHubApplication` 已 `@EnableScheduling`，自建守护调度器与 Spring 调度器并存、互不干扰 |
-| 行号 | `getTicketStatistics` 约 `:1135-1171`、失效与回调约 `:1213-1267`，旧行号作废 |
-
-### 事务回调统一模式（07 / 14 / 15 / 17 / 23 篇的共同前置）
-
-工单统计与索引、GEO 池、延迟队列、抢单占位**统一**采用「**提交后生效、回滚不发布**」：`TransactionSynchronization.afterCommit()` / `afterCompletion()` 里才写缓存、发布索引或排期；缓存同步失败只记日志，不影响已提交的业务。理解这一点，才能解释为什么 `GeoPoolRegressionTest` / `CacheConsistencyRegressionTest` 里「回滚后索引不变」是预期行为。
-
-**验证修订**：观察提交后 500ms 内 key 被二次删除；回滚时 `ticket:pool:version` 不应递增。详见 [`23-ticket-pool-zset.md`](23-ticket-pool-zset.md)、[`15-nearby-order-geo.md`](15-nearby-order-geo.md)。
+> **Redis 考点**：写操作更新 DB 后删缓存，仍有一个「读线程在删除前查走旧快照、在删除后写回」的窗口 —— 用第二次延迟删除兜住它。
+> **来源**：`docs/01-redis-application-points.md` §2.3（缓存一致性与竞态）；`docs/02-cache-consistency-race.md` §2.1 的竞态推导
+> **完整路径**：`src/main/java/com/fancy/rideagenthub/service/impl/TicketServiceImpl.java`（`afterTicketMutation` / `evictTicketStatistics`）、`src/main/java/com/fancy/rideagenthub/service/base/DelayedCacheEvictor.java`
 
 ---
 
 ## 一、业务场景
 
-B 端客服后台有一个工单统计仪表盘，展示当日工单的四项聚合指标（待分配 / 处理中 / 今日创建 / 今日完成）。数据来自工单表的 4 次 `selectCount`，是一个典型的**读多写少、但一写就改统计**的接口。
+工单统计缓存（20~30 秒随机 TTL）背后的数据是工单表——**写操作高频**：`TicketServiceImpl` 里 10 个写工单的方法（提交、状态流转、分配、回复、关闭等）都调用 `afterTicketMutation` 统一收尾。
 
-改造前的状态很尴尬：
+先删缓存再更新 DB 或先更新 DB 再删缓存（cache-aside 的两种顺序），都无法回避这个竞态：
 
-- `ticket:statistics:{yyyyMMdd}` 这个 key **全项目只有读路径，没有任何一处删除**；
-- 工单表的 10 个写方法（提交、取消、评价、认领、转交、处理、回复、升级 ×2、用户补充）**没有一个碰缓存**。
-
-于是统计接口最长可以返回 `TTL`（20–30 秒）之前的旧值。用户刚提交完工单，刷新仪表盘，数字纹丝不动 —— 而这不是缓存的一致性问题，纯粹是**漏了失效**。
-
-### 第一步：先给所有写方法加失效
-
-这一步是后面所有讨论的前提：**没有写路径的删除，就构造不出竞态**。
-
-| 方法 | 定义行 | 失效调用行 | DB 操作 |
-|---|---|---|---|
-| `submitTicket` | `TicketServiceImpl.java:100` | `:155` | insert 工单 |
-| `cancelTicket` | `TicketServiceImpl.java:166` | `:199` | update status |
-| `confirmAndRate` | `TicketServiceImpl.java:212` | `:250` | update status |
-| `assignTicket` | `TicketServiceImpl.java:423` | `:458` | update handler + status |
-| `reassignTicket` | `TicketServiceImpl.java:470` | `:503` | update handler + status |
-| `processTicket` | `TicketServiceImpl.java:515` | `:585` | update status（switch 四个分支后统一一次） |
-| `sendMessage` | `TicketServiceImpl.java:609` | `:632` | update status |
-| `escalateTicket` | `TicketServiceImpl.java:915` | `:954` | update priority |
-| `escalateTicketByAdmin` | `TicketServiceImpl.java:965` | `:1000` | update priority |
-| `appendUserMessage` | `TicketServiceImpl.java:1011` | `:1045` | update time |
-
-**怎么加的：方法内直接调用，不是注解 + AOP。** 每个写方法在业务逻辑结束后调一次 `afterTicketMutation(ticketId)`（`TicketServiceImpl.java:1168-1173`），由它统一做两件事：
-
-```java
-private void afterTicketMutation(String ticketId) {
-    evictTicketStatistics();
-    if (StringUtils.hasText(ticketId)) {
-        afterCommit(() -> ticketPoolIndex.syncByTicketId(ticketId));
-    }
-}
+```
+T0 读线程：miss → 查 DB 拿到旧快照 S（工单数 = 99）
+T1 写线程：DB 提交（工单数 = 100）→ 删除缓存
+T2 读线程：此刻才把 S 回填进缓存（工单数 = 99，带 20~30s TTL）
+↑ T1 的删除发生在 T2 的回填之前 —— 脏快照将存活一个 TTL
 ```
 
-注释里解释了为什么不做成 AOP 注解（`:1156-1161`）：
-
-> 把"统计缓存失效"和"工单池索引同步"绑在一起：两者都由工单表的同一批变更触发，分成两次调用迟早会有人只写其中一个。任何改动工单的方法都应当调用本方法，而不是单独调 `evictTicketStatistics()`。
-
-也就是说，这里放弃 AOP 是为了**换一个更强的保证**：失效与索引同步必须成对出现。注解只能表达前者。
-
-### 第二步：加了删除之后，竞态才暴露出来
+单次删除兜不住的原因：**回填的时机不可预测**——读线程在删除前查走快照，在删除后才写回，删除动作落在了中间。
 
 ---
 
 ## 二、Redis 结构选型
 
-| Key | 结构 | TTL | 语义 |
-|---|---|---|---|
-| `ticket:statistics:{yyyyMMdd}` | String（JSON） | **20 秒 + 0–10 秒随机抖动** | 当日工单统计快照 |
-| `ticket:statistics:lock:{yyyyMMdd}` | String（UUID 令牌） | 5 秒 | 缓存重建互斥锁 |
-
-TTL 与延迟常量（均为 `TicketServiceImpl` 的私有静态字段）：
-
-| 常量 | 行号 | 值 |
+| 组件 | 形态 | 说明 |
 |---|---|---|
-| `TICKET_STATS_CACHE_BASE_SECONDS` | `:77` | `20L` |
-| `TICKET_STATS_CACHE_JITTER_SECONDS` | `:78` | `10` |
-| `TICKET_STATS_LOCK_SECONDS` | `:79` | `5L` |
-| `TICKET_STATS_LOCK_WAIT_MILLIS` | `:80` | `60L` |
-| `TICKET_STATS_LOCK_RETRY_TIMES` | `:81` | `3` |
-| `TICKET_STATS_DELAYED_EVICT` | `:90` | `Duration.ofMillis(500)` |
-
-**随机抖动**（`:1146-1147`）不是随手加的：如果所有实例在同一毫秒回填，它们会在同一毫秒同时过期 —— 抖动把过期时刻打散，避免统计这种「全站只有一个 key」的缓存出现集体失效。
+| 被保护缓存 | `ticket:statistics:{yyyyMMdd}`（String，随机 TTL 20~30s） | 值为 `TicketDataVO` JSON |
+| 第一次删除 | 提交后立即 `DEL` | 挂在 `afterCommit` |
+| 第二次删除 | 500ms 后 `DEL` | `DelayedCacheEvictor` 自建单线程调度器 |
 
 ---
 
 ## 三、代码落点
 
-| 位置 | 方法 | 职责 |
-|---|---|---|
-| `TicketServiceImpl.java:1090-1126` | `getTicketStatistics` | 读缓存 → 抢重建锁 → 双检 → 查 DB → 回填 |
-| `TicketServiceImpl.java:1128-1140` | `getCachedTicketStatistics` | 读缓存 + 反序列化（失败则删脏缓存） |
-| `TicketServiceImpl.java:1142-1154` | `cacheTicketStatistics` | 回填，TTL 取 20 + 0–10 秒 |
-| `TicketServiceImpl.java:1168-1173` | `afterTicketMutation` | 工单写后的统一收尾（失效 + 索引同步） |
-| `TicketServiceImpl.java:1190-1200` | `evictTicketStatistics` | **双删**：提交后立即删 + 调度 500ms 后再删 |
-| `TicketServiceImpl.java:1205-1216` | `afterCommit` | 有事务则挂到 `afterCommit`，否则立即执行 |
-| `TicketServiceImpl.java:1227-1229` | `tryLockTicketStatistics` | 抢重建锁（走 `RedisLock`，自带令牌校验） |
-| `DelayedCacheEvictor.java:38-46` | 构造器 | 单线程 `ScheduledExecutorService` + 守护线程 |
-| `DelayedCacheEvictor.java:57-74` | `evictAfter` | 调度延迟删除；失败只记日志 |
-| `DelayedCacheEvictor.java:76-79` | `shutdown` | `@PreDestroy` 关闭调度器 |
+| 位置 | 职责 |
+|---|---|
+| `TicketServiceImpl.afterTicketMutation` | 写工单的统一收尾：**先**注册索引同步（`ticketPoolIndex.syncByTicketId` 挂 `afterCommit`），**再**调 `evictTicketStatistics` |
+| `TicketServiceImpl.evictTicketStatistics` | 挂 `afterCommit`：第一次删除（try/catch 包裹）+ 调度 500ms 第二次删除 |
+| `service/base/DelayedCacheEvictor` | 单线程守护调度器：`evictAfter(key, delay)`；`@PreDestroy` 优雅关闭（`awaitTermination(5s)`） |
 
-`DelayedCacheEvictor` 全类只有 80 行，其中真正的逻辑就是 `evictAfter` 里的一句 `scheduler.schedule(...)`。
+`afterCommit` 辅助方法（`TicketServiceImpl` 私有）在无事务时立即执行——同一个失效逻辑在事务内外行为一致。
 
 ---
 
 ## 四、实现拆解
 
-### 4.1 竞态时序：第一次删除为什么拦不住
+### 4.1 为什么必须提交后删除
+
+若在事务内删除缓存：并发读线程 miss 后回源 DB，读到的是**尚未提交**的数据（或读到旧值），并把它回填——制造出一个比目标竞态更早、更容易触发的脏窗口。挂在 `afterCommit` 上，删除时 DB 已可见，读线程回源拿到的至少是提交后的数据；竞态只剩「删除前查走旧快照」这一种，由第二次删除兜。
+
+回滚场景自动正确：`afterCommit` 根本不触发，索引与缓存停留在写入前的状态，与回滚后的 DB 一致。
+
+### 4.2 顺序：先注册索引同步，再失效统计缓存
+
+`afterTicketMutation` 里两个动作的顺序是刻意的：
 
 ```
-时间 →
-T1 读线程                                     T2 写线程
-────────────────────────────────────────────────────────────────────────
-getTicketStatistics:1095
-  读缓存 miss
-                                              submitTicket:100
-                                                insert 工单（事务未提交）
-:1100 抢重建锁成功
-:1108 queryTicketStatisticsFromDb
-      4 次 selectCount（几十 ms）
-          ┌─────────────── 这几十毫秒就是窗口 ───────────────┐
-                                              DB 事务 COMMIT
-                                              evictTicketStatistics:1194
-                                                DEL ticket:statistics:xxx   ← 第一次删除
-          └───────────────────────────────────────────────────┘
-:1109 cacheTicketStatistics(cacheKey, fresh)
-      写回【不含新工单】的旧统计                       ← 缓存重新变脏！
+afterCommit(() -> ticketPoolIndex.syncByTicketId(ticketId))   // ① 先注册
+evictTicketStatistics()                                        // ② 再失效
 ```
 
-**关键点：第一次删除发生在 T1 回填之前，所以它删的是一个「即将被重新写脏」的 key。** 删除动作本身完全正确，只是**位置**在竞态窗口的另一侧。
+若 `evictTicketStatistics` 在注册前抛异常，索引同步已经挂上——**统计缓存的独立故障不能阻止索引版本推进**。反过来（先失效再注册）则统计缓存故障会让索引也停在旧版本。
 
-注意 T1 拿到的 `fresh` 并不是「错误的数据」—— 它是在 T2 提交之前查出来的**真实快照**。问题在于它从「查」到「写」之间跨越了 T2 的提交，于是这个快照在写入缓存的那一刻已经过期了。这正是 Cache-Aside 无法靠单次删除闭合的窗口。
-
-### 4.2 重建锁为什么防不住
-
-`getTicketStatistics:1100-1113` 用了一把互斥锁（`ticket:statistics:lock:{yyyyMMdd}`）来防止**多个读线程同时重建**（缓存击穿）。但在这张时序图里，T2 是**写线程**：
-
-> 写方根本不走读方的锁。
-
-锁保护的是「读—读」之间的重复重建，而竞态发生在「读—写」之间。两者的临界区压根不重叠，所以加锁无效。这是排查缓存竞态时最容易误判的一点 —— **看到加锁就以为安全了**。
-
-### 4.3 延迟双删：在窗口之后补一刀
-
-`TicketServiceImpl.java:1190-1200`：
+### 4.3 第一次删除的容错语义
 
 ```java
-private void evictTicketStatistics() {
-    afterCommit(() -> {
-        String cacheKey = RedisKeyConstants.ticketStatisticsKey(LocalDate.now());
-        // 第一次删除：立即失效
-        stringRedisTemplate.delete(cacheKey);
-        // 第二次删除：延迟执行，兜住"并发读基于旧快照回填"的窗口。
-        // 注意此处是在提交后调度，因此延迟窗口从"DB 已可见"开始计，语义正确。
-        delayedCacheEvictor.evictAfter(cacheKey, TICKET_STATS_DELAYED_EVICT);
-        log.debug("工单统计缓存已失效(双删): key={}", cacheKey);
-    });
-}
+try { stringRedisTemplate.delete(cacheKey); }
+catch (RuntimeException e) { log.warn(...); }   // 删除失败不阻断
 ```
 
-补上第二次删除后，时序变成：
+数据库已经提交，删除失败时**必须继续调度第二次删除**（不能把异常上抛把业务请求打失败）。删除成功只能清除当时已存在的缓存；若旧快照在第二次删除之后才回填，仍会残留到 TTL 到期。
 
-```
-T2  COMMIT
-T2  DEL cache                    ← 第一次删除
-T1                                  回填旧统计（把 key 写脏）
-T2  ...500ms 后...
-T2  DEL cache                    ← 第二次删除，把 T1 写回的脏值抹掉
-下一个读请求 → miss → 查 DB（此时能看到 T2 的新工单）→ 回填正确值
-```
+### 4.4 第二次删除的延迟取值
 
-### 4.4 为什么必须挂在 `afterCommit` 而不是事务内
+`TICKET_STATS_DELAYED_EVICT = 500ms`。取值依据（源码注释原话）：
 
-`TicketServiceImpl.java:1205-1216`：
+> 需覆盖「读线程查 DB + 回填缓存」的耗时，否则第二次删除仍早于回填，竞态依旧存在。统计查询是 4 次 selectCount，实测在几十毫秒量级，取 500ms 留足余量。延迟过长只会多几次缓存未命中，不会造成脏数据，故宁可取大。
 
-```java
-private void afterCommit(Runnable action) {
-    if (TransactionSynchronizationManager.isSynchronizationActive()) {
-        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-            @Override
-            public void afterCommit() {
-                action.run();
-            }
-        });
-    } else {
-        action.run();   // 无事务时立即执行
-    }
-}
-```
+**双删的容错方向是不对称的**：延迟偏大 → 多几次 miss（无害）；延迟偏小 → 脏窗口漏网（有害）。所以取值策略是「宁可偏大」。
 
-`evictTicketStatistics` 的注释把理由写清楚了（`:1182-1183`）：
+### 4.5 自建调度器与 Spring 调度器并存
 
-> **提交后失效**：若在事务内删除缓存，并发读会拿到"尚未提交的 DB 快照"并回填，制造出比目标竞态更早、更容易触发的脏数据窗口。故挂到 afterCommit。
-
-这句话值得展开。如果反过来在**事务内**删除：
-
-```
-T2  BEGIN → UPDATE 工单 → DEL cache   ← 此时 T2 尚未提交
-T1  读 miss → 查 DB（REPEATABLE READ 下看到的是 T2 提交前的旧值）→ 回填旧统计
-T2  COMMIT                            ← 缓存里躺着旧统计，而且没有任何人会再删它
-```
-
-这个窗口**比延迟双删要解决的那个窗口更容易触发** —— 它只要「读线程恰好在 T2 提交前查 DB」就够了，而延迟双删的窗口需要「读线程恰好在 T2 提交前开始查、又在提交后完成回填」。所以正确顺序是**先提交、再删缓存**，这样第二次删除的时间起点才有明确语义（「DB 已可见」那一刻）。
-
-### 4.5 `DelayedCacheEvictor` 的实现细节
-
-`DelayedCacheEvictor.java:38-46`：
-
-```java
-public DelayedCacheEvictor(StringRedisTemplate redisTemplate) {
-    this.redisTemplate = redisTemplate;
-    this.scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
-        Thread thread = new Thread(runnable, "delayed-cache-evictor");
-        // 守护线程：应用关闭时不被阻塞
-        thread.setDaemon(true);
-        return thread;
-    });
-}
-```
-
-四个设计点：
-
-1. **自己起 `ScheduledExecutorService`，没有用 `@EnableScheduling`。** 项目当时没有开启 Spring 的定时任务支持；为了一个延迟删除去全局打开调度器，不如就地起一个。副作用是「调度能力」被收拢在这个类里，不扩散。
-2. **单线程。** 延迟删除是极轻量的操作（一条 `DEL`），单线程足以承担；单线程还顺带保证了同一 key 的多次删除按调度顺序执行。
-3. **守护线程 + `@PreDestroy`（`:76-79`）。** 应用关闭时调度器不阻塞 JVM 退出，同时 `shutdown()` 让在途任务有机会收尾。
-4. **删除失败只记日志（`:66-68`），调度失败也只是降级（`:70-73`）。**
-
-```java
-try {
-    redisTemplate.delete(key);
-    log.debug("延迟删除缓存完成: key={}, delay={}ms", key, delay.toMillis());
-} catch (Exception e) {
-    log.warn("延迟删除缓存失败: key={}", key, e);
-}
-```
-
-理由在类注释（`:27-29`）：
-
-> **安全性**：延迟删除最多导致一次多余的缓存未命中，永远不会造成脏数据 —— 因此延迟时长宁可取大一些。
-
-注意这里的**不对称性**：第二次删除**失败**的代价是「脏数据要等到 TTL 过期才消失」（这里是 20–30 秒），第二次删除**多余**的代价是「多一次缓存重建」。前者比后者严重，但两者都远小于「写入一个错误的删除时机」的代价 —— 所以 `evictAfter` 的参数校验（`:58-60`）宁可静默返回也不抛异常：
-
-```java
-if (key == null || key.isBlank() || delay == null || delay.isNegative()) {
-    return;
-}
-```
+`DelayedCacheEvictor` 自建单线程 `ScheduledExecutorService`（守护线程 `delayed-cache-evictor`），而非复用 Spring 的 `@Scheduled` 基础设施。理由：双删任务要求**提交即入队、精确毫秒级延迟**，与定时轮询语义不同；且自建线程池的排队 / 拒绝行为独立于业务调度器（`RejectedExecutionException` 有专门处理）。启动类已开 `@EnableScheduling`（`OrderTimeoutJob` 等使用），两者互不干扰。
 
 ---
 
@@ -284,98 +91,47 @@ if (key == null || key.isBlank() || delay == null || delay.isNegative()) {
 
 | 选择 | 备选 | 为什么选这个 |
 |---|---|---|
-| **双删**（立即 + 500ms） | 只删一次 | 只删一次会被 4.1 的回填覆盖。双删是唯一能在**不引入版本号**的前提下兜住窗口的做法 |
-| 第二次删除**异步调度** | 写线程 `Thread.sleep(500)` 后再删 | 写线程不能被阻塞 500ms。异步调度让写路径的 RT 完全不受影响 |
-| 第二次删除挂在**写路径** | 在读路径回填后再删一次 | 读路径回填后再删会把自己刚写的数据删掉，导致永久 miss。教科书形态是「删 → 延迟 → 再删」，两刀都在写侧 |
-| 延迟 500ms | 100ms / 2s | 需覆盖「读线程查 DB + 回填」。统计查询是 4 次 `selectCount`，实测几十毫秒，500ms 留足余量（`:86-88`） |
-| **保守失效**：不判断本次写入是否真的影响那 4 个统计项 | 精确判断影响范围 | 注释 `:1186-1187`：「统计接口面向 B 端仪表盘，多几次缓存重建的代价远低于漏失效导致的数据错误」 |
-| TTL 带 **0–10 秒抖动** | 固定 20 秒 | 避免多实例在同一毫秒集体过期 |
+| 延迟双删 | 延迟单删 / 不删（靠短 TTL 自愈） | 短 TTL（20~30s）本身已限制脏数据寿命，双删把「TTL 内的脏读概率」再压一个量级；代价极小（500ms 后一次 DEL） |
+| 500ms 延迟 | 更短（100ms）/ 更长（2s） | 容错不对称：偏大无害、偏小有害；实测回填耗时几十毫秒，500ms 是 10 倍余量 |
+| 自建单线程调度器 | Spring `@Scheduled` / 时间轮 | 毫秒级精确延迟 + 提交即入队；单线程足够（双删任务轻量、无并发语义） |
+| 事务回调统一模式 | 写路径各自为政 | 10 个写方法统一走 `afterTicketMutation`，漏掉一个方法就是漏掉一条失效路径（见 4.2 的顺序设计） |
+
+> 一个诚实的判断：统计 TTL 只有 20~30 秒、数据面向仪表盘，**单纯从数据价值看双删是「过度设计」**——TTL 到期脏数据自然消失。这里保留双删是因为它同时是「事务回调统一模式」的教学载体：同样的 `afterCommit` + 延迟兜底结构，出现在 GEO 池、延迟队列、抢单占位等所有「提交后生效」的场景里（见 [README](README.md) §3.1 引用枢纽）。
 
 ---
 
 ## 六、边界与已知问题
 
-### 6.1 致命缺陷：sleep 多久靠猜
-
-这是延迟双删**无法通过调参解决**的问题。第二次删除的延迟 δ 必须满足：
-
-```
-δ  >  「读线程从查 DB 到回填完成」的最大耗时
-```
-
-而这个耗时取决于：DB 当时的负载、GC 停顿、线程调度、网络抖动、读线程被锁阻塞多久 —— **没有任何一项是可测量的上界**。500ms 是「统计查询实测几十毫秒，留 10 倍余量」拍出来的，注释里也承认了这一点：
-
-> 取值需覆盖"读线程查 DB + 回填缓存"的耗时，否则第二次删除仍早于回填，竞态依旧存在。
-
-δ 取小了 → 窗口没盖住，脏数据存在；δ 取大了 → 多几次无谓的缓存未命中（在 TTL 只有 20 秒的场景里，δ 取 5 秒就已经和 TTL 一个量级了，第二次删除几乎失去意义）。
-
-**「靠猜时间」是延迟双删的本质，不是它的实现瑕疵。** 这一点在第 3 步的墓碑机制里被正面解决 —— 见 [`08-city-code-tombstone.md`](08-city-code-tombstone.md)。
-
-### 6.2 本项目里它「够用但不是最优」
-
-`ticket:statistics` 的 TTL 只有 **20 + 0–10 秒**，这意味着：
-
-> **即使延迟双删完全失效，脏数据的存活时间也有硬上界 —— 30 秒。**
-
-换句话说，即使第二次删除从来没执行过，最坏情况也只是「仪表盘数字最多旧 30 秒」—— 而这个业务对这个精度的容忍度很高（它是给人看的仪表盘，不是给程序读的判据）。
-
-严格按工程标准衡量：**这个 key 加个「写时删除」就足够了，延迟双删在这里是过度设计。**
-
-### 6.3 工程诚实说明：教学价值大于工程价值
-
-把它留在这里的理由是**认知递进**：
-
-> 它的价值在于演示「为什么加了删除还会有脏数据」。
-
-只有先亲眼看到 4.1 的时序图成立，才能理解为什么第 3 步需要墓碑、第 4 步需要 Lease。如果跳过它直接上墓碑，墓碑看起来就像是为了炫技。
-
-而且正因为这里 TTL 短，6.1 那个「sleep 该睡多久」的缺陷**不够刺眼** —— 这个「不够刺眼」本身是有意为之：它逼着下一个场景（`CityCodeUtil`，TTL 7 天）去把缺陷放大到无法回避的程度。
-
-### 6.4 其余已知问题
-
-1. **`evictTicketStatistics` 用的是 `LocalDate.now()`**（`:1192`），而不是写入发生时所在的业务日期。跨零点时会出现：写入发生在 `23:59:59.9`，`afterCommit` 在 `00:00:00.1` 执行 —— 删掉的是**新一天**的 key，而真正变脏的**前一天**的 key 只靠 TTL（20–30 秒）兜底。窗口极小、后果有界，属于已知残留。
-
-2. **多实例下调度是「谁写谁调度」**。第二次删除由写请求所在实例的调度器执行，若该实例在 500ms 内被强杀，第二次删除就不会发生 —— 退回到 6.2 的「最多脏 30 秒」。
-
-3. **反序列化失败会直接删缓存**（`getCachedTicketStatistics:1135-1137`）。这是另一条独立于双删的失效路径，同样是「保守优先」。
-
-4. **`RedisLock` 的重建锁与双删无关**。它的作用只是防击穿，不要指望它能兜住读写竞态（见 4.2）。
+1. **延迟双删降低概率，不消除竞态**：读线程卡顿超过 500ms 后才回填，脏快照仍会写入并存活到 TTL 到期。它适合「短 TTL + 低价值数据」；7 天 TTL 的数据请改用墓碑（[08 篇](08-city-code-tombstone.md)）或版本租约（[09 篇](09-lease-token.md)）。
+2. **进程崩溃会丢掉第二次删除**：调度任务在内存里，重启即失。脏数据存活到 TTL 到期（20~30 秒），可接受。
+3. **双删不覆盖「读路径的破坏性回填」**：若回填语义是「整体替换」而非「写入」，需要 Lease（[09 篇](09-lease-token.md)）。
+4. **`updateTicketTime` 不单独失效**：它是辅助方法（只更新时间戳），由调用方统一走 `afterTicketMutation` 覆盖，不算遗漏。
 
 ---
 
 ## 七、如何验证
 
 ```bash
-# 1. 观察缓存 key 与它的 TTL
-redis-cli GET ticket:statistics:20260913
-redis-cli TTL ticket:statistics:20260913
-# 期望 0 < TTL <= 30（20 + 0~10 抖动）
+# 1. 写工单后观察双删
+#    （提交工单的瞬间到 500ms 之间，缓存 key 应经历 存在→DEL→(重建) 的过程）
+redis-cli EXISTS ticket:statistics:<yyyyMMdd>   # 提交后立即查：多数时候已为 0
 
-# 2. 确认重建锁的生命周期很短
-redis-cli TTL ticket:statistics:lock:20260913   # 期望 <= 5，且大多数时候 key 不存在
+# 2. 观察应用日志：
+#    "工单统计缓存已失效(双删): key=..."（debug 级）
+#    第一次删除失败时："工单统计缓存失效失败"（warn），随后第二次删除仍会执行
 
-# 3. 验证第一次删除：调一次工单写接口（如提交工单）
-redis-cli EXISTS ticket:statistics:20260913     # 期望 0（已被删）
+# 3. 构造竞态复现（需配合断点）：
+#    在 DB 查询后挂起，写事务提交后 500ms 内放行读线程并完成回填
+#    → 第二次删除清掉旧快照；若在第二次删除之后才回填，则旧值仍可能残留到 TTL 到期
 
-# 4. 验证第二次删除：把调度延迟临时改大（例如 5s），
-#    然后在写接口返回后立刻读一次统计（触发回填），
-#    再等待 5 秒 —— key 应该在这时被第二次删除
-redis-cli EXISTS ticket:statistics:20260913     # 期望 0
-
-# 5. 观察日志确认双删真的走了
-#    日志级别调到 DEBUG 后应能看到：
-#    "工单统计缓存已失效(双删): key=ticket:statistics:20260913"
+# 4. 回滚验证：触发工单写异常回滚，缓存与索引应保持不变
 ```
 
 ---
 
 ## 八、延伸阅读
 
-- [`04-cache-breakdown-mutex.md`](04-cache-breakdown-mutex.md) —— 同一个 `getTicketStatistics` 里的重建锁：它防的是击穿，防不住本篇的读写竞态
-- [`05-cache-avalanche-random-ttl.md`](05-cache-avalanche-random-ttl.md) —— 20 + 0–10 秒抖动的完整理由
-- [`08-city-code-tombstone.md`](08-city-code-tombstone.md) —— 把「猜时间」换成「看状态」，正面解决 6.1 的缺陷
-- [`09-lease-token.md`](09-lease-token.md) —— 当「回填本身就是破坏性覆盖」时，双删和墓碑都失效
-- [`06-null-sentinel-and-prewarm.md`](06-null-sentinel-and-prewarm.md) —— 哨兵解决「读不到」，双删解决「读到旧的」
-- [`13-distributed-lock.md`](13-distributed-lock.md) —— `RedisLock`：令牌校验 + Lua 原子释放
-- [`10-lua-scripts-overview.md`](10-lua-scripts-overview.md) —— 项目全部 Lua 脚本总表；延迟双删是**唯一没有走 Lua** 的一致性方案
-- [`../../02-cache-consistency-race.md`](../../02-cache-consistency-race.md) —— 本批文档的原始盘点（行号已漂移，以代码为准）
+- [`08-city-code-tombstone.md`](08-city-code-tombstone.md) —— 长 TTL 场景：双删救不了时的「看状态」方案
+- [`09-lease-token.md`](09-lease-token.md) —— 回填破坏性场景：版本校验方案
+- [`17-order-timeout-delay-queue.md`](17-order-timeout-delay-queue.md) —— 同一套 `afterCommit` 模式在延迟队列上的应用
+- [`docs/02-cache-consistency-race.md`](../../02-cache-consistency-race.md) —— 三解法适用边界的完整推导

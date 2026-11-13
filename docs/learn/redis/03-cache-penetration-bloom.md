@@ -1,193 +1,82 @@
-# 缓存穿透：用布隆过滤器拦掉「一定不存在」的用户名
+# 缓存穿透：布隆过滤器
 
-> **Redis 考点**：Redisson `RBloomFilter` 前置拦截「一定不存在」的查询，避免为不存在的数据反复回源 DB（缓存穿透）；并解释「误判方向为什么是安全的」。
-> **来源**：`docs/01-redis-application-points.md` 一、现状盘点（「缓存穿透（布隆过滤器）」）与三、现存缺陷 2/3
+> **Redis 考点**：Redisson `RBloomFilter` 拦截「一定不存在」的查询，保护数据库不被恶意 / 高频的不存在 key 查询打穿。
+> **来源**：`docs/01-redis-application-points.md` §2.2（缓存三大经典问题）
 > **完整路径**：`src/main/java/com/fancy/rideagenthub/service/base/UserUsernameBloomFilterService.java`
-> **代码版本**：当前工作区为 `RideAgentHub` / `com.fancy.rideagenthub`（基准路径 `src/main/java/com/fancy/rideagenthub/`）。本系列撰写于历史快照 `bdc40d7`（旧名 `TaxiAgent`、旧包 `com.fancy.taxiagent`，属已被重写合并的旧分支），文中的 `文件:行号` 与部分代码块是**改造前快照**，整体已漂移；学习时以「类名 + 方法名 + 章节名」定位当前源码，具体行为一律以当前代码为准。
-
----
-
-## 【当前实现对照】
-
-> **审计阅读约定（2026-11-13 代码反向复核）**：本篇二～八章正文与验证命令写于改造前快照，**作为缺陷推导教材保留**；凡与本节冲突，一律以本节与当前源码为准。下表是已确认的失效点。
-
-| # | 正文中的旧说法 | 当前代码事实 |
-|---|---|---|
-| 1 | 「不产生任何 SQL」、`mightContain` 是唯一查询调用方、`if (!mightContain(...)) return true;` 代码块、验证第 2 条「不应产生 SELECT」 | `AuthServiceImpl.isUsernameAvailable` **直查 DB**（`:258-268`），`mightContain` 生产 0 调用方 —— 布隆已退出可用性主链路，变成「只写不读」 |
-| 2 | 「`sys_user` 没有 username 唯一索引 → 会落库两个同名用户」「注册只校验邮箱、不校验用户名」 | `sql/init.sql:13-17` 有生成列 `active_username` + `uk_active_username_role` 唯一索引，注册前置校验返回 409（`AuthServiceImpl:81`）；重建期假阴性**不再**导致重名落库 |
-| 3 | 验证命令 3「重建期间查询已注册用户名 → 可能返回 true → 即缺陷」 | 直查 DB 结果恒定，无法复现；`rebuild()` 仍是 `delete()` + `tryInit()` + 逐条 `add` 的原地重建（`UserUsernameBloomFilterService.java:41-61`），**❌ 仍存在但后果已变** |
-| 4 | 缺「布隆当前定位」的原理 | 逻辑删除把生成列置 NULL 才能释放用户名；`POST /user/rebuild` 需 `ADMIN`（`UserController.java:162-167`）。真正裁决唯一性的是 DB 唯一索引，布隆不再是正确性依赖 |
-
-> 布隆过滤器的误判方向、容量/误判率推导、双 key 切换建议**全部保留**；以下事实已变。
-
-| 项 | 当前实现 |
-|---|---|
-| 主链路 | `UserUsernameBloomFilterService.mightContain` 在生产代码 **0 调用方**（已退出可用性主链路）；`AuthServiceImpl.isUsernameAvailable` **直查 DB**，注册前置还会校验用户名。旧「不产生任何 SQL」「唯一查询调用方」❌ 已过时 |
-| 仍在使用的部分 | `addUsername`（注册时加入）与 ADMIN `POST /user/rebuild` 全量重建 |
-| 唯一索引 | `sql/init.sql` 有生成列 + `uk_active_username_role`（同角色、未删除账号唯一），`sql/migrations/20261113_security_consistency.sql` 是旧库升级路径；并发注册由 DB 索引裁决 |
-| 缺陷状态 | `rebuild()` 仍是 `delete()` + `tryInit()` 原地重建 ❌ **仍存在**；但后果已从「落库两个重名用户」变为「**重建期假阴性**」，由唯一索引与直查 DB 兜底 |
-| 双 key 切换 | 仍是**可选优化**（当前未实现），原文建议保留作方案对比 |
-
-**面试追问**：「布隆过滤器还有用吗？」→ 它不再是可用性判断的必经路径，只剩注册写入与 ADMIN 重建；正确性的兜底是 DB 唯一索引。详见 [`../agent/03-security-and-boundaries.md`](../agent/03-security-and-boundaries.md)。
 
 ---
 
 ## 一、业务场景
 
-前端注册表单在用户输入用户名时调用 `GET /auth/username/available?username=xxx`（`AuthController.java:78-86`）判断该名字是否已被占用。这个接口有三个特点：
+缓存穿透与击穿 / 雪崩的区别：**穿透查询的是「数据库里也不存在」的数据**。缓存无法存一个不存在的值（除非用哨兵，见 [06 篇](06-null-sentinel-and-prewarm.md)），于是每次请求都直捣数据库——攻击者拿随机用户名刷注册查重接口，就能把 DB 打挂。
 
-1. **公开、无鉴权**（`AuthController` 的 `/username/available` 上没有 `@RequirePermission`）；
-2. **可被任意脚本高频调用**；
-3. **绝大多数试探的用户名都不存在**（注册场景下用户会反复试名字）。
+本项目的场景是**用户名占用查询**：注册时用户输入用户名，前端实时提示「是否已被占用」。这个查询：
 
-它背后的查询是 `findByUsernameAndRole(username, "USER")` —— 一次 `SELECT`。对不存在的用户名来说，任何缓存都帮不上忙：缓存里没有这个 key（查不到的东西无法被缓存命中），每次请求都要 DB 真实回答一次。**这就是缓存穿透**：请求合法、数据不存在，缓存层完全失效，压力 1:1 传导到 DB。攻击者用随机用户名刷这个接口，得到的是一条稳定的 DB QPS 放大通道。
+- 输入完全由外部控制（任意字符串）；
+- 大部分输入是「不存在」的（正常用户试的名字基本没被注册过）；
+- 有现成的全量数据可加载（用户名集合）。
 
-布隆过滤器在这里的作用是把「一定不存在」这个结论在 Redis 侧就地得出并返回，**不产生任何 SQL**。
+正是布隆过滤器的标准适用面：**把全量「存在」的集合放进内存可负担的概率结构，用 O(1) 判断「一定不存在」**。
+
+当前代码中的角色划分：
+
+| 调用点 | 用途 |
+|---|---|
+| `AuthServiceImpl` 注册流程 | `addUsername`——新用户名落库后登记进布隆 |
+| `POST /user/rebuild`（ADMIN） | `rebuild`——全量重建 |
+| `isUsernameAvailable`（`AuthServiceImpl`） | **直查数据库**，布隆不在可用性主链路上（见 4.3） |
 
 ---
 
 ## 二、Redis 结构选型
 
-| Key | 结构 | TTL | 语义 |
-|---|---|---|---|
-| `auth:user:username:bloom` | Redisson `RBloomFilter<String>`（位数组 + 配置，由 Redisson 自己管理） | 无 TTL（Redisson 层不设过期，key 常驻） | 全量「有效 USER 用户名」的**近似**集合 |
+| 项 | 值 |
+|---|---|
+| 结构 | Redisson `RBloomFilter<String>` |
+| key | `RedisKeyConstants.userUsernameBloomKey()` |
+| 容量 | `EXPECTED_INSERTIONS = 1000000`（100 万） |
+| 误判率 | `FALSE_PROBABILITY = 0.01`（1%） |
 
-- Key 常量：`RedisKeyConstants.java:43`（`USER_USERNAME_BLOOM_KEY`）、`:233-235`（`userUsernameBloomKey()`）。
-- 参数：`EXPECTED_INSERTIONS = 1000000L`（`:16`）、`FALSE_PROBABILITY = 0.01`（`:17`）。
-  - 100 万是**预估容量**，决定位数组长度：按 `m ≈ -n·ln p / (ln2)²`，n = 1e6、p = 0.01 时 m ≈ 1.2 MB（约 960 万位），哈希函数个数 `k = -log₂p ≈ 7`。相对它每次省下的 DB 查询，这个内存代价可以忽略。
-  - 两个参数**只在首次 `tryInit` 时生效**；1% 是「插入量不超过 100 万」前提下的上界，真实用户超过 100 万后误判率会高于 1%，而 `tryInit` 不会覆盖已有配置（只能重建，见 4.4）。
-- 集合内容的口径来自 `UserAuthMapper.selectUsernamesForBloom`（`mapper/UserAuthMapper.java:16-17`）：
+布隆过滤器的误判是**单向**的：
 
-  ```sql
-  SELECT username FROM sys_user WHERE role = 'USER' AND status = 1 AND is_deleted = 0 AND username IS NOT NULL
-  ```
+- 判「不存在」→ **一定不存在**（无假阴性）；
+- 判「存在」→ 可能不存在（1% 假阳性）。
 
-  只装「有效 + USER 角色」的用户名，与校验方 `findByUsernameAndRole(username, UserRole.USER.name())` 的口径**严格一致**。这一点是必须的：过滤器与 DB 的判定范围只要不一致，就会出现「过滤器说存在、DB 说不存在」的错答。
+所以它只能用在「拦截不存在」的方向：判不存在直接回「可用」，判「存在」仍要查库确认。反过来说，**它永远不会把一个已存在的用户名判成「不存在」**（除非数据没进来，见 4.2）。
 
 ---
 
 ## 三、代码落点
 
-| 位置 | 方法 / 片段 | 职责 |
-|---|---|---|
-| `UserUsernameBloomFilterService.java:16-17` | 容量与误判率常量 | 100 万 / 1% |
-| `UserUsernameBloomFilterService.java:27-32` | `mightContain` | 查询入口（空串直接 `false`） |
-| `UserUsernameBloomFilterService.java:34-39` | `addUsername` | 增量写入（注册 / 建号后） |
-| `UserUsernameBloomFilterService.java:41-61` | `rebuild` | 全量重建（**现存缺陷，见 4.4**） |
-| `UserUsernameBloomFilterService.java:63-67` | `getBloomFilter` | 每次调用都 `getBloomFilter` + `tryInit`（**现存缺陷，见 4.5**） |
-| `AuthServiceImpl.java:252-267` | `isUsernameAvailable` | 唯一的查询调用方：`false` → 直接返回可用；`true` → 回源 DB |
-| `AuthServiceImpl.java:104` | `registerByEmailCode` | 邮箱注册成功后 `addUsername` |
-| `AuthServiceImpl.java:246` | `createAccount` | 后台建号成功后 `addUsername`（仅 `USER` 角色） |
-| `AuthController.java:82-86` | `GET /auth/username/available` | 对外接口 |
-| `UserController.java:159-167` | `POST /user/rebuild` | 管理端（`@RequirePermission({"ADMIN"})`）触发全量重建，返回写入条数 |
-
-> 说明：`mightContain` 只被用在**用户名可用性查询**这一条路径上，**不参与登录流程**（登录走 `findByUsernameAndRole` / `findUserRoleByEmail` 直查 DB）。`addUsername` 的写入点是注册与后台建号，`rebuild` 由管理端手动触发。
+| 方法 | 职责 |
+|---|---|
+| `mightContain` | `getBloomFilter().contains(username)`；**当前无生产调用方** |
+| `addUsername` | `getBloomFilter().add(username)`，注册落库后调用 |
+| `rebuild` | `delete` → `tryInit` → `selectUsernamesForBloom` 全量回灌，返回登记数 |
+| `getBloomFilter` | `getBloomFilter(key)` + `tryInit`（幂等初始化，未初始化时惰性建） |
 
 ---
 
 ## 四、实现拆解
 
-### 4.1 `mightContain` 的两个方向：为什么误判是安全的
+### 4.1 参数推导：100 万 / 1% 意味着什么
 
-布隆过滤器唯一的数学保证是：**说「不存在」一定正确；说「存在」可能错**（无假阴性、有假阳性）。
+误判率 \(p\) 与元素数 \(n\)、位数 \(m\)、哈希数 \(k\) 的关系：\(m \approx -n \ln p / (\ln 2)^2\)。代入 \(n = 10^6\)、\(p = 0.01\)：约 **9.6 Mbit ≈ 1.2 MB**、7 个哈希函数。这是一个可以被任何实例整份缓存的体积，也是「全量加载」可行的前提。
 
-```java
-public boolean mightContain(String username) {
-    if (!StringUtils.hasText(username)) {
-        return false;                       // 空值直接判否，避免无意义查询
-    }
-    return getBloomFilter().contains(username);
-}
-```
+`tryInit` 幂等：已初始化的过滤器直接返回，参数只第一次生效——重建时要先 `delete` 才能换参数。
 
-| 返回值 | 含义 | 允许的动作 |
-|---|---|---|
-| `false` | **一定**不在集合里 → 一定没被注册 | 可以直接下结论，无需查 DB |
-| `true` | 可能在，也可能只是哈希撞了（假阳性 ≤ 1%） | **必须**回源 DB 才能给确定答案 |
+### 4.2 重建：原地删除 + 全量回灌
 
-调用方 `AuthServiceImpl.java:261-266` 正是按这个方向写的：
+`rebuild` 的顺序是 `delete → tryInit → 回灌`。`delete` 到回灌完成之间存在窗口：**窗口内 `contains` 会把已注册的用户名判为「不存在」（假阴性）**。这是布隆「无假阴性」性质在重建期的例外——不是概率问题，是数据缺失问题。
 
-```java
-if (!usernameBloomFilterService.mightContain(username)) {
-    return true;                                                    // 一定不存在 → 可用，且不查 DB
-}
-UserAuth existing = userAuthService.findByUsernameAndRole(username, UserRole.USER.name());
-return existing == null;                                            // 可能存在 → 回源 DB 确认
-```
+后果评估：用户名可用性检查**直查数据库**（见 4.3），并发注册重名由数据库生成列唯一索引 `uk_active_username_role` 裁决（`DuplicateKeyException` → 409）。当前 `mightContain` 无生产调用方，重建期缺失不会改变可用性查询的结果或查询次数；并发注册仍由唯一索引裁决。
 
-**误判方向为什么是安全的**：假阳性只会让一个**本来可用**的用户名多查一次 DB（DB 的回答仍然是「可用」），用户完全无感；而「已存在的名字被漏掉」这种情况根本不会发生 —— 布隆过滤器不会说假阴性。于是：
+若要彻底消除窗口，标准做法是**双 key 切换重建**：新过滤器写满后原子改名。当前未采用——重建是低频 ADMIN 操作，DB 唯一索引已兜底，复杂度不值得。
 
-> 误判的代价是**性能**（1% 的请求多走一次 DB），不是**正确性**。
+### 4.3 `mightContain` 不在可用性主链路上
 
-这正是所有「前置过滤器」类优化成立的前提：只允许往「保守」的方向错。
+用户名可用性查询（`AuthServiceImpl.isUsernameAvailable`）当前直查数据库。布隆在本项目承担的是「注册后登记 + 可重建的演示能力」，而不是可用性接口的前置拦截。源码能确认的事实是 `isUsernameAvailable` 直接查库，`mightContain` 没有生产调用方。不能据此推断项目流量或作者的性能取舍。若接入布隆，应在判「可能存在」时继续查库确认，假阳性不必变成错误的占用提示；另需解决重建期的数据缺失。
 
-### 4.2 反向用法是灾难（对照理解）
-
-如果把判断写成 `if (mightContain(username)) return true;`（把「可能存在」当成结论直接用），那 1% 的假阳性就会**直接拒绝**一个完全可用的用户名，而且用户无法通过任何操作绕过（换浏览器、重试都没用，因为哈希结果不变）。这说明两个方向的确定性不同，**不能对称处理**。
-
-同理，布隆过滤器也不能当「唯一性校验」用：它只能回答「一定不存在」，不能回答「一定存在」。
-
-### 4.3 增量写入与全量重建两条路径
-
-| 路径 | 触发 | 行为 |
-|---|---|---|
-| 增量 | 邮箱注册 `AuthServiceImpl.java:104`、后台建号 `:246`（仅 `USER`） | 只 `add`，**从不删除** |
-| 全量 | `POST /user/rebuild`（ADMIN） | 清空后从 DB 拉全量用户名逐条 `add` |
-
-两个必须知道的性质：
-
-- **布隆过滤器不支持删除**（清除一个元素的位会影响其它元素的判定）。所以「删除用户 / 改名」后旧用户名会永久留在过滤器里 → 该名字后续的可用性查询**只能走 DB 路径**（回答仍然正确：DB 查不到 → `existing == null` → 可用），只是失去了加速。这就是 `rebuild` 存在的理由。
-- **增量写入不参与事务**：`addUsername` 在 `@Transactional` 方法里被调用，但写入 Redis 的动作不在事务内，也不会挂到 `afterCommit`。事务回滚时可能留下一个「DB 里不存在、过滤器里存在」的成员 —— 失败方向是安全的（后续该名字多查一次 DB，结论仍是可用）。
-
-### 4.4 现存缺陷一：`rebuild` 是「先 delete 再逐条 add」（`:41-61`）
-
-```java
-RBloomFilter<String> bloomFilter = redissonClient.getBloomFilter(RedisKeyConstants.userUsernameBloomKey());
-bloomFilter.delete();                                          // :43 先删（过滤器瞬间变成空）
-bloomFilter.tryInit(EXPECTED_INSERTIONS, FALSE_PROBABILITY);   // :44
-List<String> usernames = userAuthMapper.selectUsernamesForBloom();
-...
-for (String username : normalized) {
-    bloomFilter.add(username);                                 // :56-58 再逐条加（N 次 Redis 往返）
-}
-```
-
-从 `:43` 到最后一个 `add` 完成，过滤器处于**空或半空**状态。调用方的实际后果是：
-
-- 空过滤器让 `mightContain` 对**所有**用户名返回 `false`（包括已注册的）→ `isUsernameAvailable` 把这些已占用的名字**误报为可用** → 用户按这个结果注册，就会产生**重名用户**。
-- 而 `sys_user` 表**没有 username 唯一索引**（`src/main/resources/sql/init.sql:1-14`，只有 `PRIMARY KEY (id)`），DB 不会兜底拦截。所以这是一个**正确性窗口**，长度 = 全量用户名读 DB + 逐条 `add` 的时间（`add` 是逐条往返 Redis，条数越多窗口越长，百万级可达分钟级）。
-
-> **需要纠正一个常见说法**：这里的窗口**不是**「重建期查询穿透到 DB」。恰恰相反 —— 空过滤器会把几乎所有请求短路掉、不查 DB（`mightContain == false` 直接 `return true`），DB 压力是**下降**的。之所以与「布隆过滤器拦在缓存前面防穿透」的经典形态相反，是因为本项目的调用方向是「命中即确定，未命中才回源」（4.1 的表格）。读同类资料时不要照搬结论。
-
-**改造方向（未实现）**：**双 key 切换 + 完成后原子改名**。把新过滤器建在 `auth:user:username:bloom:new`（或带版本号后缀），全部 `add` 完成后再 `RENAME` 替换旧 key，读路径始终指向一个完整的过滤器，重建期间不存在空窗。考虑到 `RBloomFilter` 把 key 名和配置封装在一起，落地时更简单的等价做法是：**版本号后缀 + 读侧回退**（读 `:v2` 未就绪则读 `:v1`），或**在重建期间让调用方临时降级为直查 DB**（用性能换正确性，代价可控且方向安全）。
-
-### 4.5 现存缺陷二：`getBloomFilter()` 每次调用都 `tryInit`（`:63-67`）
-
-```java
-private RBloomFilter<String> getBloomFilter() {
-    RBloomFilter<String> bloomFilter = redissonClient.getBloomFilter(RedisKeyConstants.userUsernameBloomKey());
-    bloomFilter.tryInit(EXPECTED_INSERTIONS, FALSE_PROBABILITY);   // 每次都要去 Redis 确认配置是否存在
-    return bloomFilter;
-}
-```
-
-`mightContain`（`:31`）和 `addUsername`（`:38`）每次都要先经过这里。`tryInit` 会去 Redis 确认过滤器配置是否存在，**等于每次查询都多一次 Redis 往返**。而这个往返的答案在过滤器的生命周期内几乎恒定（配置只在首次创建 / 重建时变化）。
-
-结果是自相矛盾的性能账：引入布隆过滤器是为了省掉一次 DB 查询，而每次查询又先加一次 Redis 往返 —— 净收益被削掉一截（尤其在「本地已有连接池 + DB 查询走索引」的情况下）。
-
-**改进方向（未实现）**：把 `RBloomFilter` 实例缓存成字段（`volatile` + 双重检查），或用本地 `AtomicBoolean` 标记跳过重复 `tryInit`。有一个坑必须一并处理：`rebuild` 在 `:43` 显式 `delete()` 了 key，如果缓存了实例 / 标记，**重建时必须让缓存失效**，否则会一直用一个「本地认为已初始化、Redis 里其实刚被删掉」的实例。
-
-### 4.6 为什么用 Redisson 的 `RBloomFilter` 而不是 RedisBloom 模块
-
-`RBloomFilter` 是**客户端实现**：位数组存在 Redis 里，哈希计算与位的读写都在 JVM 侧完成，因此不依赖 `BF.RESERVE` / `BF.ADD` / `BF.EXISTS` 这些 RedisBloom 模块命令。
-
-| | Redisson `RBloomFilter` | RedisBloom 模块 |
-|---|---|---|
-| 部署要求 | 普通 Redis 即可（项目 `application.yaml:28-31` 就是一个普通实例） | 需要额外加载模块 |
-| 原子性边界 | 在客户端（`contains` 是若干次位读取的往返） | 在服务端，单命令原子 |
-| 可观测性 | `redis-cli` 里只能看到 Redisson 自己的结构，没有 `BF.*` 命令可用 | `BF.INFO` / `BF.EXISTS` 直接可查 |
-
-项目选前者，换取「零额外部署」和「与已有 Redisson 依赖（`RBloomFilter` + `RLock` 同源）复用」。
 
 ---
 
@@ -195,65 +84,43 @@ private RBloomFilter<String> getBloomFilter() {
 
 | 选择 | 备选 | 为什么选这个 |
 |---|---|---|
-| 布隆过滤器 | 缓存空值哨兵（`username → ""`，见 [`06-null-sentinel-and-prewarm.md`](06-null-sentinel-and-prewarm.md)） | 空值哨兵要为**每一个不存在的用户名**写一个 key。查重接口是公开、可被刷的：攻击者用随机用户名刷 → 缓存里被塞满垃圾 key，形成**内存放大攻击**。布隆过滤器用固定的 ~1.2MB 表达整个「存在集合」，抗刷，且不会因为攻击流量增长 |
-| 布隆过滤器 | 每次直查 DB | 公开接口直查 DB 等于把 DB 暴露给未鉴权的试探流量 |
-| 窄口径 `role='USER' AND status=1 AND is_deleted=0` | 全表所有用户名 | 与 `findByUsernameAndRole` 的查询范围严格一致；口径不一致会产生「过滤器说存在、DB 说不存在」的错答 |
-| 只加不删 | 删除用户时同步从过滤器移除 | 布隆过滤器**物理上不支持删除**。只能接受「残留 → 该名字后续走 DB」，或整体 `rebuild` |
-| 管理端手动触发 `rebuild` | 定时任务自动重建 | 当前是演示 / 兜底用途（`POST /user/rebuild` + ADMIN 权限）。生产形态应是「定时 + 双 key 切换」（4.4 的改造方向） |
-| 参数 100 万 / 1% | 100 万 / 0.1% 或 1000 万 / 1% | 0.1% 的误判率要把位数组再放大 ~50%（由 `m ∝ ln(1/p)`，`ln(1000)/ln(100) ≈ 1.50`；内存换命中率）；当前组合的收益/内存比最划算，且 1% 的代价只是「多查一次 DB」（4.1） |
+| Redisson `RBloomFilter` | 自研 bitmap + 多哈希 | Redisson 处理了分片与初始化竞争；`tryInit` 幂等 |
+| 容量 100 万 / 1% | 更大容量换更低误判 | 1.2 MB 与 1% 已是甜点位；注册查重有 DB 兜底，更低误判收益有限 |
+| 全量重建（原地） | 双 key 切换重建 | 重建窗口的假阴性由唯一索引兜底；双 key 的复杂度当前不值得 |
+| 可用性直查 DB | 布隆前置拦截 | 当前未接入布隆读判断；若接入，可能存在仍须查库确认 |
 
 ---
 
 ## 六、边界与已知问题
 
-1. **重建期正确性窗口**（4.4）：空 / 半空过滤器会把已占用的用户名判定为「可用」，且 `sys_user` 没有 username 唯一索引兜底 → 可能真的落库重名用户。**现存缺陷，未修**。
-2. **`getBloomFilter` 每次调用多一次 Redis 往返**（4.5）：**现存缺陷，未修**。
-3. **过滤器与 DB 之间没有一致性编排**：`addUsername` 在事务方法内调用但不参与事务（没有 `afterCommit`），回滚会留下「多出来的成员」（安全方向：只多查一次 DB）。
-4. **只增不减**：用户逻辑删除 / 改名后旧名残留，直到下一次 `rebuild`。
-5. **容量与误判率只在首次初始化时生效**：`EXPECTED_INSERTIONS = 1000000` 是硬编码常量，真实用户超过 100 万后误判率上升；`tryInit` 不会覆盖已有配置，只能重建。
-6. **`isUsernameAvailable` 不是唯一性保证**：`registerByEmailCode:76-108` 注册流程本身**只校验邮箱**（`existsByEmailAndRole`），不校验用户名唯一性。也就是说重名是否真的落库，取决于调用方是否先调了可用性接口 —— 这让第 1 条缺陷的影响面被放大。
-7. **`rebuild` 的返回值**是「写入条数」（`normalized.size()`），不是「过滤器当前容量」，也不是「重建耗时」；用它做监控时要知道这一点。
-8. **`rebuild` 与并发写入有竞争**：重建期间新注册的用户可能已经在 `:46` 的 DB 查询之后，于是它的用户名不会出现在重建结果里，但它自己的 `addUsername` 会把它加进去 —— 恰好不丢。反过来，如果先 `add` 后 `delete`（时序极端），就会丢。当前顺序（先删后拉）在这个意义上反而更安全。
+1. **重建期假阴性**：`rebuild` 原地 `delete → 回灌`，窗口内已注册用户名会被判「不存在」。后果由 DB 唯一索引兜底，不影响正确性。
+2. **容量溢出行为**：插入数超过 100 万后误判率上升（位数组过载）。当前用户量级远未达到；达到前应重建更大容量的过滤器。
+3. **逻辑删除的用户名可复用**：`uk_active_username_role` 只约束未删除账号；布隆里的旧用户名残留会造成假阳性（判「存在」→ 查库发现可用），方向安全。
+4. **`mightContain` 无生产调用方**：作为能力保留；若把可用性查询改为「布隆判不存在 → 直接返回可用」的结构，需先处理重建期假阴性，并让「可能存在」继续回源确认。
 
 ---
 
 ## 七、如何验证
 
 ```bash
-# 0. 项目 Redis 使用默认 db 0（application.yaml:28-31）
+# 布隆过滤器底层是 Redisson 的 bitmap 结构，不能直接 GET
+redis-cli EXISTS <bloomKey>            # 期望 1（初始化后存在）
+redis-cli TYPE <bloomKey>              # 期望 string（位图）；配置另存于 Redisson 派生的配置 Hash）
 
-# 1. 确认过滤器 key 存在（执行一次重建后）
-redis-cli EXISTS auth:user:username:bloom      # 期望 1
-redis-cli TYPE   auth:user:username:bloom      # 由 Redisson 自己管理（位数组 + 配置）
-# 注意：这里不能用 RedisBloom 模块命令（BF.EXISTS / BF.INFO / BF.ADD），
-#       Redisson 的 RBloomFilter 是客户端实现，不依赖该模块。
+# 重建后观察登记数（POST /user/rebuild，需 ADMIN）
+# 返回体 data 为登记的用户名数量
 
-# 2. 正常路径：已注册用户名 → 回源 DB；随机用户名 → 被过滤器拦下（无 SQL）
-curl 'http://localhost:8080/auth/username/available?username=<已注册用户名>'      # 期望 false
-curl 'http://localhost:8080/auth/username/available?username=zz_not_exist_9911'   # 期望 true
-# 观察 SQL 日志：第 2 条不应产生 SELECT
-
-# 3. 复现 4.4 的正确性窗口：
-#    以 ADMIN 身份触发重建，并在重建进行中反复查询一个"已注册"的用户名
-curl -X POST 'http://localhost:8080/user/rebuild' -H 'Authorization: Bearer <ADMIN_TOKEN>'
-#    重建期间查询该用户名：
-curl 'http://localhost:8080/auth/username/available?username=<已注册用户名>'
-# 期望（正确实现）：始终 false；实际可能返回 true → 即缺陷
-
-# 4. 观察 4.5 的额外往返：镜像 Redis 命令流，看每次查询前是否都有一次配置读取
-redis-cli MONITOR | grep -i bloom
-curl 'http://localhost:8080/auth/username/available?username=whatever'
-
-# 5. 验证「只增不减」：删除一个 USER 后不重建，该用户名查询仍会回源 DB（结论仍为可用）
+# 行为验证：
+# 1. 注册新用户 → addUsername 登记
+# 2. 重建期间调用可用性查询 → 仍正确（直查 DB）
+# 3. 并发注册同名 → 后者收到 409（DuplicateKeyException 映射）
 ```
 
 ---
 
 ## 八、延伸阅读
 
-- [`06-null-sentinel-and-prewarm.md`](06-null-sentinel-and-prewarm.md) —— 另一条防穿透路线：空值哨兵（`__NULL__`）与缓存预热
-- [`04-cache-breakdown-mutex.md`](04-cache-breakdown-mutex.md) —— 穿透的「表亲」：热点 key 失效瞬间的击穿
-- [`05-cache-avalanche-random-ttl.md`](05-cache-avalanche-random-ttl.md) —— 大量 key 同时失效的雪崩
-- [`01-shared-session-token.md`](01-shared-session-token.md) —— 同一条注册 / 登录链路上的会话存储
-- [`02-email-code-cooldown.md`](02-email-code-cooldown.md) —— 注册链路的另一环
-- Redisson 官方文档：`RBloomFilter`；布隆过滤器误判率公式（`m`、`k` 的推导）
+- [`06-null-sentinel-and-prewarm.md`](06-null-sentinel-and-prewarm.md) —— 穿透的另一种解法：空值哨兵（把「已知的空」缓存下来）
+- [`04-cache-breakdown-mutex.md`](04-cache-breakdown-mutex.md) —— 穿透与击穿的区分
+- [`../agent/03-security-and-boundaries.md`](../agent/03-security-and-boundaries.md) —— 生成列唯一索引与迁移脚本
+- 布隆过滤器原理：[Bloom filter - Wikipedia](https://en.wikipedia.org/wiki/Bloom_filter)
