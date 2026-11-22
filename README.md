@@ -22,8 +22,8 @@
 
 | 主线 | 能学到什么 | 入口 |
 | --- | --- | --- |
-| **Redis 高并发** | 抢单 Lua 原子预检、GEO 附近订单、成员级 TTL 心跳、ZSet 延迟队列、缓存穿透 / 击穿 / 雪崩、分布式锁、缓存一致性三解法（延迟双删 / 墓碑 / Lease 令牌） | 下方 [Redis 高并发实战](#redis-高并发实战)；专题学习笔记在 [`docs/learn/redis/`](docs/learn/redis/README.md)（25 篇，一个考点一篇） |
-| **多 Agent + RAG** | 分类路由、工具调用循环、订单确认断点（HITL）、多层记忆、混合检索 RAG | 下方 [Agent 与 RAG 链路](#agent-与-rag-链路) |
+| **Redis 高并发** | 抢单 Lua 原子预检、GEO 附近订单、成员级 TTL 心跳、ZSet 延迟队列、缓存穿透 / 击穿 / 雪崩、分布式锁、缓存一致性三解法（延迟双删 / 墓碑 / Lease 令牌） | 下方 [Redis 高并发实战](#redis-高并发实战)；系统精读教材在 [`docs/learning-v2/`](docs/learning-v2/README.md)（26 章），单点考点笔记在 [`docs/learn/redis/`](docs/learn/redis/README.md)（25 篇） |
+| **多 Agent + RAG** | 分类路由、工具调用循环、订单确认断点（HITL）、多层记忆、混合检索 RAG | 下方 [Agent 与 RAG 链路](#agent-与-rag-链路)；系统教材见 [`docs/learning-v2/`](docs/learning-v2/README.md)，专题笔记见 [`docs/learn/agent/`](docs/learn/agent/README.md)（3 篇） |
 
 Redis 既承担 Agent 的**对话状态存储**（订单槽位、确认断点、分类结果），也提供业务侧的**并发协调与查询加速**（抢单预检、附近订单、超时兜底）。两条学习主线因此共享同一组业务场景。
 
@@ -111,9 +111,12 @@ flowchart LR
     OTOOLS --> REDIS
     OTOOLS --> MYSQL
     OTOOLS --> MONGO
+    STOOLS --> REDIS
     STOOLS --> MYSQL
+    STOOLS --> MONGO
     STOOLS --> ES
     DTOOLS --> REDIS
+    DTOOLS --> MYSQL
     TR --> REDIS
     TR --> MYSQL
 ```
@@ -128,7 +131,7 @@ flowchart LR
 | 司机端“附近订单”排序 | **GEO** | `GEORADIUS` 查询三公里内最近的至多 200 个候选；提交后失效、版本校验重建，回表发现候选或版本不一致时整页降级为数据库查询 | [`OrderGeoPool`](src/main/java/com/fancy/rideagenthub/service/base/OrderGeoPool.java) |
 | 司机在线状态 | **成员级 TTL** | 共享 GEO key + 心跳 Hash，以 Redis 时间判定 60 秒有效期；Lua 原子更新、检查与清理成员 | [`DriverGeoIndex`](src/main/java/com/fancy/rideagenthub/service/base/DriverGeoIndex.java) |
 | 订单超时兜底（无人接单 / 未到达 / 未支付） | **ZSet 延迟队列** | 提交后 `ZADD` 排期；Lua 原子执行 `ZRANGEBYSCORE` + `ZREM` 领取任务；失败重新入队并由数据库补偿扫描兜底 | [`OrderDelayQueue`](src/main/java/com/fancy/rideagenthub/service/base/OrderDelayQueue.java)、[`OrderTimeoutJob`](src/main/java/com/fancy/rideagenthub/service/base/OrderTimeoutJob.java) |
-| 用户名占用查询 | **缓存穿透** | Redisson 布隆过滤器 | [`UserUsernameBloomFilterService`](src/main/java/com/fancy/rideagenthub/service/base/UserUsernameBloomFilterService.java) |
+| 用户名布隆登记与重建 | **缓存穿透** | Redisson `RBloomFilter` 登记已注册 `USER` 用户名并支持全量重建；`mightContain` 当前未接入查询拦截，`isUsernameAvailable` 直查 DB 并由唯一索引兜底 | [`UserUsernameBloomFilterService`](src/main/java/com/fancy/rideagenthub/service/base/UserUsernameBloomFilterService.java) |
 | 工单统计热点 key | **缓存击穿** | 互斥锁 + 双检；未拿到锁时有限重试读缓存，仍未命中则直查 DB | [`TicketServiceImpl`](src/main/java/com/fancy/rideagenthub/service/impl/TicketServiceImpl.java) |
 | 缓存批量过期 | **缓存雪崩** | TTL 随机抖动 | 同上 |
 | 工单写操作后的脏缓存 | **延迟双删** | 事务提交后立即删除，再延迟删除；降低旧快照回填风险，仍受延迟窗口与进程存活限制 | [`DelayedCacheEvictor`](src/main/java/com/fancy/rideagenthub/service/base/DelayedCacheEvictor.java) |
@@ -141,8 +144,8 @@ flowchart LR
 
 ### 代码组织上的几个约定
 
-- **Lua 脚本集中维护**于 [`RedisScripts`](src/main/java/com/fancy/rideagenthub/util/RedisScripts.java)，覆盖位置心跳、索引发布与读取、延迟任务领取、锁释放、版本校验和抢单预检。
-- **主要 key 由** [`RedisKeyConstants`](src/main/java/com/fancy/rideagenthub/constant/RedisKeyConstants.java) **统一生成**；工单编号仍在 `TicketServiceImpl` 内使用局部前缀 `ticket:no:`。
+- **Lua 脚本共 33 段**：**22 个**通用脚本集中维护于 [`RedisScripts`](src/main/java/com/fancy/rideagenthub/util/RedisScripts.java)（覆盖位置心跳、索引发布与读取、延迟任务领取、锁释放、版本校验、抢单预检与滑动窗口限流）；另有 **11 个**内联脚本按领域内聚在 `TokenServiceImpl`(3)、`EmailCodeService`(4)、`OrderConfirmation`(2)、`TicketServiceImpl`(1) 与 `OrderSearchTool`(1) 中。
+- **主要 key 由** [`RedisKeyConstants`](src/main/java/com/fancy/rideagenthub/constant/RedisKeyConstants.java) **统一生成**；少数领域局部 key 在业务类内就地拼接：`ToolResponseMemory` 的 `chat:tool:v2:{chatId}:{callId}`（`RedisKeyConstants.TOOL_RESPONSE_KEY` 为未使用的遗留常量）、`TicketServiceImpl` 的 `ticket:no:{yyyyMMdd}`、`TokenServiceImpl` 的 `auth:session-version:{userId}`、`EmailCodeService` 的 `:attempts/:owner/:claim` 后缀、`RequestRateLimitInterceptor` 的 `request:rate:{摘要}`、`ChatRequestRunner` 的 `chat:execution:{chatId}` 与 `IdGeneratorConfig` 的 `id:node:{dc}:{worker}`。
 - **抢单正确性由数据库约束兜底**：司机账号行锁保障跨订单的一人一单，订单条件更新裁决是否接单成功；Redis Lua 承担原子预检与占位。
 - **故障策略按组件区分**：附近订单与工单池索引不可用时回退数据库查询，对话限流异常时放行；抢单路径仍依赖 Redisson 锁与 Redis 预检，不能承诺 Redis 故障时继续接单。延迟队列的任务丢失由数据库扫描补偿，实际状态流转仍会获取订单锁。
 
@@ -172,12 +175,12 @@ flowchart LR
 
 ### 2. 四个 Agent 的职责分工
 
-| Agent | 负责什么 | 典型工具 |
+| Agent | 负责什么 | 注册的工具类（核心工具方法） |
 | --- | --- | --- |
-| `OrderAgent` | 新建订单、补槽位、算价、确认、创建订单 | `saveNewOrderParam`、`isNewOrderReady`、`getEstRouteAndPrice`、`createOrder` |
-| `DailyAgent` | 天气、POI 搜索、地址编解码、常用地点管理、简单估时估价 | `CurWeatherTool`、`POISearchTool`、`GeoRegeoTool`、`UserPOITool` |
-| `SupportAgent` | 查历史订单、取消订单、改终点、工单流转、规则问答 | `OrderSearchTool`、`TicketTool`、`RagTool` |
-| `FallbackAgent` | 非业务域内容兜底，引导用户回到网约车场景 | 纯文本回复，不执行业务工具 |
+| `OrderAgent` | 新建订单、补槽位、算价、确认、创建订单 | `OrderTool`（`saveNewOrderParam`、`isNewOrderReady`、`getEstRouteAndPrice`、`notifyUser`、`markOrderReadyForCreate`、`createOrder`、`explainPrice`）、`POISearchTool`、`GeoRegeoTool`、`UserPOISearchTool`（只读常用地点）、`TrafficTool`（`getFlightInfo`）、`ToolRepPointerTool`（`getCalling`） |
+| `DailyAgent` | 天气、POI 搜索、周边搜索、地址编解码、常用地点管理（增删改查）、出行时间与简单价格估算 | `CurWeatherTool`、`POISearchTool`、`POIAroundTool`、`GeoRegeoTool`、`UserPOITool`、`DailyTool`（`estimateBufferTime`、`estimatePrice`）、`ToolRepPointerTool`（`getCalling`） |
+| `SupportAgent` | 查历史订单、取消预检与取消订单、改终点、工单流转、规则问答 | `OrderSearchTool`（含 `verifyCancelConditions`、`cancelOrder`、`modifyOrderDestination`）、`TicketTool`、`RagTool`（`searchKnowledgeBase`）、`ToolRepPointerTool`（`getCalling`） |
+| `FallbackAgent` | 非业务域内容兜底，引导用户回到网约车场景 | 纯文本回复，不注册、不执行任何业务工具 |
 
 ### 3. OrderAgent 的完整业务链
 
@@ -197,8 +200,8 @@ sequenceDiagram
     participant CM as ChatManager
 
     User->>API: POST /chat/v2/c/{chatId}
-    API->>RR: run(...)：UUID 格式校验 + 单轮执行锁 + assertOwned
-    RR->>CS: chat()：isLocked → canStartChat（参数/限流）→ break 检查 → 分类 / DANGER
+    API->>RR: run(...)：UUID 格式校验 + 单轮执行锁 + assertOwned(allowNew=true)
+    RR->>CS: chat()：isLocked → canStartChat（参数/限流）→ assertOwned → break 检查 → 分类 / DANGER
     CS->>CS: resolveClassification() => ORDER（ClassificationCache）
     CS->>OA: invoke()
 
@@ -211,21 +214,23 @@ sequenceDiagram
     OA->>Tool: getEstRouteAndPrice()
     Tool->>Redis: quoted()：quoteId + 报价时间戳 + 24h TTL
     OA->>OC: begin(chatId, toolCallId) → confirmationId
-    OC->>Redis: HSET break=yes, pendingToolCall
+    OC->>Redis: HSET pendingToolCall, break=yes
+    OA->>Redis: saveNewMessages() 持久化新增消息 + HSET break=yes
     OA-->>User: AgentEvent.comfirm(orderJson 字符串，含 confirmationId)
     Note over OC,Redis: break=yes 等待确认；报价 15 分钟有效
 
     User->>API: POST /chat/v2/r/{chatId} {confirmationId, confirmed}
-    API->>RR: run(resume=true)
+    API->>RR: run(resume=true)：UUID 格式校验 + 单轮执行锁 + assertOwned(allowNew=false)
     RR->>CS: resume(confirmationId, confirmed, prompt)
-    CS->>OC: confirm(confirmationId, confirmed)
+    CS->>OC: confirm(chatId, confirmationId, confirmed)
     OC->>Redis: CONFIRM：校验编号/状态；接受需≤15分钟并签发权限，拒绝清除权限
     CS->>OA: resume(固定 feedback + 可选补充说明)
-    OA->>Redis: getPersisted + 先持久化 ToolResponseMessage
+    OA->>Redis: getPersisted + 先持久化 ToolResponseMessage + HDEL break/pendingToolCall/confirmationAccepted
     OA->>Tool: markOrderReadyForCreate()（仅查询 isConfirmed）
-    OA->>Tool: createOrder()
-    Tool->>OC: consume()（CONSUME Lua 一次性消费）
-    Tool->>Order: createOrder()
+    OA->>Tool: createOrder()：检查 ReadyForCreate → 组装 CreateOrderDTO
+    Tool->>OC: consume(chatId)（CONSUME Lua 一次性消费）
+    Tool->>Order: createOrder(orderDTO)
+    Tool->>Tool: deleteByTraceId() 清理算价预览轨迹
     Tool->>CM: lockChat(chatId)
     Tool->>Redis: 写入 OrderId
     OA-->>User: 返回订单创建结果
@@ -294,19 +299,19 @@ RAG 部分不是单一路径检索，而是：
 
 | 存储 | 用途 |
 | --- | --- |
-| MySQL | 用户、订单、工单、对话消息、工具调用结果、RAG 映射 |
-| Redis | 对话分类、订单槽位、确认断点、缓存消息、工具结果缓存 |
-| MongoDB | 订单路径规划轨迹 |
-| Elasticsearch | 知识库索引与混合检索 |
+| MySQL | 用户账号（`sys_user`）、常用地点（`sys_user_poi`）、订单（`sys_ride_order`）、工单与沟通记录（`sys_ticket` / `sys_ticket_chat`）、会话元数据与消息（`sys_chat` / `sys_chat_message`）、工具调用结果（`sys_chat_tool_response`）、RAG 问答与映射及同步任务（`sys_qa_info` / `sys_qa_elastic_map` / `sys_qa_sync_job`）、高德城市编码（`bus_citycode`） |
+| Redis | 登录态 Token / 反向索引 / 会话版本、邮箱验证码五组 key、用户名布隆过滤器、对话分类与缓存、订单槽位与确认断点（`chat:info`）、L2 历史消息与版本租约、工具结果缓存、抢单状态与司机占位、待接单订单 GEO 池、司机在线 GEO 与心跳 Hash、订单超时 ZSet 延迟队列、工单池 ZSet 索引与统计缓存、工单日序号 `INCR`、城市编码缓存与墓碑、用户位置 Hash、双层滑动窗口限流 ZSet、Redisson 分布式锁（订单锁 / 单轮执行锁 / 雪花 ID 节点租约） |
+| MongoDB | 订单路径规划轨迹（算价阶段预览轨迹 + 正式订单轨迹） |
+| Elasticsearch | 知识库索引（`qa_knowledge_base`）与向量 + BM25 混合检索 |
 
 ## 当前模型编排
 
 从代码实现看，模型编排是分层的：
 
-- **路由默认模型**：`qwen-plus-2025-12-01`
-- **分类模型**：`qwen3-max-preview`
-- **领域 Agent 执行模型**：`deepseek-chat`
-- **Embedding 模型**：`text-embedding-v4`
+- **ChatClient 默认配置模型**：`qwen-plus-2025-12-01`（`ChatServiceImpl` 构造 `ChatClient` 时的 `defaultOptions`，当前实际分类调用均被下方的 `CLASSIFIER_MODEL` 覆盖）
+- **分类模型（实际生效）**：`qwen3-max-preview`（DashScope）
+- **领域 Agent 执行模型**：`deepseek-chat`（OpenAI 兼容接口）
+- **Embedding 模型**：`text-embedding-v4`（DashScope，1024 维）
 
 这种拆分很适合业务 Agent：
 
@@ -332,26 +337,34 @@ RAG 部分不是单一路径检索，而是：
 
 ```text
 src/main/java/com/fancy/rideagenthub
-├─ agents/                 # 4 个领域 Agent
+├─ agents/                 # 4 个领域 Agent（Order / Daily / Support / Fallback）与 AgentStreams
+├─ agentbase/chatinfo/     # ChatManager：会话归属、初始化、锁定与恢复
 ├─ agentbase/tool/         # 工具定义与业务回调
-├─ agentbase/memory/       # 多层记忆与工具结果缓存
-├─ agentbase/rag/          # 知识库检索与 ES/RRF 融合
-├─ agentbase/amap/         # 地图与路线能力
-├─ agentbase/qweather/     # 天气能力
-├─ service/base/           # Redis 组件：抢单预检、GEO 池、延迟队列、分布式锁、限流…
-├─ util/                   # RedisScripts 等通用工具
-├─ constant/               # RedisKeyConstants 等常量与 key 生成方法
+├─ agentbase/memory/       # 多层记忆（Heap / Redis / MySQL）与工具结果缓存
+├─ agentbase/rag/          # 知识库检索（向量 + BM25 + RRF）与 QaIndexSynchronizer 异步同步
+├─ agentbase/amap/         # 高德地图、路线规划与城市编码缓存（CityCodeUtil）
+├─ agentbase/qweather/     # 和风天气能力
+├─ annotation/             # @RequirePermission 权限注解
+├─ aspect/                 # PermissionAspect 角色鉴权切面
+├─ config/                 # 配置、线程池、雪花 ID 节点租约、支付门禁与系统 Prompt
+├─ constant/               # RedisKeyConstants、ToolContextKeyConstants 等常量
 ├─ controller/             # HTTP 入口
-├─ service/                # 业务服务层
+├─ domain/                 # DTO / VO / Entity / Enum / Response
+├─ exception/              # GlobalExceptionHandler 与业务/鉴权异常体系
+├─ interceptor/            # AuthTokenInterceptor 与 RequestRateLimitInterceptor
 ├─ mapper/                 # MyBatis-Plus Mapper
-├─ domain/                 # DTO / VO / Entity / Enum
-└─ config/                 # 配置与系统 Prompt
+├─ payment/                # RidePaymentChannelVerifier 支付渠道核验接口
+├─ security/               # UserToken、UserTokenContext 与 CredentialStamp 凭据摘要
+├─ service/                # 业务服务接口与实现（impl/）
+├─ service/base/           # 核心基础组件：抢单预检、GEO 池、延迟队列、分布式锁、限流、确认状态机…
+└─ util/                   # RedisScripts、SnowflakeIdWorker、BusinessTime 等通用工具
 
 docs/
 ├─ 01-redis-application-points.md   # Redis 应用点全景：每个考点对应的业务需求与当前实现
 ├─ 02-cache-consistency-race.md     # 缓存一致性三解法的竞态推导与当前落地边界
+├─ learning-v2/                     # 系统化源码精读教材（26 章正文 + _meta 课程路线与核验台账）
 └─ learn/
-   ├─ redis/                        # 25 篇考点笔记，一个考点一篇
+   ├─ redis/                        # 25 篇 Redis 考点笔记，一个考点一篇
    └─ agent/                        # 3 篇 Agent 层笔记（编排与 SSE / RAG 一致性 / 安全边界）
 ```
 
